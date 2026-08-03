@@ -1,0 +1,353 @@
+import asyncio
+from types import SimpleNamespace
+
+from rich.text import Text
+
+from matrixcli.app import (
+    SENDER_COLORS,
+    HomeScreen,
+    RoomScreen,
+    ThreadScreen,
+    _fmt_time,
+    _sender_color,
+)
+from matrixcli.client import Entry, Message
+
+
+def make_entry(**kw):
+    defaults = dict(
+        room_id="!a:hs",
+        title="general",
+        unread=0,
+        is_direct=False,
+        person=None,
+        last_ts=0,
+    )
+    defaults.update(kw)
+    return Entry(**defaults)
+
+
+class TestHelpers:
+    def test_sender_color_deterministic_and_in_palette(self):
+        assert _sender_color("@a:hs") == _sender_color("@a:hs")
+        assert _sender_color("@a:hs") in SENDER_COLORS
+
+    def test_fmt_time_zero_is_blank_column(self):
+        assert _fmt_time(0) == "     "
+        assert len(_fmt_time(1700000000000)) == 5
+
+
+class TestLabelFor:
+    # _label_for never touches self, so a dummy stands in for the screen.
+    def label(self, entry, is_selected_space=False):
+        return HomeScreen._label_for(SimpleNamespace(), entry, is_selected_space)
+
+    def test_hostile_title_renders_as_literal_text(self):
+        for title in ("[test", "[b yellow](99)[/b yellow]", "x[/]y"):
+            label = self.label(make_entry(title=title, unread=2))
+            rendered = Text.from_markup(label)  # must not raise
+            assert title in rendered.plain
+
+    def test_markers_and_badges(self):
+        assert self.label(make_entry(is_favourite=True)).startswith("★ ")
+        assert self.label(make_entry(is_space=True), True).startswith("◦ ")
+        plain = self.label(make_entry())
+        assert plain.startswith("  ")
+        assert self.label(make_entry(unread=3)).endswith("(3)[/b yellow]")
+        assert "[green]●[/green]" in self.label(make_entry(online=True))
+
+
+class TestIsReplyTarget:
+    def make_screen(self):
+        return RoomScreen(make_entry())
+
+    def msg(self, event_id=""):
+        return Message(
+            sender="@a:hs", sender_name="A", body="x", ts=1, event_id=event_id
+        )
+
+    def test_no_reply_target(self):
+        screen = self.make_screen()
+        assert not screen._is_reply_target(self.msg("$1"))
+
+    def test_identity_match(self):
+        screen = self.make_screen()
+        m = self.msg()
+        screen.reply_to = m
+        assert screen._is_reply_target(m)
+
+    def test_event_id_match_across_reloaded_objects(self):
+        screen = self.make_screen()
+        screen.reply_to = self.msg("$1")
+        assert screen._is_reply_target(self.msg("$1"))
+        assert not screen._is_reply_target(self.msg("$2"))
+
+    def test_empty_event_ids_do_not_match_each_other(self):
+        screen = self.make_screen()
+        screen.reply_to = self.msg("")
+        assert not screen._is_reply_target(self.msg(""))
+
+
+class TestFirstUnread:
+    def make_screen(self, n=5, marker=None, unread=0):
+        screen = RoomScreen(make_entry(unread=unread))
+        screen.messages = [
+            Message(sender="@a:hs", sender_name="A", body="x", ts=i, event_id=f"${i}")
+            for i in range(n)
+        ]
+        screen._opened_read_marker = marker
+        return screen
+
+    def test_marker_in_window(self):
+        assert self.make_screen(marker="$2")._first_unread_index() == 3
+
+    def test_marker_at_latest_message_means_no_unread(self):
+        assert self.make_screen(marker="$4")._first_unread_index() is None
+
+    def test_marker_missing_falls_back_to_unread_count(self):
+        screen = self.make_screen(marker="$gone", unread=2)
+        assert screen._first_unread_index() == 3
+
+    def test_no_signals_means_read(self):
+        assert self.make_screen()._first_unread_index() is None
+
+    def test_empty_room(self):
+        assert self.make_screen(n=0, marker="$x")._first_unread_index() is None
+
+    def test_divider_anchored_at_open_does_not_drift(self):
+        # The count fallback is only meaningful against the opening snapshot;
+        # once anchored to an event id, later arrivals must not move it.
+        screen = self.make_screen(unread=2)
+        idx = screen._first_unread_index()
+        screen._first_unread_event = screen.messages[idx].event_id
+        assert screen._first_unread_pos() == 3
+        screen.messages = screen.messages + [
+            Message(sender="@a:hs", sender_name="A", body="x", ts=9, event_id="$9")
+        ]
+        assert screen._first_unread_pos() == 3
+
+
+class TestThreadScreenUnread:
+    def make_screen(self, marker=None, unread=0):
+        root = Message(
+            sender="@a:hs", sender_name="A", body="root", ts=0, event_id="$root"
+        )
+        screen = ThreadScreen(make_entry(unread=unread), root)
+        screen.messages = [
+            Message(sender="@a:hs", sender_name="A", body="x", ts=i, event_id=f"${i}")
+            for i in range(5)
+        ]
+        screen._opened_read_marker = marker
+        return screen
+
+    def test_room_unread_count_is_ignored(self):
+        # The room's unread count counts main-timeline events; applying it to
+        # a thread's reply list would place the divider at a meaningless spot.
+        assert self.make_screen(unread=3)._first_unread_index() is None
+
+    def test_marker_inside_thread_places_divider(self):
+        assert self.make_screen(marker="$2")._first_unread_index() == 3
+
+    def test_marker_at_last_reply_means_no_unread(self):
+        assert self.make_screen(marker="$4")._first_unread_index() is None
+
+
+def msg(event_id, ts, root="", count=0):
+    return Message(
+        sender="@a:hs",
+        sender_name="A",
+        body=event_id,
+        ts=ts,
+        event_id=event_id,
+        thread_root=root,
+        thread_count=count,
+    )
+
+
+class TestLoadMessagesDisplay:
+    def make_screen(self, monkeypatch, history, threaded=False, older=()):
+        screen = RoomScreen(make_entry())
+
+        async def load_history(room_id):
+            return list(history)
+
+        fake_app = SimpleNamespace(
+            session=SimpleNamespace(load_history=load_history)
+        )
+        monkeypatch.setattr(
+            RoomScreen, "app", property(lambda self: fake_app), raising=False
+        )
+        screen.threaded = threaded
+        screen.older = list(older)
+        return screen
+
+    def test_normal_view_collapses_replies_and_counts_them(self, monkeypatch):
+        history = [
+            msg("$root", 100),
+            msg("$main", 150),
+            msg("$a", 200, root="$root"),
+            msg("$b", 300, root="$root"),
+        ]
+        screen = self.make_screen(monkeypatch, history)
+        out = asyncio.run(screen._load_messages())
+        assert [m.event_id for m in out] == ["$root", "$main"]
+        assert screen.thread_counts == {"$root": 2}
+
+    def test_server_aggregated_count_wins_over_local_window(self, monkeypatch):
+        history = [msg("$root", 100, count=7), msg("$a", 200, root="$root")]
+        screen = self.make_screen(monkeypatch, history)
+        asyncio.run(screen._load_messages())
+        assert screen.thread_counts == {"$root": 7}
+
+    def test_threaded_view_nests_replies_under_their_root(self, monkeypatch):
+        history = [
+            msg("$root", 100),
+            msg("$main", 150),
+            msg("$a", 200, root="$root"),
+        ]
+        screen = self.make_screen(monkeypatch, history, threaded=True)
+        out = asyncio.run(screen._load_messages())
+        assert [m.event_id for m in out] == ["$root", "$a", "$main"]
+
+    def test_threaded_view_keeps_orphan_replies_inline(self, monkeypatch):
+        # The reply's root is older than the loaded window: it must stay
+        # visible at its chronological position instead of being hidden.
+        history = [
+            msg("$main", 150),
+            msg("$orphan", 200, root="$gone"),
+            msg("$later", 300),
+        ]
+        screen = self.make_screen(monkeypatch, history, threaded=True)
+        out = asyncio.run(screen._load_messages())
+        assert [m.event_id for m in out] == ["$main", "$orphan", "$later"]
+
+    def test_scrolled_back_history_is_spliced_in(self, monkeypatch):
+        history = [msg("$new", 300)]
+        older = [msg("$old", 100), msg("$new", 300)]
+        screen = self.make_screen(monkeypatch, history, older=older)
+        out = asyncio.run(screen._load_messages())
+        assert [m.event_id for m in out] == ["$old", "$new"]
+
+    def test_older_threaded_replies_collapse_in_normal_view(self, monkeypatch):
+        history = [msg("$root", 300)]
+        older = [msg("$reply", 100, root="$root")]
+        screen = self.make_screen(monkeypatch, history, older=older)
+        out = asyncio.run(screen._load_messages())
+        assert [m.event_id for m in out] == ["$root"]
+        assert screen.thread_counts == {"$root": 1}
+
+
+class TestExpandedThreads:
+    def make_screen(self, monkeypatch, history, expanded=(), fetched=None):
+        screen = RoomScreen(make_entry())
+
+        async def load_history(room_id):
+            return list(history)
+
+        fake_app = SimpleNamespace(
+            session=SimpleNamespace(load_history=load_history)
+        )
+        monkeypatch.setattr(
+            RoomScreen, "app", property(lambda self: fake_app), raising=False
+        )
+        screen.expanded = set(expanded)
+        screen._thread_replies = dict(fetched or {})
+        return screen
+
+    def test_unfolded_root_shows_replies_inline(self, monkeypatch):
+        history = [
+            msg("$root", 100),
+            msg("$main", 150),
+            msg("$a", 200, root="$root"),
+        ]
+        screen = self.make_screen(monkeypatch, history, expanded={"$root"})
+        out = asyncio.run(screen._load_messages())
+        assert [m.event_id for m in out] == ["$root", "$a", "$main"]
+
+    def test_folded_roots_stay_collapsed_alongside_unfolded_ones(self, monkeypatch):
+        history = [
+            msg("$r1", 100),
+            msg("$r2", 150),
+            msg("$a", 200, root="$r1"),
+            msg("$b", 300, root="$r2"),
+        ]
+        screen = self.make_screen(monkeypatch, history, expanded={"$r2"})
+        out = asyncio.run(screen._load_messages())
+        assert [m.event_id for m in out] == ["$r1", "$r2", "$b"]
+
+    def test_fetched_replies_merge_with_window_replies(self, monkeypatch):
+        history = [msg("$root", 100), msg("$new", 300, root="$root")]
+        fetched = {"$root": [msg("$old", 200, root="$root"), msg("$new", 300, root="$root")]}
+        screen = self.make_screen(
+            monkeypatch, history, expanded={"$root"}, fetched=fetched
+        )
+        out = asyncio.run(screen._load_messages())
+        assert [m.event_id for m in out] == ["$root", "$old", "$new"]
+
+
+class TestActionThread:
+    def make_screen(self, monkeypatch, messages, timeline=()):
+        screen = RoomScreen(make_entry())
+        pushed = []
+        notices = []
+        fake_app = SimpleNamespace(
+            session=SimpleNamespace(timelines={"!a:hs": list(timeline)}),
+            push_screen=lambda s: pushed.append(s),
+            notify=lambda *a, **k: notices.append(a),
+        )
+        monkeypatch.setattr(
+            RoomScreen, "app", property(lambda self: fake_app), raising=False
+        )
+        screen.messages = list(messages)
+        return screen, pushed, notices
+
+    def test_plain_message_roots_its_own_thread(self, monkeypatch):
+        screen, pushed, _ = self.make_screen(monkeypatch, [msg("$root", 100)])
+        screen.selected = 0
+        screen.action_thread()
+        assert pushed and pushed[0].root.event_id == "$root"
+
+    def test_reply_opens_the_thread_it_belongs_to(self, monkeypatch):
+        # Threads do not nest: T on a reply must open the reply's thread, not
+        # start a spec-invalid thread rooted at the reply itself.
+        history = [msg("$root", 100), msg("$reply", 200, root="$root")]
+        screen, pushed, _ = self.make_screen(monkeypatch, history)
+        screen.selected = 1
+        screen.action_thread()
+        assert pushed and pushed[0].root.event_id == "$root"
+
+    def test_reply_root_resolved_from_session_cache(self, monkeypatch):
+        history = [msg("$reply", 200, root="$root")]
+        screen, pushed, _ = self.make_screen(
+            monkeypatch, history, timeline=[msg("$root", 100)]
+        )
+        screen.selected = 0
+        screen.action_thread()
+        assert pushed and pushed[0].root.event_id == "$root"
+
+    def test_missing_root_notifies_instead_of_nesting(self, monkeypatch):
+        history = [msg("$reply", 200, root="$gone")]
+        screen, pushed, notices = self.make_screen(monkeypatch, history)
+        screen.selected = 0
+        screen.action_thread()
+        assert not pushed
+        assert notices
+
+
+class TestAppChrome:
+    def test_command_palette_disabled(self):
+        from matrixcli.app import MatrixApp
+
+        assert MatrixApp.ENABLE_COMMAND_PALETTE is False
+
+    def test_ctrl_q_neutralized_q_quits_and_about_bound(self):
+        from matrixcli.app import MatrixApp
+
+        actions = {}
+        for b in MatrixApp.BINDINGS:
+            key = b.key if hasattr(b, "key") else b[0]
+            action = b.action if hasattr(b, "action") else b[1]
+            actions[key] = action
+        assert actions["ctrl+q"] == "noop"
+        assert actions["q"] == "quit"
+        assert actions["question_mark"] == "about"

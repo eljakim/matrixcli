@@ -1,0 +1,6 @@
+*.pyc
+.venv
+.claude
+element-keys.txt
+config.ini
+build/

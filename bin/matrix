@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Run the Poetry-managed matrixcli client from any directory. Path arguments,
+# both standalone (the FILE after --import-keys or -c) and in equals form
+# (--import-keys=FILE, --config=FILE), are resolved against the current
+# working directory; other flags like --verify are passed through untouched.
+set -euo pipefail
+
+# Resolve this script's real location, following symlinks, so a symlink in
+# /opt/local/bin still finds the project.
+source="${BASH_SOURCE[0]}"
+while [ -L "$source" ]; do
+  dir="$(cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd)"
+  source="$(readlink "$source")"
+  [[ "$source" != /* ]] && source="$dir/$source"
+done
+script_dir="$(cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd)"
+project_dir="$(dirname "$script_dir")"
+
+abspath() {
+    case "$1" in
+        /*) printf '%s\n' "$1" ;;
+        *)  printf '%s\n' "$(pwd)/$1" ;;
+    esac
+}
+
+forwarded=()
+for arg in "$@"; do
+    case "$arg" in
+        --config=*|--import-keys=*)
+            forwarded+=("${arg%%=*}=$(abspath "${arg#*=}")") ;;
+        -*) forwarded+=("$arg") ;;
+        *)  forwarded+=("$(abspath "$arg")") ;;
+    esac
+done
+
+# -P (not -C) points Poetry at the project while keeping the caller's working
+# directory, so the app's documented ./config.ini resolution still works.
+exec poetry -P "$project_dir" run matrix ${forwarded+"${forwarded[@]}"}
