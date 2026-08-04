@@ -869,7 +869,9 @@ class TestRefreshSpaceChildren:
             {"type": "m.room.member", "state_key": "@u:hs", "content": {"membership": "join"}},
         ]
         fake = self.FakeHttp(payload)
-        monkeypatch.setattr("matrixcli.client.aiohttp.ClientSession", lambda: fake)
+        monkeypatch.setattr(
+            "matrixcli.client.aiohttp.ClientSession", lambda **kw: fake
+        )
         asyncio.run(session.refresh_space_children())
         # A malformed via (plain string) still counts as a live link; an
         # emptied content or missing state_key does not.
@@ -884,9 +886,59 @@ class TestRefreshSpaceChildren:
         session.client.rooms["!s:hs"] = fake_room("!s:hs", room_type="m.space")
         session.space_children["!s:hs"] = {"!kept:hs"}
         fake = self.FakeHttp([], status=403)
-        monkeypatch.setattr("matrixcli.client.aiohttp.ClientSession", lambda: fake)
+        monkeypatch.setattr(
+            "matrixcli.client.aiohttp.ClientSession", lambda **kw: fake
+        )
         asyncio.run(session.refresh_space_children())
         assert session.space_children["!s:hs"] == {"!kept:hs"}
+
+
+class TestSpacesWithChildChanges:
+    def resp(self, join):
+        return SimpleNamespace(rooms=SimpleNamespace(join=join))
+
+    def room(self, timeline=(), state=()):
+        return SimpleNamespace(
+            timeline=SimpleNamespace(events=list(timeline)), state=list(state)
+        )
+
+    def test_detects_child_events_in_timeline_and_state(self, session):
+        child = SimpleNamespace(
+            source={"type": "m.space.child", "state_key": "!r:hs", "content": {}}
+        )
+        message = SimpleNamespace(source={"type": "m.room.message", "content": {}})
+        resp = self.resp(
+            {
+                "!s1:hs": self.room(timeline=[message, child]),
+                "!s2:hs": self.room(state=[child]),
+                "!plain:hs": self.room(timeline=[message]),
+            }
+        )
+        assert session.spaces_with_child_changes(resp) == {"!s1:hs", "!s2:hs"}
+
+    def test_matches_bad_events_without_typed_fields(self, session):
+        # The malformed child events this whole path exists for arrive as
+        # BadEvent, which keeps only the source dict.
+        from nio.events.room_events import Event, RoomSpaceChildEvent
+
+        bad = Event.parse_event(
+            {
+                "type": "m.space.child",
+                "event_id": "$c",
+                "sender": ALICE,
+                "origin_server_ts": 100,
+                "room_id": "!s:hs",
+                "state_key": "!r:hs",
+                "content": {"via": "hs"},
+            }
+        )
+        assert not isinstance(bad, RoomSpaceChildEvent)
+        resp = self.resp({"!s:hs": self.room(timeline=[bad])})
+        assert session.spaces_with_child_changes(resp) == {"!s:hs"}
+
+    def test_empty_response_is_handled(self, session):
+        assert session.spaces_with_child_changes(SimpleNamespace()) == set()
+        assert session.spaces_with_child_changes(self.resp({})) == set()
 
 
 class TestDownloadMedia:

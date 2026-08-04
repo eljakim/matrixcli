@@ -898,7 +898,10 @@ class MatrixSession:
             ]
         headers = {"Authorization": f"Bearer {self.client.access_token}"}
         try:
-            async with aiohttp.ClientSession() as http:
+            # Bounded: the background sync loop awaits this on every child-link
+            # change, and a hung request there would freeze every live update.
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as http:
                 for sid in spaces:
                     url = (
                         f"{self.cfg.homeserver}/_matrix/client/v3/rooms/"
@@ -919,6 +922,27 @@ class MatrixSession:
                     self.space_children[sid] = children
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
             return
+
+    def spaces_with_child_changes(self, response) -> set[str]:
+        """Ids of the rooms whose m.space.child state changed in this sync
+        response, so the caller can refetch just those child maps.
+
+        Matched on the raw ``source`` dict rather than on the parsed event
+        type: the malformed child events refresh_space_children exists for come
+        back as BadEvent, which carries no typed fields at all. State events
+        reach us through the timeline on a live sync and through ``state`` on a
+        gappy one, so both are scanned."""
+        changed = set()
+        rooms = getattr(getattr(response, "rooms", None), "join", {}) or {}
+        for room_id, joined in rooms.items():
+            events = list(getattr(getattr(joined, "timeline", None), "events", []) or [])
+            events += list(getattr(joined, "state", None) or [])
+            for ev in events:
+                source = getattr(ev, "source", None)
+                if isinstance(source, dict) and source.get("type") == "m.space.child":
+                    changed.add(room_id)
+                    break
+        return changed
 
     # --- dashboard --------------------------------------------------------
 

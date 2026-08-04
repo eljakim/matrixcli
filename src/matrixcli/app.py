@@ -1565,6 +1565,13 @@ class MatrixApp(App):
                 continue
             if isinstance(resp, SyncResponse):
                 self.session._record_room_timestamps(resp)
+                # Rooms added to (or removed from) a space arrive as
+                # m.space.child state, but the child map behind the Rooms
+                # column is read over raw state and so never updates itself.
+                # Refetch only the spaces this sync touched, so the column
+                # keeps up without polling the state endpoint every 30s.
+                for space_id in self.session.spaces_with_child_changes(resp):
+                    await self.session.refresh_space_children(space_id)
                 self.action_refresh_home()
                 for screen in self.screen_stack:
                     if isinstance(screen, RoomScreen):
