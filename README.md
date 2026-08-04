@@ -105,10 +105,17 @@ In a room:
   fetches older history, all the way back to the room's first message
 - `u`: jump to the first unread message; messages that arrived after you last
   opened the room sit below a red `── new ──` divider
-- `Enter`: download the selected uploaded file (shown as `📎 name (size)`);
-  a popup picks the destination: last-used folder, `~/Desktop`,
-  `~/Downloads`, or the current directory. Encrypted attachments are
-  decrypted on download.
+- `Enter`: act on the selected message.
+  - It holds a link (underlined and, in terminals that support it,
+    mouse-clickable): open it with the system's default browser. A message
+    with several links shows a popup to pick one. Only `http(s)` links are
+    picked up.
+  - It is an uploaded file (shown as `📎 name (size)`): download it; a popup
+    picks the destination: last-used folder, `~/Desktop`, `~/Downloads`, or
+    the current directory. Encrypted attachments are decrypted on download.
+
+  Both popups take `j`/`k` or `↓`/`↑` to choose, `Enter` to confirm, and
+  `Esc` to cancel.
 - `r`: reply to the selected message (inline editor below it)
 - `R`: compose a new message (editor at the end)
 - `l` / `h`: unfold / fold the selected message's thread in place. `l` on a

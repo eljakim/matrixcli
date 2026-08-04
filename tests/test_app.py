@@ -5,9 +5,12 @@ from rich.text import Text
 
 from matrixcli.app import (
     SENDER_COLORS,
+    DownloadScreen,
     HomeScreen,
+    LinkScreen,
     RoomScreen,
     ThreadScreen,
+    _find_urls,
     _fmt_time,
     _sender_color,
 )
@@ -55,6 +58,109 @@ class TestLabelFor:
         assert plain.startswith("  ")
         assert self.label(make_entry(unread=3)).endswith("(3)[/b yellow]")
         assert "[green]●[/green]" in self.label(make_entry(online=True))
+
+
+class TestFindUrls:
+    def urls(self, text):
+        return [u for _, _, u in _find_urls(text)]
+
+    def test_bare_url(self):
+        assert self.urls("see https://a.example/x?y=1 please") == [
+            "https://a.example/x?y=1"
+        ]
+
+    def test_markdown_link_stops_at_the_closing_paren(self):
+        text = "Yes, according to the [hotel's website](https://ferganahotel.com/en-gb/services)"
+        assert self.urls(text) == ["https://ferganahotel.com/en-gb/services"]
+
+    def test_trailing_sentence_punctuation_is_not_part_of_the_url(self):
+        assert self.urls("go to http://a.example/b.") == ["http://a.example/b"]
+        assert self.urls("http://a.example/b, and more") == ["http://a.example/b"]
+
+    def test_several_urls_in_reading_order(self):
+        assert self.urls("https://a.example and https://b.example/2") == [
+            "https://a.example",
+            "https://b.example/2",
+        ]
+
+    def test_only_http_schemes(self):
+        assert self.urls("file:///etc/passwd javascript:alert(1) mailto:a@b.c") == []
+
+    def test_spans_cover_the_url_in_the_source_text(self):
+        text = "look: https://a.example/x!"
+        (start, end, url), = _find_urls(text)
+        assert text[start:end] == url
+
+    def test_no_url(self):
+        assert self.urls("plain text, no links here") == []
+        assert self.urls("") == []
+
+
+class TestActionOpen:
+    """Enter routes to the right thing: download for a file, browser for a
+    link, a picker when a message holds several."""
+
+    class Screen(RoomScreen):
+        # RoomScreen.app is a property that needs a running App; a plain
+        # attribute here shadows it, and the two side effects are recorded
+        # instead of performed.
+        app = SimpleNamespace(push_screen=lambda *a, **kw: None)
+
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.opened = []
+            self.pushed = []
+            self.app = SimpleNamespace(
+                push_screen=lambda screen, cb=None: self.pushed.append(screen)
+            )
+
+        def _open_url(self, url):
+            self.opened.append(url)
+
+    def make_screen(self, body="", **kw):
+        screen = self.Screen(make_entry())
+        screen.messages = [
+            Message(sender="@a:hs", sender_name="A", body=body, ts=1, event_id="$1", **kw)
+        ]
+        screen.selected = 0
+        return screen
+
+    def test_single_link_opens_directly(self):
+        screen = self.make_screen("look at https://a.example/x")
+        screen.action_open()
+        assert screen.opened == ["https://a.example/x"]
+        assert screen.pushed == []
+
+    def test_several_links_show_the_picker(self):
+        screen = self.make_screen("https://a.example and https://b.example")
+        screen.action_open()
+        assert screen.opened == []
+        assert isinstance(screen.pushed[0], LinkScreen)
+        assert screen.pushed[0].urls == ["https://a.example", "https://b.example"]
+
+    def test_file_still_offers_the_download_dialog(self):
+        screen = self.make_screen("photo.png https://a.example", media_url="mxc://x/y")
+        screen.action_open()
+        assert screen.opened == []
+        assert isinstance(screen.pushed[0], DownloadScreen)
+
+    def test_message_without_a_link_does_nothing(self):
+        screen = self.make_screen("no links here")
+        screen.action_open()
+        assert screen.opened == [] and screen.pushed == []
+
+    def test_empty_room_does_nothing(self):
+        screen = self.Screen(make_entry())
+        screen.action_open()
+        assert screen.opened == [] and screen.pushed == []
+
+
+class TestPickerKeys:
+    # A subclass redeclaring BINDINGS would silently drop the vim keys.
+    def test_pickers_take_vim_keys_and_escape(self):
+        for cls in (DownloadScreen, LinkScreen):
+            keys = cls._merged_bindings.key_to_bindings
+            assert {"j", "k", "escape"} <= set(keys), cls.__name__
 
 
 class TestIsReplyTarget:

@@ -16,6 +16,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
+import re
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -67,6 +71,26 @@ SENDER_COLORS = [
 
 def _sender_color(user_id: str) -> str:
     return SENDER_COLORS[sum(ord(c) for c in user_id) % len(SENDER_COLORS)]
+
+
+# Only http(s): the URL ends up as an argument to the system's URL handler, and
+# schemes like file:, javascript: or smb: coming from a remote sender have no
+# business being opened on one keystroke. Brackets, quotes and whitespace end
+# the match, so the closing ")" of a markdown [label](url) link stays out of it.
+URL_RE = re.compile(r"https?://[^\s<>\"'`\[\]{}()]+", re.IGNORECASE)
+
+
+def _find_urls(text: str) -> list[tuple[int, int, str]]:
+    """(start, end, url) for every link in ``text``, in reading order. Sentence
+    punctuation directly after a URL is stripped: people write "see https://x.y."
+    and mean the sentence to end there."""
+    spans = []
+    for match in URL_RE.finditer(text or ""):
+        url = match.group(0).rstrip(".,;:!?")
+        if url.endswith("//"):
+            continue  # the strip ate the whole host, e.g. a bare "https://."
+        spans.append((match.start(), match.start() + len(url), url))
+    return spans
 
 
 def _version() -> str:
@@ -157,7 +181,7 @@ class RoomScreen(Screen):
         ("l", "expand", "Open thread"),
         ("h", "collapse", "Close thread"),
         ("u", "first_unread", "First unread"),
-        Binding("enter", "open_media", "Download", show=False),
+        Binding("enter", "open", "Open link / download", show=False),
         ("r", "reply", "Reply"),
         ("R", "compose", "New message"),
         # Two bindings share "t"; check_action enables exactly one, so the
@@ -699,7 +723,13 @@ class RoomScreen(Screen):
             label.append("  Enter to download", style="dim italic")
             grid.add_row(_fmt_time(m.ts), label)
         else:
-            grid.add_row(_fmt_time(m.ts), Text(body, style="grey70" if mine else ""))
+            text = Text(body, style="grey70" if mine else "")
+            for start, end, url in _find_urls(body):
+                # "link <url>" makes Rich emit an OSC 8 hyperlink, so the URL is
+                # also mouse-clickable in terminals that support it; the
+                # underline marks it in the ones that do not.
+                text.stylize(f"underline deep_sky_blue1 link {url}", start, end)
+            grid.add_row(_fmt_time(m.ts), text)
         count = self.thread_counts.get(m.event_id, 0)
         if count and not self.threaded and m.event_id not in self.expanded:
             label = "reply" if count == 1 else "replies"
@@ -718,19 +748,58 @@ class RoomScreen(Screen):
         self._composing = False
         self.run_worker(self._redraw())
 
-    def action_open_media(self) -> None:
-        """Enter on an uploaded file: ask where to save it, then download."""
+    def action_open(self) -> None:
+        """Enter on the selected message: an uploaded file asks where to save
+        it and downloads, a message with links opens one in the browser (with
+        a picker when it holds several)."""
         if not self.messages:
             return
         m = self.messages[self.selected]
-        if not m.media_url:
+        if m.media_url:
+
+            def when_chosen(directory: str | None) -> None:
+                if directory:
+                    self.run_worker(self._download(m, directory))
+
+            self.app.push_screen(DownloadScreen(m), when_chosen)
+            return
+        urls = [url for _, _, url in _find_urls(m.body or "")]
+        if not urls:
+            return
+        if len(urls) == 1:
+            self._open_url(urls[0])
             return
 
-        def when_chosen(directory: str | None) -> None:
-            if directory:
-                self.run_worker(self._download(m, directory))
+        def when_picked(url: str | None) -> None:
+            if url:
+                self._open_url(url)
 
-        self.app.push_screen(DownloadScreen(m), when_chosen)
+        self.app.push_screen(LinkScreen(urls), when_picked)
+
+    def _open_url(self, url: str) -> None:
+        """Hand the URL to the desktop's default handler (Safari, or whatever
+        is set on this machine). Started detached and without a shell: the
+        handler must never inherit our terminal, block the UI, or let a
+        remote sender's URL turn into shell words."""
+        try:
+            if sys.platform == "win32":
+                os.startfile(url)  # Windows' own URL handler, no shell involved
+            else:
+                subprocess.Popen(
+                    ["open" if sys.platform == "darwin" else "xdg-open", url],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        except Exception as exc:
+            self.app.notify(
+                f"Could not open link: {exc}",
+                severity="error",
+                timeout=8,
+                markup=False,
+            )
+            return
+        self.app.notify(f"Opening {url}", timeout=4, markup=False)
 
     async def _download(self, m, directory: str) -> None:
         try:
@@ -911,13 +980,33 @@ class ThreadScreen(RoomScreen):
         pass
 
 
-class DownloadScreen(ModalScreen):
+class PickerScreen(ModalScreen):
+    """Shared keys for the pick-one-row modals: j/k next to the arrows (the
+    room view is driven with them, so the popups it opens should be too), and
+    Escape to dismiss with None. Subclasses compose exactly one ListView and
+    dismiss with the chosen row's value."""
+
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
+    ]
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_cursor_down(self) -> None:
+        self.query_one(ListView).action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        self.query_one(ListView).action_cursor_up()
+
+
+class DownloadScreen(PickerScreen):
     """Pick a destination directory for a file download: the last-used
     directory first (when there is one), then ~/Desktop, ~/Downloads, and the
-    current directory. Up/down to choose, Enter to download, Escape to
+    current directory. j/k or up/down to choose, Enter to download, Escape to
     cancel; dismisses with the chosen path string or None."""
-
-    BINDINGS = [("escape", "cancel", "Cancel")]
 
     def __init__(self, message) -> None:
         super().__init__()
@@ -953,11 +1042,38 @@ class DownloadScreen(ModalScreen):
         lv.index = 0
         lv.focus()
 
-    def action_cancel(self) -> None:
-        self.dismiss(None)
-
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         self.dismiss(getattr(event.item, "dir_path", None))
+
+
+class LinkScreen(PickerScreen):
+    """Pick which link to open when the selected message holds more than one.
+    j/k or up/down to choose, Enter to open, Escape to cancel; dismisses with
+    the chosen URL or None."""
+
+    def __init__(self, urls: list[str]) -> None:
+        super().__init__()
+        self.urls = urls
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="linkbox"):
+            yield Label("Open which link?", id="linktitle")
+            yield ListView(id="links")
+
+    async def on_mount(self) -> None:
+        lv = self.query_one("#links", ListView)
+        for url in self.urls:
+            # escape(): the URL comes from the sender, and unescaped a "[" in
+            # it is parsed as console markup (crash on "[/", spoofed styling).
+            # Truncated so a long one cannot blow out the dialog.
+            item = ListItem(Label(escape(url[:200])))
+            item.url = url
+            await lv.append(item)
+        lv.index = 0
+        lv.focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        self.dismiss(getattr(event.item, "url", None))
 
 
 class AboutScreen(ModalScreen):
@@ -1331,7 +1447,7 @@ class MatrixApp(App):
         background: $panel;
     }
     #searchbox #results { max-height: 20; }
-    #downloadbox {
+    #downloadbox, #linkbox {
         width: 70%;
         height: auto;
         margin: 4 10;
@@ -1339,7 +1455,8 @@ class MatrixApp(App):
         border: round $accent;
         background: $panel;
     }
-    #downloadtitle { text-style: bold; padding: 0 0 1 0; }
+    #downloadtitle, #linktitle { text-style: bold; padding: 0 0 1 0; }
+    #linkbox #links { max-height: 12; }
     AboutScreen { align: center middle; }
     #aboutbox {
         width: auto;
