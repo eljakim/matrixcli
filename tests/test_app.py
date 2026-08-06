@@ -457,3 +457,42 @@ class TestAppChrome:
         assert actions["ctrl+q"] == "noop"
         assert actions["q"] == "quit"
         assert actions["question_mark"] == "about"
+        assert actions["ctrl+r"] == "force_refresh"
+
+
+class TestConnStatus:
+    # render only reads self.app, so a dummy stands in for the widget.
+    def render(self, last_sync_at, sync_ok):
+        from matrixcli.app import ConnStatus
+
+        fake = SimpleNamespace(
+            app=SimpleNamespace(last_sync_at=last_sync_at, sync_ok=sync_ok)
+        )
+        return ConnStatus.render(fake)
+
+    def test_before_first_sync_shows_nothing(self):
+        assert self.render(None, True).plain == ""
+
+    def test_fresh_sync_shows_dot_and_age(self):
+        import time
+
+        text = self.render(time.monotonic() - 5, True)
+        assert text.plain.startswith("● ")
+        assert text.plain.endswith("5s")
+        assert "offline" not in text.plain
+
+    def test_failed_sync_shows_offline(self):
+        import time
+
+        text = self.render(time.monotonic() - 5, False)
+        assert "offline" in text.plain
+        assert text.plain.endswith("5s")
+
+    def test_silently_hung_poll_counts_as_offline(self):
+        # No error was raised, but nothing has synced within STALE_AFTER: a
+        # dropped network hangs the long-poll without failing it.
+        import time
+
+        text = self.render(time.monotonic() - 120, True)
+        assert "offline" in text.plain
+        assert text.plain.endswith("2m")

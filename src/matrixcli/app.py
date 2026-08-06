@@ -118,6 +118,54 @@ def _fmt_size(size: int) -> str:
     return ""
 
 
+# The sync loop long-polls for 30s, so a healthy session sees a response at
+# least that often; once the last one is older than this, the connection is
+# presumed dead even if no request has errored out yet (a silently dropped
+# network hangs the poll without raising until much later).
+STALE_AFTER = 45.0
+
+
+class ConnStatus(Static):
+    """Connectivity/staleness indicator in the footer's bottom-right corner.
+
+    Shows a green dot plus the age of the last successful sync while the
+    connection is healthy, and a red "offline" marker with the same age (now:
+    how stale everything on screen is) when the last sync failed or none has
+    completed within STALE_AFTER. Re-rendered on a 1s timer so the age ticks.
+    """
+
+    def on_mount(self) -> None:
+        # layout=True: the text width changes as the age grows ("59s" -> "1m",
+        # "● 5s" -> "✗ offline 2m") and the dock: right slot must resize.
+        self.set_interval(1.0, lambda: self.refresh(layout=True))
+
+    def render(self) -> Text:
+        last = getattr(self.app, "last_sync_at", None)
+        ok = getattr(self.app, "sync_ok", True)
+        if last is None:
+            return Text("")  # still starting up; nothing meaningful to show
+        age = max(0.0, time.monotonic() - last)
+        if age < 60:
+            age_str = f"{int(age)}s"
+        elif age < 3600:
+            age_str = f"{int(age // 60)}m"
+        else:
+            age_str = f"{int(age // 3600)}h"
+        if ok and age <= STALE_AFTER:
+            return Text.assemble(("● ", "green"), (age_str, "dim"))
+        return Text.assemble(("✗ offline ", "bold red"), (age_str, "red"))
+
+
+class StatusFooter(Footer):
+    """The standard key-binding footer with a ConnStatus docked at its right
+    edge. Composed as a child (not overlaid) so the Footer's own recompose on
+    binding changes rebuilds the indicator along with the keys."""
+
+    def compose(self) -> ComposeResult:
+        yield from super().compose()
+        yield ConnStatus()
+
+
 class EntryItem(ListItem):
     """A ListView row that remembers which room/person it points at."""
 
@@ -222,7 +270,7 @@ class RoomScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         yield VerticalScroll(id="timeline")
-        yield Footer()
+        yield StatusFooter()
 
     async def _load_messages(self) -> list:
         """The message list this screen renders. Normal view: the room's main
@@ -1216,7 +1264,7 @@ class HomeScreen(Screen):
             with Vertical(classes="column"):
                 yield Label("DMs", classes="section")
                 yield ListView(id="dms")
-        yield Footer()
+        yield StatusFooter()
 
     async def on_mount(self) -> None:
         self.title = "matrixcli"
@@ -1465,6 +1513,15 @@ class MatrixApp(App):
         border: round $accent;
         background: $panel;
     }
+    /* Bottom-right of the footer, same slot Textual's own command-palette
+       key uses; the vkey border separates it from the binding keys. */
+    ConnStatus {
+        dock: right;
+        width: auto;
+        height: 1;
+        padding: 0 1;
+        border-left: vkey $foreground 20%;
+    }
     #timeline { height: 1fr; padding: 0 1; }
     MessageLine { height: auto; border-left: wide $background; }
     /* Threaded view: indent the whole reply (timestamp included) under the
@@ -1488,6 +1545,9 @@ class MatrixApp(App):
         ("q", "quit", "Quit"),
         Binding("ctrl+q", "noop", show=False),
         Binding("question_mark", "about", "About", show=False),
+        # Hidden to keep the footer lean. While a composer is focused its own
+        # ctrl+r (Send) wins, as widget bindings shadow app bindings.
+        Binding("ctrl+r", "force_refresh", "Refresh", show=False),
     ]
 
     def action_noop(self) -> None:
@@ -1520,6 +1580,11 @@ class MatrixApp(App):
         self.cfg = cfg
         self.session = MatrixSession(cfg)
         self.fatal: str | None = None
+        # Connection health for the footer's ConnStatus: monotonic time of the
+        # last successful sync (None until the first one lands) and whether
+        # the most recent sync attempt succeeded.
+        self.last_sync_at: float | None = None
+        self.sync_ok = True
 
     async def on_mount(self) -> None:
         await self.push_screen(LoadingScreen())
@@ -1553,17 +1618,26 @@ class MatrixApp(App):
 
     @work(exclusive=True, group="sync")
     async def sync_loop(self) -> None:
+        # The first request uses timeout=0 so it returns immediately instead
+        # of long-polling. That makes a forced refresh (ctrl+r restarts this
+        # exclusive worker) update the screen and the staleness clock right
+        # away rather than after up to 30s of empty long-poll.
+        timeout = 0
         while True:
             try:
-                resp = await self.session.client.sync(timeout=30000, full_state=False)
+                resp = await self.session.client.sync(timeout=timeout, full_state=False)
             except Exception:
                 # nio normally returns error *responses*, but event callbacks
                 # run inside sync() and an unexpected raise from one (or from
                 # the transport) would kill this worker, silently freezing
                 # every live update for the rest of the session.
+                self.sync_ok = False
                 await asyncio.sleep(5)
                 continue
+            timeout = 30000
             if isinstance(resp, SyncResponse):
+                self.sync_ok = True
+                self.last_sync_at = time.monotonic()
                 self.session._record_room_timestamps(resp)
                 # Rooms added to (or removed from) a space arrive as
                 # m.space.child state, but the child map behind the Rooms
@@ -1590,6 +1664,7 @@ class MatrixApp(App):
             else:
                 # Other error responses return immediately (no long-poll), so
                 # back off instead of hammering the server in a tight loop.
+                self.sync_ok = False
                 await asyncio.sleep(5)
 
     def open_room(self, entry: Entry) -> None:
@@ -1614,6 +1689,23 @@ class MatrixApp(App):
 
     def action_search(self) -> None:
         self.push_screen(SearchScreen())
+
+    def action_force_refresh(self) -> None:
+        """ctrl+r: resync now. Restarting the exclusive sync worker cancels
+        the in-flight 30s long-poll and issues an immediate sync (its first
+        request uses timeout=0), so a wedged connection is retried on the
+        spot. The screens' change-detection caches are cleared first so they
+        rebuild even if the sync brings nothing new."""
+        if isinstance(self.screen, LoadingScreen):
+            return  # startup owns the connection until the home screen is up
+        for screen in self.screen_stack:
+            if isinstance(screen, HomeScreen):
+                screen._last_signature = None
+                self.call_later(screen.refresh_data)
+            elif isinstance(screen, RoomScreen):
+                screen._last_seen_event = None
+                self.call_later(screen.refresh_messages)
+        self.sync_loop()
 
     def action_refresh_home(self) -> None:
         for screen in self.screen_stack:
