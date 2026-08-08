@@ -512,6 +512,63 @@ class TestRefreshDirectMap:
         assert session.direct_by_room == {}
 
 
+class TestInitialSync:
+    """A homeserver that drops the connection mid-response makes nio raise the
+    raw aiohttp error instead of returning a SyncError; initial_sync must ride
+    that out rather than let it kill the startup worker."""
+
+    def run(self, session, monkeypatch, syncs, get_displayname=None):
+        calls = []
+
+        async def noop(*a, **kw):
+            return None
+
+        async def fake_sync(**kw):
+            outcome = syncs[len(calls)]
+            calls.append(kw)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        monkeypatch.setattr(session, "_refresh_direct_map", noop)
+        monkeypatch.setattr(session, "refresh_space_children", noop)
+        monkeypatch.setattr(
+            session.client, "get_displayname", get_displayname or noop
+        )
+        monkeypatch.setattr(session.client, "sync", fake_sync)
+        monkeypatch.setattr(asyncio, "sleep", noop)
+        steps = []
+        asyncio.run(session.initial_sync(progress=steps.append))
+        return calls, steps
+
+    def test_transport_error_is_retried_then_succeeds(self, session, monkeypatch):
+        good = SimpleNamespace(rooms=SimpleNamespace(join={}))
+        calls, steps = self.run(
+            session,
+            monkeypatch,
+            [aiohttp.ClientPayloadError("payload not completed"), good],
+        )
+        assert len(calls) == 2
+        assert any("retrying" in s for s in steps)
+
+    def test_transport_error_every_time_does_not_raise(self, session, monkeypatch):
+        boom = ConnectionResetError(54, "Connection reset by peer")
+        calls, steps = self.run(session, monkeypatch, [boom, boom, boom])
+        assert len(calls) == 3
+        assert any("showing cached data" in s for s in steps)
+
+    def test_displayname_transport_error_is_not_fatal(self, session, monkeypatch):
+        async def boom(*a, **kw):
+            raise aiohttp.ClientPayloadError("payload not completed")
+
+        good = SimpleNamespace(rooms=SimpleNamespace(join={}))
+        calls, steps = self.run(
+            session, monkeypatch, [good], get_displayname=boom
+        )
+        assert len(calls) == 1
+        assert not any("retrying" in s for s in steps)
+
+
 class TestInvites:
     def test_dashboard_lists_invites(self, session):
         session.client.invited_rooms["!inv:hs"] = SimpleNamespace(

@@ -440,6 +440,51 @@ class TestActionThread:
         assert notices
 
 
+class TestPendingEcho:
+    def msg(self, event_id, pending=False, ts=1):
+        return Message(
+            sender="@a:hs",
+            sender_name="A",
+            body="x",
+            ts=ts,
+            event_id=event_id,
+            pending=pending,
+        )
+
+    def test_splice_appends_in_flight_echoes(self):
+        screen = RoomScreen(make_entry())
+        echo = self.msg("~local.1", pending=True)
+        screen._pending.append(echo)
+        out = screen._splice_pending([self.msg("$1")])
+        assert out[-1] is echo
+
+    def test_splice_skips_echo_already_in_list(self):
+        # After confirmation swaps in the real event id, a reload that already
+        # contains the sync echo must not duplicate the message.
+        screen = RoomScreen(make_entry())
+        echo = self.msg("$real", pending=True)
+        screen._pending.append(echo)
+        out = screen._splice_pending([self.msg("$real")])
+        assert len(out) == 1
+
+    def test_thread_latest_skips_pending_echoes(self):
+        # A provisional "~local." id must never leave the client as the
+        # thread reply-fallback event id.
+        root = self.msg("$root")
+        screen = ThreadScreen(make_entry(), root)
+        screen.messages = [
+            self.msg("$reply", ts=2),
+            self.msg("~local.1", pending=True, ts=3),
+        ]
+        assert screen._send_kwargs(None)["thread_latest"] == "$reply"
+
+    def test_thread_latest_all_pending_falls_back_to_root(self):
+        root = self.msg("$root")
+        screen = ThreadScreen(make_entry(), root)
+        screen.messages = [self.msg("~local.1", pending=True)]
+        assert screen._send_kwargs(None)["thread_latest"] == "$root"
+
+
 class TestAppChrome:
     def test_command_palette_disabled(self):
         from matrixcli.app import MatrixApp

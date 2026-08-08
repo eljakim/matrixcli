@@ -22,7 +22,9 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from uuid import uuid4
 
+import textual.events
 import textual.message
 from textual import work
 from textual.binding import Binding
@@ -184,13 +186,17 @@ class MessageLine(Static):
 
 
 class ComposerArea(TextArea):
-    """A borderless, soft-wrapping multi-line editor where Enter inserts a
-    newline and Ctrl+R sends. The send/cancel bindings are real Textual
+    """A borderless, soft-wrapping multi-line editor where Enter sends and
+    Shift+Enter inserts a newline. The send/cancel bindings are real Textual
     bindings (show=True) so they appear in the footer while the editor is
     focused."""
 
     BINDINGS = [
-        Binding("ctrl+r", "send", "Send", show=True),
+        Binding("enter", "send", "Send", show=True),
+        Binding("shift+enter", "newline", "New line", show=True),
+        # Fallback for terminals without the kitty keyboard protocol, where
+        # Shift+Enter is indistinguishable from Enter.
+        Binding("alt+enter", "newline", "New line", show=False),
         Binding("escape", "cancel", "Cancel", show=True),
     ]
 
@@ -204,11 +210,26 @@ class ComposerArea(TextArea):
 
     _submitted = False
 
+    async def _on_key(self, event: textual.events.Key) -> None:
+        # TextArea's own _on_key turns Enter into an inserted newline and stops
+        # the event before bindings run, so the enter->send binding above is
+        # footer decoration only; the real interception has to happen here.
+        # Shift+Enter is not consumed by TextArea, so its binding fires
+        # normally.
+        if event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            self.action_send()
+            return
+        await super()._on_key(event)
+
+    def action_newline(self) -> None:
+        start, end = self.selection
+        self._replace_via_keyboard("\n", start, end)
+
     def action_send(self) -> None:
-        # We avoid Ctrl+S for "send" because most terminals capture it for XOFF
-        # flow control, which freezes the terminal.
         # One send per editor instance: the editor stays mounted during the
-        # network round-trip, so a second Ctrl+R would otherwise queue a
+        # network round-trip, so a second Enter would otherwise queue a
         # duplicate send. Every redraw mounts a fresh instance, resetting this.
         if self._submitted:
             return
@@ -263,6 +284,10 @@ class RoomScreen(Screen):
         self._first_unread_event: str | None = None
         self._composing = False  # True while an "R" new-message editor is open
         self._last_seen_event: str | None = None  # latest event id we rendered
+        # Local echoes still in flight: shown in gray immediately on Enter and
+        # spliced back into every reload so a background sync cannot drop them
+        # before the server confirms (see _finish_send).
+        self._pending: list = []
         # _redraw is reached from workers, this screen's own handlers, and
         # app-level sync callbacks; the lock keeps rebuilds from interleaving.
         self._redraw_lock = asyncio.Lock()
@@ -317,7 +342,7 @@ class RoomScreen(Screen):
                     for r in replies.get(m.event_id, []):
                         merged[r.event_id] = r
                     out.extend(sorted(merged.values(), key=lambda r: r.ts))
-            return out
+            return self._splice_pending(out)
         root_ids = {m.event_id for m in main}
         out = []
         for m in messages:
@@ -326,7 +351,17 @@ class RoomScreen(Screen):
             out.append(m)
             if not m.thread_root:
                 out.extend(replies.get(m.event_id, []))
-        return out
+        return self._splice_pending(out)
+
+    def _splice_pending(self, messages: list) -> list:
+        """Append the in-flight local echoes to a freshly built display list.
+        Reloads rebuild from the session cache, which knows nothing about a
+        message whose send has not returned yet; without this it would blink
+        out of the timeline whenever a sync lands during the round-trip."""
+        for p in self._pending:
+            if all(m.event_id != p.event_id for m in messages):
+                messages.append(p)
+        return messages
 
     async def on_mount(self) -> None:
         self.title = self.entry.title
@@ -771,7 +806,13 @@ class RoomScreen(Screen):
             label.append("  Enter to download", style="dim italic")
             grid.add_row(_fmt_time(m.ts), label)
         else:
-            text = Text(body, style="grey70" if mine else "")
+            # An unconfirmed local echo renders dimmer than a delivered own
+            # message; _finish_send flips it to the normal color on confirm.
+            if m.pending:
+                style = "grey50"
+            else:
+                style = "grey70" if mine else ""
+            text = Text(body, style=style)
             for start, end, url in _find_urls(body):
                 # "link <url>" makes Rich emit an OSC 8 hyperlink, so the URL is
                 # also mouse-clickable in terminals that support it; the
@@ -792,7 +833,10 @@ class RoomScreen(Screen):
     def action_reply(self) -> None:
         if not self.messages:
             return
-        self.reply_to = self.messages[self.selected]
+        m = self.messages[self.selected]
+        if m.pending:
+            return  # no server event id yet to hang the reply relation on
+        self.reply_to = m
         self._composing = False
         self.run_worker(self._redraw())
 
@@ -880,6 +924,8 @@ class RoomScreen(Screen):
         if not self.messages:
             return
         root = self.messages[self.selected]
+        if root.pending:
+            return  # rooting a thread needs the server-assigned event id
         if root.thread_root:
             root_id = root.thread_root
             root = next(
@@ -935,32 +981,60 @@ class RoomScreen(Screen):
             await self._redraw()
             return
         reply = self.reply_to
+        # Capture the relation arguments before touching any state: the
+        # thread override reads self.messages for the latest-reply fallback.
         kwargs = self._send_kwargs(reply)
-        ok, info = await self.app.session.send(self.entry.room_id, text, **kwargs)
         from .client import Message
 
+        # Optimistic local echo: show the message (in gray) and close the
+        # editor immediately, then do the network round-trip in a worker.
+        # The provisional "~local." id keeps it distinct in every event-id
+        # keyed merge until the server assigns the real one.
+        echo = Message(
+            sender=self.app.session.cfg.user_id,
+            sender_name=self.app.session.my_name,
+            body=text,
+            ts=int(time.time() * 1000),
+            event_id=f"~local.{uuid4().hex}",
+            thread_root=kwargs.get("thread_root") or "",
+            pending=True,
+        )
+        self._pending.append(echo)
+        self.messages.append(echo)
+        self.reply_to = None
+        self._composing = False
+        self.selected = len(self.messages) - 1
+        await self._redraw()
+        self.run_worker(self._finish_send(echo, text, reply, kwargs))
+
+    async def _finish_send(self, echo, text: str, reply, kwargs: dict) -> None:
+        ok, info = await self.app.session.send(self.entry.room_id, text, **kwargs)
+        if echo in self._pending:
+            self._pending.remove(echo)
+        if not self.is_attached:
+            return
         if ok:
-            self.reply_to = None
-            self._composing = False
-            # The sync echo may have landed during the send round-trip; only
-            # add the local copy if the event is not already in the list.
-            if not any(m.event_id == info for m in self.messages):
-                self.messages.append(
-                    Message(
-                        sender=self.app.session.cfg.user_id,
-                        sender_name=self.app.session.my_name,
-                        body=text,
-                        ts=int(time.time() * 1000),
-                        event_id=info,
-                        thread_root=kwargs.get("thread_root") or "",
-                    )
-                )
-            self.selected = len(self.messages) - 1
             self._last_seen_event = info
+            if any(m.event_id == info for m in self.messages):
+                # The sync echo landed during the round-trip; drop the local
+                # copy instead of showing the message twice.
+                if echo in self.messages:
+                    self.messages.remove(echo)
+            else:
+                # Confirm in place: the real event id makes later reloads
+                # merge it with the sync echo, and clearing pending flips the
+                # rendering from gray to the normal color.
+                echo.event_id = info
+                echo.pending = False
+            self.selected = min(self.selected, max(0, len(self.messages) - 1))
         else:
-            # Keep reply_to/_composing as they are: the redraw below rebuilds
-            # the editor and _restore_draft refills it, so the text survives
-            # and the user can retry or copy it out.
+            if echo in self.messages:
+                self.messages.remove(echo)
+            self.selected = min(self.selected, max(0, len(self.messages) - 1))
+            # Reopen the editor the send came from so the text survives and
+            # the user can retry or copy it out.
+            self.reply_to = reply
+            self._composing = reply is None
             self.app.notify(
                 f"Failed to send: {info}",
                 severity="error",
@@ -968,6 +1042,18 @@ class RoomScreen(Screen):
                 markup=False,
             )
         await self._redraw()
+        if not ok:
+            # The redraw mounted a fresh, empty editor; refill it with the
+            # failed text (there was no live editor for _restore_draft to
+            # capture a draft from). If the user already started a new draft
+            # during the round-trip, leave that one alone.
+            try:
+                editor = self.query_one("#editor", ComposerArea)
+                if not editor.text:
+                    editor.text = text
+                    editor.move_cursor(editor.document.end)
+            except Exception:
+                pass
 
 
 class ThreadScreen(RoomScreen):
@@ -990,7 +1076,8 @@ class ThreadScreen(RoomScreen):
         self.sub_title = lines[0][:60]
 
     async def _load_messages(self) -> list:
-        return await self.app.session.load_thread(self.entry.room_id, self.root)
+        thread = await self.app.session.load_thread(self.entry.room_id, self.root)
+        return self._splice_pending(thread)
 
     def _first_unread_index(self) -> int | None:
         """The room-level unread count counts main-timeline events, so it says
@@ -1008,7 +1095,12 @@ class ThreadScreen(RoomScreen):
         return pos + 1
 
     def _send_kwargs(self, reply) -> dict:
-        latest = self.messages[-1].event_id if self.messages else ""
+        # Skip in-flight echoes: their provisional "~local." ids must never
+        # leave the client as the reply-fallback event id.
+        latest = next(
+            (m.event_id for m in reversed(self.messages) if not m.pending),
+            "",
+        )
         return {
             "reply_to": reply.event_id if reply else None,
             "thread_root": self.root.event_id,
@@ -1600,7 +1692,20 @@ class MatrixApp(App):
             self.fatal = message
             self.exit()
             return
-        await self.session.initial_sync(progress=loading.set_status)
+        try:
+            await self.session.initial_sync(progress=loading.set_status)
+        except Exception as exc:
+            # initial_sync handles the failures it can name, but anything that
+            # escapes it (a transport error from one of the other calls, a
+            # raise from an event callback) would otherwise abort this worker
+            # and dump a traceback over the terminal instead of starting the
+            # app. The dashboard can open on cached data; sync_loop retries.
+            self.notify(
+                f"Initial sync failed ({type(exc).__name__}); showing cached "
+                "data while the background sync retries.",
+                severity="warning",
+                markup=False,
+            )
         loading.set_status("ready")
         await self.switch_screen(HomeScreen())
         if self.cfg.room:

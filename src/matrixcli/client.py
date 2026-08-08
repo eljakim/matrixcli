@@ -129,6 +129,7 @@ class Message:
     media_name: str = ""  # upload filename (body may be a caption)
     media_size: int = 0  # bytes, from content.info, 0 if unknown
     media_crypt: dict | None = None  # key/iv/hash for encrypted attachments
+    pending: bool = False  # local echo awaiting the server's event id
 
 
 def _media_info(event) -> dict:
@@ -410,7 +411,12 @@ class MatrixSession:
 
         step("loading direct-message list")
         await self._refresh_direct_map()
-        name_resp = await self.client.get_displayname()
+        try:
+            name_resp = await self.client.get_displayname()
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            # A dropped connection here is not worth failing startup over; the
+            # display name is cosmetic and user_name() falls back to the id.
+            name_resp = None
         if getattr(name_resp, "displayname", None):
             self.my_name = name_resp.displayname
         # Force one fresh (non-incremental) sync so the server returns recent
@@ -436,25 +442,37 @@ class MatrixSession:
         }
         step("syncing rooms and messages")
         # Non-429 errors come back immediately as SyncError (nio only retries
-        # rate limits itself); retry a few times rather than silently
-        # presenting an empty dashboard as "ready".
+        # rate limits itself), and a connection that dies mid-response never
+        # becomes a response at all: nio lets the raw aiohttp error through
+        # (ClientPayloadError / ConnectionResetError), which is easy to hit
+        # because this is the one big full_state sync of the session. Retry a
+        # few times rather than killing the startup worker with a traceback or
+        # silently presenting an empty dashboard as "ready".
+        resp = None
         for attempt in range(3):
-            resp = await self.client.sync(
-                timeout=30000,
-                full_state=True,
-                sync_filter=sync_filter,
-                set_presence="online",
-            )
-            if not isinstance(resp, SyncError):
-                break
-            detail = (
-                getattr(resp, "message", "")
-                or getattr(resp, "status_code", "")
-                or "error"
-            )
+            try:
+                resp = await self.client.sync(
+                    timeout=30000,
+                    full_state=True,
+                    sync_filter=sync_filter,
+                    set_presence="online",
+                )
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                resp = None
+                detail = type(exc).__name__
+            else:
+                if not isinstance(resp, SyncError):
+                    break
+                detail = (
+                    getattr(resp, "message", "")
+                    or getattr(resp, "status_code", "")
+                    or "error"
+                )
+            if attempt == 2:
+                break  # out of attempts; don't promise a retry or sleep first
             step(f"initial sync failed ({detail}); retrying")
-            await asyncio.sleep(2)
-        if isinstance(resp, SyncError):
+            await asyncio.sleep(2 * (attempt + 1))
+        if resp is None or isinstance(resp, SyncError):
             step("initial sync failed; showing cached data, the background sync will keep retrying")
         step("loading space hierarchy")
         await self.refresh_space_children()

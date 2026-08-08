@@ -129,7 +129,9 @@ In a room:
   view you are in (`View: normal` / `View: threaded`). In threaded view,
   `h`/`l` jump out of / into a thread.
 - `T`: open the selected message's thread full-screen (or start a new one)
-- `Ctrl+R`: send the editor's contents (Enter inserts a newline)
+- `Enter`: send the editor's contents (`Shift+Enter` inserts a newline;
+  `Alt+Enter` does too, for terminals where Shift+Enter is indistinguishable
+  from Enter)
 - `c`: toggle compact mode (no blank line between speakers)
 - `Esc`: cancel the editor, or go back to the home screen
 
