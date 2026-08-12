@@ -471,6 +471,117 @@ class TestThreads:
         msgs = asyncio.run(session.load_thread("!a:hs", root))
         assert [m.event_id for m in msgs] == ["$root", "$r1", "$r2"]
 
+    def _root(self):
+        return Message(
+            sender=ALICE, sender_name="A", body="root", ts=100, event_id="$root"
+        )
+
+    def test_thread_merge_takes_the_servers_edit_fold_over_a_stale_cache(
+        self, session, monkeypatch
+    ):
+        # The reply was edited; the /relations fetch returns it with the
+        # bundled edit already folded in, but the cache still holds the
+        # pre-edit copy. Cached must win on identity (decryption) without
+        # reverting the text the whole rest of the app shows.
+        reply_source = {
+            "type": "m.room.message",
+            "event_id": "$r1",
+            "sender": BOB,
+            "origin_server_ts": 200,
+            "content": {
+                "msgtype": "m.text",
+                "body": "old text",
+                "m.relates_to": {"rel_type": "m.thread", "event_id": "$root"},
+            },
+            "unsigned": {
+                "m.relations": {
+                    "m.replace": edit_source("$e", BOB, 300, "new text", "$r1")
+                }
+            },
+        }
+        fake = TestRefreshSpaceChildren.FakeHttp({"chunk": [reply_source]})
+        monkeypatch.setattr(
+            "matrixcli.client.aiohttp.ClientSession", lambda **kw: fake
+        )
+        session.timelines["!a:hs"].append(
+            Message(
+                sender=BOB, sender_name="B", body="old text", ts=200,
+                event_id="$r1", thread_root="$root",
+            )
+        )
+        msgs = asyncio.run(session.load_thread("!a:hs", self._root()))
+        (reply,) = [m for m in msgs if m.event_id == "$r1"]
+        assert reply.body == "new text"
+        assert reply.edited_ts == 300
+        assert reply.original_body == "old text"
+
+    def test_thread_includes_cached_live_edits_so_the_screen_can_fold_them(
+        self, session, monkeypatch
+    ):
+        # An edit received live sits in the cache with an m.replace relation
+        # and no thread root; /relations m.thread never returns it. It must
+        # ride along, or the thread view shows the reply's pre-edit text.
+        class Boom:
+            def __init__(self, *args, **kwargs):
+                raise aiohttp.ClientError("no network")
+
+        monkeypatch.setattr("matrixcli.client.aiohttp.ClientSession", Boom)
+        session.timelines["!a:hs"].extend(
+            [
+                Message(
+                    sender=BOB, sender_name="B", body="old", ts=200,
+                    event_id="$r1", thread_root="$root",
+                ),
+                Message(
+                    sender=BOB, sender_name="B", body="new", ts=300,
+                    event_id="$e", replaces="$r1",
+                ),
+            ]
+        )
+        msgs = asyncio.run(session.load_thread("!a:hs", self._root()))
+        assert [m.event_id for m in msgs] == ["$root", "$r1", "$e"]
+        folded = fold_edits(msgs)
+        assert [(m.event_id, m.body) for m in folded] == [
+            ("$root", "root"),
+            ("$r1", "new"),
+        ]
+
+    def test_thread_merge_carries_a_deletion_the_cache_missed(
+        self, session, monkeypatch
+    ):
+        reply_source = {
+            "type": "m.room.message",
+            "event_id": "$r1",
+            "sender": BOB,
+            "origin_server_ts": 200,
+            "content": {},
+            "unsigned": {
+                "redacted_because": {
+                    "type": "m.room.redaction",
+                    "event_id": "$del",
+                    "sender": BOB,
+                    "origin_server_ts": 400,
+                    "redacts": "$r1",
+                    "content": {},
+                }
+            },
+        }
+        fake = TestRefreshSpaceChildren.FakeHttp({"chunk": [reply_source]})
+        monkeypatch.setattr(
+            "matrixcli.client.aiohttp.ClientSession", lambda **kw: fake
+        )
+        session.timelines["!a:hs"].append(
+            Message(
+                sender=BOB, sender_name="B", body="kept text", ts=200,
+                event_id="$r1", thread_root="$root",
+            )
+        )
+        msgs = asyncio.run(session.load_thread("!a:hs", self._root()))
+        (reply,) = [m for m in msgs if m.event_id == "$r1"]
+        # Deletion learned from the server, text kept from the cache.
+        assert reply.redacted_ts == 400
+        assert reply.body == "kept text"
+
 
 class TestToMessageEncrypted:
     def test_wrapper_thread_info_survives_failed_decrypt(self, session):
@@ -561,6 +672,43 @@ class TestEdits:
         folded = fold_edits([self.msg("$e", ALICE, 200, "fixed", replaces="$gone")])
         assert [m.body for m in folded] == ["fixed"]
 
+    def test_a_deleted_edit_stops_applying(self):
+        # Redacting an edit retracts it: the server un-applies it and a fresh
+        # client shows the previous text. Ours must not keep displaying the
+        # retracted body (which may be exactly what the sender deleted it for).
+        folded = fold_edits([
+            self.msg("$o", ALICE, 100, "as written"),
+            self.msg("$e", ALICE, 200, "pasted secret", replaces="$o",
+                     redacted_ts=300),
+        ])
+        assert [(m.event_id, m.body) for m in folded] == [("$o", "as written")]
+        assert folded[0].edited_ts == 0
+
+    def test_a_deleted_edit_falls_back_to_the_previous_edit(self):
+        folded = fold_edits([
+            self.msg("$o", ALICE, 100, "v1"),
+            self.msg("$e1", ALICE, 200, "v2", replaces="$o"),
+            self.msg("$e2", ALICE, 300, "v3", replaces="$o", redacted_ts=400),
+        ])
+        assert [m.body for m in folded] == ["v2"]
+        assert folded[0].edited_ts == 200
+
+    def test_a_retracted_bundled_fold_is_undone(self):
+        # The server bundled the edit onto the original, so _to_message baked
+        # the new text into the target; then the edit was deleted live. The
+        # bake must revert to the original text.
+        baked = Message(
+            sender=ALICE, sender_name=ALICE, body="pasted secret", ts=100,
+            event_id="$o", edited_ts=200, original_body="as written",
+        )
+        folded = fold_edits([
+            baked,
+            self.msg("$e", ALICE, 200, "pasted secret", replaces="$o",
+                     redacted_ts=300),
+        ])
+        assert [(m.event_id, m.body) for m in folded] == [("$o", "as written")]
+        assert folded[0].edited_ts == 0
+
     def test_undecryptable_edit_marks_but_does_not_replace(self):
         folded = fold_edits([
             self.msg("$o", ALICE, 100, "readable"),
@@ -592,6 +740,91 @@ class TestEdits:
         )
         m = session._to_message(None, ev)
         assert (m.body, m.edited_ts) == ("as written", 0)
+
+
+class TestRedactions:
+    """A deleted message keeps its place as a tombstone, and any text we
+    received before the deletion stays available locally."""
+
+    def redacted_source(self, event_id, sender, ts, redacted_ts, type="m.room.message"):
+        return {
+            "type": type,
+            "event_id": event_id,
+            "sender": sender,
+            "origin_server_ts": ts,
+            "content": {},
+            "unsigned": {
+                "redacted_because": {
+                    "type": "m.room.redaction",
+                    "event_id": "$r",
+                    "sender": sender,
+                    "origin_server_ts": redacted_ts,
+                    "redacts": event_id,
+                    "content": {},
+                }
+            },
+        }
+
+    def test_fetched_deletion_becomes_an_empty_tombstone(self, session):
+        from nio.events.room_events import Event
+
+        ev = Event.parse_event(self.redacted_source("$d", ALICE, 100, 400))
+        m = session._to_message(None, ev)
+        assert (m.event_id, m.body, m.ts, m.redacted_ts) == ("$d", "", 100, 400)
+
+    def test_a_removed_reaction_is_not_a_deleted_message(self, session):
+        # Taking back a 👍 redacts an event too. The timeline never showed it,
+        # so it must not turn into a "this message has been deleted" line.
+        from nio.events.room_events import Event
+
+        ev = Event.parse_event(
+            self.redacted_source("$x", ALICE, 100, 400, type="m.reaction")
+        )
+        assert session._to_message(None, ev) is None
+
+    def test_live_redaction_flags_the_cached_copy_and_keeps_its_text(self, session):
+        from nio import RedactionEvent
+
+        session.timelines["!a:hs"].append(
+            Message(sender=ALICE, sender_name="Alice", body="secret", ts=100,
+                    event_id="$d")
+        )
+        event = RedactionEvent.from_dict(
+            {
+                "type": "m.room.redaction",
+                "event_id": "$r",
+                "sender": ALICE,
+                "origin_server_ts": 400,
+                "redacts": "$d",
+                "content": {},
+            }
+        )
+        room = SimpleNamespace(room_id="!a:hs")
+        asyncio.run(session._on_redaction(room, event))
+        cached = session.timelines["!a:hs"][0]
+        assert (cached.body, cached.redacted_ts) == ("secret", 400)
+        # Nothing was appended, so the open room view needs another cue to
+        # redraw: the latest-event id it watches.
+        assert session.last_event_id["!a:hs"] == "$r"
+
+    def test_history_merge_marks_a_cached_message_the_server_lost(self, session):
+        # Deleted while we were away: the fetch brings back an empty
+        # tombstone, the cache still holds the text. Keep both facts.
+        from nio.events.room_events import Event
+
+        session.timelines["!a:hs"].append(
+            Message(sender=ALICE, sender_name="Alice", body="secret", ts=100,
+                    event_id="$d")
+        )
+
+        async def fake_room_messages(*args, **kwargs):
+            return SimpleNamespace(
+                chunk=[Event.parse_event(self.redacted_source("$d", ALICE, 100, 400))]
+            )
+
+        session.client.room_messages = fake_room_messages
+        msgs = asyncio.run(session.load_history("!a:hs", limit=10))
+        assert [(m.body, m.redacted_ts) for m in msgs] == [("secret", 400)]
 
 
 class TestLoadEdits:
@@ -627,6 +860,21 @@ class TestLoadEdits:
     ):
         versions = self.run(session, [], self.folded(), monkeypatch, status=500)
         assert [(v.ts, v.body) for v in versions] == [(100, "v1"), (300, "v3")]
+
+    def test_a_deleted_message_is_never_fetched_for(self, session, monkeypatch):
+        # The server has dropped the content; only the local copy is left, and
+        # asking /relations about it would just be a pointless round-trip.
+        fake = TestRefreshSpaceChildren.FakeHttp({"chunk": []})
+        monkeypatch.setattr(
+            "matrixcli.client.aiohttp.ClientSession", lambda **kw: fake
+        )
+        message = Message(
+            sender=ALICE, sender_name="Alice", body="secret", ts=100,
+            event_id="$d", redacted_ts=400,
+        )
+        versions = asyncio.run(session.load_edits("!a:hs", message))
+        assert [v.body for v in versions] == ["secret"]
+        assert fake.urls == []
 
 
 class TestRefreshDirectMap:
@@ -792,6 +1040,257 @@ class TestLoadOlder:
         session.client.room_messages = fake_room_messages
         msgs = asyncio.run(session.load_older("!a:hs"))
         assert [m.event_id for m in msgs] == ["$old", "$new"]
+
+    def test_reset_pagination_forgets_position_and_done_flag(self, session):
+        # The screen that owned the back-paginated messages is gone; a token
+        # resuming from its depth would skip everything in between on reopen.
+        session.pagination_tokens["!a:hs"] = "deep-token"
+        session.pagination_done["!a:hs"] = True
+        session.reset_pagination("!a:hs")
+
+        async def fake_room_messages(room_id, start, direction, limit):
+            return SimpleNamespace(
+                chunk=[text_event("$1", ALICE, 100, "hi")], end="tok"
+            )
+
+        session.client.room_messages = fake_room_messages
+        # Pagination works again (done flag cleared) and starts from the
+        # sync position, not the dead screen's depth.
+        session.client.next_batch = "now"
+        msgs = asyncio.run(session.load_older("!a:hs"))
+        assert [m.event_id for m in msgs] == ["$1"]
+
+    def test_reset_pagination_on_an_unvisited_room_is_a_noop(self, session):
+        session.reset_pagination("!never:hs")
+        assert session.pagination_tokens == {}
+        assert session.pagination_done == {}
+
+
+class TestEchoTimestamp:
+    """A send() echo carries this machine's wall clock; the server's
+    origin_server_ts must displace it wherever the real event shows up."""
+
+    def test_sync_echo_corrects_the_cached_timestamp(self, session, fake_room):
+        session.timelines["!a:hs"].append(
+            Message(sender=ME, sender_name="Me", body="hi", ts=99_999_999,
+                    event_id="$sent")
+        )
+        room = fake_room("!a:hs")
+        asyncio.run(session._on_message(room, text_event("$sent", ME, 1000, "hi")))
+        (cached,) = session.timelines["!a:hs"]
+        assert cached.ts == 1000
+        assert cached.body == "hi"  # everything else untouched
+
+    def test_history_merge_adopts_the_server_timestamp(self, session):
+        session.timelines["!a:hs"].append(
+            Message(sender=ME, sender_name="Me", body="hi", ts=99_999_999,
+                    event_id="$sent")
+        )
+
+        async def fake_room_messages(*args, **kwargs):
+            return SimpleNamespace(chunk=[text_event("$sent", ME, 1000, "hi")])
+
+        session.client.room_messages = fake_room_messages
+        msgs = asyncio.run(session.load_history("!a:hs", limit=10))
+        assert [(m.event_id, m.ts) for m in msgs] == [("$sent", 1000)]
+
+
+class TestLoadOlderErrors:
+    def test_error_is_none_not_beginning(self, session):
+        from nio import RoomMessagesError
+
+        async def failing(*args, **kwargs):
+            return RoomMessagesError.from_dict(
+                {"errcode": "M_UNKNOWN", "error": "boom"}, "!a:hs"
+            )
+
+        session.client.room_messages = failing
+        assert asyncio.run(session.load_older("!a:hs")) is None
+        # And the room is NOT marked done: the next attempt retries.
+        assert not session.pagination_done.get("!a:hs")
+
+
+class TestReactions:
+    def react(self, event_id, sender, target, key="👍", ts=100):
+        from nio.events.room_events import Event
+
+        return Event.parse_event(
+            {
+                "type": "m.reaction",
+                "event_id": event_id,
+                "sender": sender,
+                "origin_server_ts": ts,
+                "content": {
+                    "m.relates_to": {
+                        "rel_type": "m.annotation",
+                        "event_id": target,
+                        "key": key,
+                    }
+                },
+            }
+        )
+
+    def test_reactions_aggregate_per_key(self, session, fake_room):
+        room = fake_room("!a:hs")
+        for eid, sender, key in (
+            ("$r1", ALICE, "👍"),
+            ("$r2", BOB, "👍"),
+            ("$r3", ALICE, "🎉"),
+        ):
+            asyncio.run(session._on_reaction(room, self.react(eid, sender, "$m", key)))
+        assert session.reaction_summary("!a:hs", "$m") == [("👍", 2), ("🎉", 1)]
+        # The room view is nudged to redraw.
+        assert session.last_event_id["!a:hs"] == "$r3"
+
+    def test_variation_selector_variants_count_as_one_key(self, session, fake_room):
+        # "👍" and "👍️" are the same vote; clients disagree on which
+        # form they send.
+        room = fake_room("!a:hs")
+        asyncio.run(session._on_reaction(room, self.react("$r1", ALICE, "$m", "👍")))
+        asyncio.run(
+            session._on_reaction(room, self.react("$r2", BOB, "$m", "👍️"))
+        )
+        assert session.reaction_summary("!a:hs", "$m") == [("👍", 2)]
+
+    def test_redelivered_reaction_does_not_double_count(self, session, fake_room):
+        room = fake_room("!a:hs")
+        asyncio.run(session._on_reaction(room, self.react("$r1", ALICE, "$m")))
+        asyncio.run(session._on_reaction(room, self.react("$r1", ALICE, "$m")))
+        assert session.reaction_summary("!a:hs", "$m") == [("👍", 1)]
+
+    def test_redacting_a_reaction_subtracts_that_sender(self, session, fake_room):
+        from nio import RedactionEvent
+
+        room = fake_room("!a:hs")
+        asyncio.run(session._on_reaction(room, self.react("$r1", ALICE, "$m")))
+        asyncio.run(session._on_reaction(room, self.react("$r2", BOB, "$m")))
+        redaction = RedactionEvent.from_dict(
+            {
+                "type": "m.room.redaction",
+                "event_id": "$del",
+                "sender": ALICE,
+                "origin_server_ts": 400,
+                "redacts": "$r1",
+                "content": {},
+            }
+        )
+        asyncio.run(session._on_redaction(SimpleNamespace(room_id="!a:hs"), redaction))
+        assert session.reaction_summary("!a:hs", "$m") == [("👍", 1)]
+
+    def test_fetched_reaction_is_recorded_not_rendered(self, session, fake_room):
+        room = fake_room("!a:hs")
+        assert session._to_message(room, self.react("$r1", ALICE, "$m")) is None
+        assert session.reaction_summary("!a:hs", "$m") == [("👍", 1)]
+
+    def test_undecryptable_encrypted_reaction_is_still_counted(
+        self, session, fake_room
+    ):
+        # The wrapper carries the whole relation (target AND key) in
+        # cleartext; no key material is needed, and no "[could not decrypt]"
+        # row may appear for a thumbs-up.
+        from nio.events.room_events import Event
+
+        ev = Event.parse_event(
+            {
+                "type": "m.room.encrypted",
+                "event_id": "$enc",
+                "sender": ALICE,
+                "origin_server_ts": 100,
+                "room_id": "!a:hs",
+                "content": {
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                    "ciphertext": "xxx",
+                    "device_id": "DEV",
+                    "sender_key": "k",
+                    "session_id": "s",
+                    "m.relates_to": {
+                        "rel_type": "m.annotation",
+                        "event_id": "$m",
+                        "key": "👍",
+                    },
+                },
+            }
+        )
+        room = fake_room("!a:hs")
+        assert session._to_message(room, ev) is None
+        assert session.reaction_summary("!a:hs", "$m") == [("👍", 1)]
+
+
+class TestMentions:
+    def test_structured_mention_flags_the_message(self, session):
+        ev = text_event("$1", ALICE, 100, "please check this")
+        ev.source["content"]["m.mentions"] = {"user_ids": [ME]}
+        assert session._to_message(None, ev).mentions_me is True
+
+    def test_display_name_in_body_flags_the_message(self, session):
+        session.my_name = "Treasurer"
+        ev = text_event("$1", ALICE, 100, "ask treasurer about invoices")
+        assert session._to_message(None, ev).mentions_me is True
+
+    def test_plain_chatter_is_not_flagged(self, session):
+        session.my_name = "Treasurer"
+        ev = text_event("$1", ALICE, 100, "lunch is at noon")
+        assert session._to_message(None, ev).mentions_me is False
+
+    def test_own_message_is_never_a_ping(self, session):
+        ev = text_event("$1", ME, 100, f"I am {ME}")
+        assert session._to_message(None, ev).mentions_me is False
+
+    def test_entry_carries_the_highlight_count(self, session, fake_room):
+        room = fake_room("!a:hs", unread=5, highlights=2)
+        e = session._entry(room)
+        assert (e.unread, e.highlights) == (5, 2)
+
+
+class TestOwnEdits:
+    def run_send(self, session, coro):
+        sent = {}
+
+        async def room_send(room_id, message_type, content, **kwargs):
+            sent.update(room_id=room_id, type=message_type, content=content)
+            return SimpleNamespace(event_id="$new")
+
+        session.client.room_send = room_send
+        result = asyncio.run(coro)
+        return sent, result
+
+    def test_send_edit_wire_format_and_local_cache(self, session):
+        target = Message(sender=ME, sender_name="Me", body="typo", ts=100,
+                         event_id="$o")
+        sent, (ok, info) = self.run_send(
+            session, session.send_edit("!a:hs", target, "fixed")
+        )
+        assert ok and info == "$new"
+        content = sent["content"]
+        assert content["body"] == "* fixed"
+        assert content["m.new_content"]["body"] == "fixed"
+        assert content["m.relates_to"] == {
+            "rel_type": "m.replace",
+            "event_id": "$o",
+        }
+        # Cached at once, so the next redraw folds without waiting for sync.
+        cached = list(session.timelines["!a:hs"])
+        assert [(m.event_id, m.replaces, m.body) for m in cached] == [
+            ("$new", "$o", "fixed")
+        ]
+        folded = fold_edits([target, *cached])
+        assert [(m.event_id, m.body) for m in folded] == [("$o", "fixed")]
+
+    def test_redact_flags_the_cached_copy(self, session):
+        session.timelines["!a:hs"].append(
+            Message(sender=ME, sender_name="Me", body="oops", ts=100,
+                    event_id="$o")
+        )
+
+        async def room_redact(room_id, event_id, reason=None):
+            return SimpleNamespace(event_id="$del")
+
+        session.client.room_redact = room_redact
+        ok, info = asyncio.run(session.redact("!a:hs", "$o"))
+        assert ok
+        (cached,) = session.timelines["!a:hs"]
+        assert cached.redacted_ts > 0
+        assert cached.body == "oops"  # kept for the history popup
 
 
 class TestConnect:

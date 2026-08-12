@@ -15,6 +15,9 @@ The home screen shows three columns:
 - **DMs**: one entry per person, most recently active first, with unread
   counts and online indicators.
 
+Unread counts show in yellow; rooms where you were mentioned add a red `(N!)`
+badge. Columns taller than the terminal scroll.
+
 Plus a search overlay (`/`) over all people and rooms, and a per-room view to
 read history and send messages, which updates live as messages arrive.
 
@@ -95,7 +98,9 @@ On the home screen:
   landing back on the list you last used there
 - `Enter`: open the selected room or DM (on a space: list its rooms; on an
   invite: accept it)
-- `f`: toggle favourite on the selected room or DM
+- `f`: toggle favourite on the selected room or DM (the label reads
+  `Favourite` or `Unfavourite` to match the selected row, and disappears on
+  rows that cannot be tagged)
 - `?`: about box
 - `q`: quit (`Ctrl+Q` and the `Ctrl+P` command palette are disabled)
 
@@ -106,26 +111,59 @@ In a room:
 
 - `j` / `k` or `↓` / `↑`: move the selection down / up (the selected message
   is marked with an accent bar in the left margin); moving up past the top
-  fetches older history, all the way back to the room's first message
+  fetches older history, all the way back to the room's first message. A dim
+  `── Tue 12 Aug 2026 ──` divider marks every change of day, and reactions
+  show as a dim `👍 3` line under the message they apply to. Messages that
+  mention you get a red timestamp and a red `@` marker
 - `u`: jump to the first unread message; messages that arrived after you last
   opened the room sit below a red `── new ──` divider
-- `Enter`: act on the selected message.
-  - It holds a link (underlined and, in terminals that support it,
-    mouse-clickable): open it with the system's default browser. A message
-    with several links shows a popup to pick one. Only `http(s)` links are
-    picked up.
-  - It is an uploaded file (shown as `📎 name (size)`): download it; a popup
+- `Enter`: act on what the selected message says. The bottom bar names what it
+  will do, and says nothing when there is nothing to do:
+  - It is an uploaded file, shown as `📎 name (size)` (`Download`): a popup
     picks the destination: last-used folder, `~/Desktop`, `~/Downloads`, or
     the current directory. Encrypted attachments are decrypted on download.
+  - It holds a link, underlined and, in terminals that support it,
+    mouse-clickable (`Open link`): open it with the system's default browser.
+    Only `http(s)` links are picked up.
 
-  Both popups take `j`/`k` or `↓`/`↑` to choose, `Enter` to confirm, and
-  `Esc` to cancel.
-- `r`: reply to the selected message (inline editor below it)
-- `R`: compose a new message (editor at the end)
+  A message with several of those (more than one link, or a file with a link
+  in its caption) shows a popup to pick which (`Message actions`). Every popup
+  takes `j`/`k` or `↓`/`↑` to choose, `Enter` to confirm, and `Esc` to cancel.
+- `Shift+Enter`: look behind the selected message, when it carries a trailing
+  `*` saying the line on screen is not the whole story (`Show history`). This
+  is a separate key from `Enter` so neither has to guess which you meant on,
+  say, an edited message that also holds a link. `Alt+Enter` does the same,
+  for terminals where Shift+Enter is indistinguishable from Enter.
+  - **Edited**: shown once, with its newest text, rather than as two
+    near-identical messages. The popup lists every version oldest first with
+    the time it was sent, fetched from the server, so versions older than the
+    loaded history are included too.
+  - **Deleted**: shown as `this message has been deleted`. If the message
+    arrived before it was deleted, the popup shows the text as we received it,
+    marked with the deletion time. The server no longer holds that text, so it
+    is only available in the session that saw it: after a restart the
+    tombstone is all that is left, and there is nothing to open.
+- `r` / `R`: reply to the selected message / compose a new one. Both open a
+  five-line editor docked below the timeline (the history moves up to make
+  room); its header line names what you are replying to. A draft longer than
+  five lines scrolls inside the panel, and a message arriving mid-typing
+  redraws the history without touching what you have written. Escape stashes
+  the draft rather than destroying it: `r`/`R` in the same room (or thread)
+  hands it back, for as long as the app runs.
+- `e`: edit the selected message, when it is your own (the composer opens
+  with its current text and sends the correction as a Matrix edit)
+- `d`: delete the selected message, when it is your own; a confirmation
+  popup gates it (Enter confirms, Esc backs out)
+- `/`: search the loaded history of this room (accent-insensitive, newest
+  hit first); `Enter` jumps the selection to the picked message. It searches
+  what has been loaded this visit, including anything paged back, not the
+  server's full archive.
 - `l` / `h`: unfold / fold the selected message's thread in place. `l` on a
   message with a `⤷ N replies` badge opens its replies inline (indented,
   fetched in full from the server); `l` again steps into the first reply.
   `h` on a reply jumps back to the root; `h` on the root folds the thread.
+  Both appear in the bottom bar only when the selected message has a thread
+  to act on.
 - `t`: toggle between normal view (threads collapsed behind a dim
   `⤷ N replies` badge, except those unfolded with `l`) and threaded view
   (every reply indented as a whole under its root, with a vertical bar down
@@ -133,20 +171,14 @@ In a room:
   view you are in (`View: normal` / `View: threaded`). In threaded view,
   `h`/`l` jump out of / into a thread.
 - `T`: open the selected message's thread full-screen (or start a new one)
-- `H`: show the edit history of the selected message. A message the sender has
-  since rewritten is shown once, with its newest text and a trailing `*`
-  (rather than as two near-identical messages); the bottom bar offers `H`
-  whenever the selected message carries that marker, and the popup lists every
-  version oldest first with the time it was sent. The versions are fetched from
-  the server, so ones older than the loaded history are included too. `h` is
-  taken by threads, hence the capital.
-- `Enter`: send the editor's contents (`Shift+Enter` inserts a newline;
+- `Enter` (in the composer): send its contents (`Shift+Enter` inserts a newline;
   `Alt+Enter` does too, for terminals where Shift+Enter is indistinguishable
   from Enter)
-- `c`: toggle compact mode (no blank line between speakers)
+- `c`: toggle compact mode (no blank line between speakers); the label reads
+  `Compact: off` / `Compact: on`
 - `Esc`: cancel the editor, or go back to the home screen
 
-In a thread (opened with `t`): the composer is ready immediately and sends
+In a thread (opened with `T`): the composer is ready immediately and sends
 into the thread; `r`, `j`/`k`, and `Esc` work as in a room.
 
 ### Device verification and history decryption

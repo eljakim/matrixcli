@@ -2,16 +2,12 @@
 
 It owns the ``AsyncClient`` lifecycle (restore-from-token or password login),
 keeps the encryption store warm, observes timeline events to track recency, and
-derives the three home-screen panels:
+derives the home screen's columns (see ``dashboard()``): spaces with the
+selected space's rooms, invites, recently opened rooms, favourites, and DMs.
 
-* **Unread** -- direct chats (people) that currently have unread notifications.
-* **People** -- the most-recently-active direct chats *not* already in Unread.
-* **Rooms** -- group rooms with unread messages, plus the rooms you most
-  recently opened.
-
-Recency for People comes from message timestamps Matrix gives us; recency for
-"recently opened" Rooms is tracked locally (Matrix has no such concept) and
-stamped whenever you open a room in the UI.
+Message recency comes from the timestamps Matrix gives us; "recently opened" is
+tracked locally (Matrix has no such concept) and stamped whenever you open a
+room in the UI.
 """
 
 from __future__ import annotations
@@ -45,6 +41,9 @@ from nio import (
     MegolmEvent,
     MessageDirection,
     PresenceEvent,
+    ReactionEvent,
+    RedactedEvent,
+    RedactionEvent,
     RoomEncryptedMedia,
     RoomMessage,
     RoomMessageMedia,
@@ -118,6 +117,7 @@ class Entry:
     online: bool = False
     is_favourite: bool = False
     is_invite: bool = False  # a pending invite, not a joined room
+    highlights: int = 0  # unread mentions/keyword hits, from the server
 
 
 @dataclass
@@ -136,7 +136,13 @@ class Message:
     pending: bool = False  # local echo awaiting the server's event id
     replaces: str = ""  # an m.replace edit: the event id whose text it rewrites
     edited_ts: int = 0  # newest edit folded into this message (0: never edited)
-    original_body: str = ""  # the text before the first edit, for the "H" popup
+    original_body: str = ""  # the text before the first edit, for the history popup
+    mentions_me: bool = False  # names us: red-flagged in the timeline
+    # When the message was deleted (0: not deleted). ``body`` then holds
+    # whatever text we received before the deletion, which the server no
+    # longer has; the timeline renders a tombstone and the history popup
+    # (Shift+Enter) reveals it.
+    redacted_ts: int = 0
 
 
 def _media_info(event) -> dict:
@@ -181,6 +187,25 @@ def _thread_info(event) -> tuple[str, int]:
     return root, count
 
 
+def _event_room_id(room, event) -> str:
+    """The room an event belongs to: the MatrixRoom when the caller has one,
+    else the event's own room_id field (present on /messages fetches)."""
+    if room is not None:
+        return room.room_id
+    return (getattr(event, "source", {}) or {}).get("room_id") or ""
+
+
+def fold_text(text: str) -> str:
+    """Accent-insensitive fold for matching: "agnes" finds "Ágnes" and typing
+    the accents still works. Shared by the people/rooms search and the
+    in-room message search."""
+    return "".join(
+        c
+        for c in unicodedata.normalize("NFKD", text.lower())
+        if not unicodedata.combining(c)
+    )
+
+
 def _edit_target(event) -> str:
     """The event id this event rewrites (an m.replace edit), or "". Read from
     the wire-format event for the same reason as _thread_info: an encrypted
@@ -223,14 +248,25 @@ def fold_edits(messages: list[Message]) -> list[Message]:
 
     newest: dict[str, Message] = {}
     for m in messages:
-        if rewrites(m):
+        if rewrites(m) and not m.redacted_ts:
+            # A redacted edit is a retraction: the server un-applies it, and a
+            # fresh client shows the previous text. Folding it in would keep
+            # displaying deleted content for the rest of the session.
             current = newest.get(m.replaces)
             if current is None or m.ts > current.ts:
                 newest[m.replaces] = m
+    # (target id, edit ts) of every retracted edit, to recognize a fold the
+    # server bundled into the target (_to_message bakes body/edited_ts in)
+    # whose edit has since been deleted: the bake must be undone.
+    retracted = {(m.replaces, m.ts) for m in messages if rewrites(m) and m.redacted_ts}
     out: list[Message] = []
     for m in messages:
         if rewrites(m):
+            # Edits never render as their own row; a redacted one does not
+            # render as a tombstone either, it simply stops applying.
             continue
+        if (m.event_id, m.edited_ts) in retracted and m.original_body:
+            m = replace(m, body=m.original_body, original_body="", edited_ts=0)
         edit = newest.get(m.event_id)
         # The server bundles the latest edit onto the original (see
         # _to_message), so a message can arrive already folded; only a newer
@@ -241,11 +277,13 @@ def fold_edits(messages: list[Message]) -> list[Message]:
             if edit.body.startswith(UNDECRYPTABLE):
                 m = replace(m, edited_ts=edit.ts)
             else:
+                # The rewritten text may add or drop the mention.
                 m = replace(
                     m,
                     body=edit.body,
                     original_body=m.original_body or m.body,
                     edited_ts=edit.ts,
+                    mentions_me=edit.mentions_me,
                 )
         out.append(m)
     return out
@@ -267,6 +305,18 @@ class MatrixSession:
         # from, and whether the very beginning of history has been reached.
         self.pagination_tokens: dict[str, str] = {}
         self.pagination_done: dict[str, bool] = {}
+        # room id -> target event id -> reaction key -> senders. Sets of
+        # senders, not counts: history refetches and redelivered syncs would
+        # double-count, and removing a reaction must subtract exactly one.
+        self.reactions: dict[str, dict[str, dict[str, set[str]]]] = {}
+        # reaction event id -> (room, target, key, sender), so a redaction of
+        # the reaction event can find what to subtract.
+        self._reaction_events: dict[str, tuple[str, str, str, str]] = {}
+        # Composer text stashed when an editor is cancelled, keyed by room id
+        # (":<root>"-suffixed for threads); refilled the next time a composer
+        # opens there. In-memory only: an Escape slip should not cost a
+        # paragraph, but drafts are not worth persisting to disk.
+        self.drafts: dict[str, str] = {}
 
         token = cfg.load_token()
         self._new_client(token["device_id"] if token else None)
@@ -290,6 +340,8 @@ class MatrixSession:
             config=client_config,
         )
         self.client.add_event_callback(self._on_message, RoomMessage)
+        self.client.add_event_callback(self._on_reaction, ReactionEvent)
+        self.client.add_event_callback(self._on_redaction, RedactionEvent)
         self.client.add_presence_callback(self._on_presence, PresenceEvent)
 
     # --- connection -------------------------------------------------------
@@ -497,18 +549,12 @@ class MatrixSession:
         if getattr(name_resp, "displayname", None):
             self.my_name = name_resp.displayname
         # Force one fresh (non-incremental) sync so the server returns recent
-        # timelines for ALL rooms, seeding last-activity timestamps. With only
-        # the stored token, quiet rooms return empty timelines and would rank as
-        # if silent (so e.g. yesterday's DM disappears). Clearing next_batch
-        # makes nio sync from scratch; it then stores a new token and the live
-        # loop continues incrementally from there. set_presence asks the server
-        # to send presence for our contacts.
-        # Clear BOTH token fields: nio resolves the sync position as
-        # `next_batch or loaded_sync_token`, and loaded_sync_token is restored
-        # from the store (store_sync_tokens=True). Clearing only next_batch still
-        # resumes from the stored token, so quiet rooms return empty timelines
-        # and never seed a timestamp. Zeroing both forces a true from-scratch
-        # sync that returns recent timelines for every room.
+        # timelines for ALL rooms, seeding last-activity timestamps: resuming
+        # from a stored token gives quiet rooms empty timelines, ranking them
+        # as if silent (yesterday's DM would vanish). nio resolves the sync
+        # position as `next_batch or loaded_sync_token` (the latter restored by
+        # store_sync_tokens=True), so BOTH must be cleared; afterwards a new
+        # token is stored and the live loop continues incrementally.
         self.client.next_batch = ""
         self.client.loaded_sync_token = ""
         # No lazy_load_members: we need full member state so user_name() can
@@ -564,7 +610,7 @@ class MatrixSession:
         """Record the latest event timestamp per room from a sync response so
         recency ranking matches what the server knows, not just the messages we
         happened to receive a typed callback for. Without this, most rooms keep
-        last_ts == 0 and People/Rooms come out in arbitrary order."""
+        last_ts == 0 and the dashboard columns come out in arbitrary order."""
         rooms = getattr(getattr(response, "rooms", None), "join", {}) or {}
         changed = False
         for room_id, joined in rooms.items():
@@ -916,11 +962,24 @@ class MatrixSession:
         body = _clean(body)
         timeline = self.timelines[room.room_id]
         # The event may already be cached as our own local echo (send()
-        # appends it) or from a redelivered sync; do not append it twice.
-        if not (
-            event.event_id
-            and any(m.event_id == event.event_id for m in timeline)
-        ):
+        # appends it) or from a redelivered sync; do not append it twice. The
+        # echo carries this machine's wall-clock time though, and every later
+        # merge lets cached entries win, so a skewed clock would misorder the
+        # timeline forever: adopt the server's timestamp here.
+        cached_at = next(
+            (
+                i
+                for i, m in enumerate(timeline)
+                if event.event_id and m.event_id == event.event_id
+            ),
+            None,
+        )
+        if cached_at is not None:
+            if timeline[cached_at].ts != event.server_timestamp:
+                timeline[cached_at] = replace(
+                    timeline[cached_at], ts=event.server_timestamp
+                )
+        else:
             thread_root, thread_count = _thread_info(event)
             timeline.append(
                 Message(
@@ -932,6 +991,7 @@ class MatrixSession:
                     thread_root=thread_root,
                     thread_count=thread_count,
                     replaces=replaces,
+                    mentions_me=self._mentions_me(event, body),
                     **_media_info(event),
                 )
             )
@@ -942,6 +1002,78 @@ class MatrixSession:
         # the last one seen. Deliberately not gated on the timestamp: a remote
         # homeserver's clock can lag ours, and a timestamp gate would then pin
         # this to an older event and live refresh would never trigger.
+        if event.event_id:
+            self.last_event_id[room.room_id] = event.event_id
+
+    def _mentions_me(self, event, body: str) -> bool:
+        """Whether an event names this account: the structured m.mentions list
+        when the sender's client set one, else the reply-era fallback of our
+        display name or user id appearing in the body. Own messages never
+        count (quoting yourself is not a ping)."""
+        if event.sender == self.cfg.user_id:
+            return False
+        content = (getattr(event, "source", {}) or {}).get("content", {}) or {}
+        mentions = content.get("m.mentions")
+        if isinstance(mentions, dict):
+            ids = mentions.get("user_ids")
+            if isinstance(ids, list) and self.cfg.user_id in ids:
+                return True
+        folded = (body or "").casefold()
+        if self.cfg.user_id.casefold() in folded:
+            return True
+        name = (self.my_name or "").casefold()
+        return bool(name) and name != self.cfg.user_id.casefold() and name in folded
+
+    def _note_reaction(
+        self, room_id: str, event_id: str, sender: str, target: str, key: str
+    ) -> None:
+        """Record one m.reaction into the per-message aggregates."""
+        # Strip the emoji variation selector: clients disagree on sending
+        # "👍" vs "👍️", and a vote count split into two buckets over an
+        # invisible codepoint miscounts the vote.
+        key = _clean(key).replace("️", "")[:16]
+        if not (room_id and event_id and sender and target and key):
+            return
+        by_key = self.reactions.setdefault(room_id, {}).setdefault(target, {})
+        by_key.setdefault(key, set()).add(sender)
+        self._reaction_events[event_id] = (room_id, target, key, sender)
+
+    def reaction_summary(self, room_id: str, event_id: str) -> list[tuple[str, int]]:
+        """(key, count) pairs for one message, most-used first."""
+        by_key = self.reactions.get(room_id, {}).get(event_id) or {}
+        return sorted(
+            ((k, len(s)) for k, s in by_key.items() if s),
+            key=lambda kv: (-kv[1], kv[0]),
+        )
+
+    async def _on_reaction(self, room: MatrixRoom, event: ReactionEvent) -> None:
+        self._note_reaction(
+            room.room_id, event.event_id, event.sender, event.reacts_to, event.key
+        )
+        # Nothing was appended to the timeline; the open room view redraws off
+        # the latest-event id, so bump it (same as _on_redaction).
+        if event.event_id:
+            self.last_event_id[room.room_id] = event.event_id
+
+    async def _on_redaction(self, room: MatrixRoom, event: RedactionEvent) -> None:
+        """A deletion arrives as its own event naming the id it removes. Flag
+        the cached copy instead of dropping it: the text is already gone from
+        the server, so what we received earlier is all anyone can still show,
+        and it stays available in the history popup for the rest of the session."""
+        # Redacting a reaction takes the vote back: subtract that one sender.
+        noted = self._reaction_events.pop(event.redacts or "", None)
+        if noted is not None:
+            room_id, target, key, sender = noted
+            senders = self.reactions.get(room_id, {}).get(target, {}).get(key)
+            if senders is not None:
+                senders.discard(sender)
+        timeline = self.timelines.get(room.room_id)
+        for i, m in enumerate(timeline or ()):
+            if m.event_id and m.event_id == event.redacts:
+                timeline[i] = replace(m, redacted_ts=event.server_timestamp)
+                break
+        # Nothing was appended, so the open room view has to be told to redraw
+        # some other way; the latest-event id is what it watches.
         if event.event_id:
             self.last_event_id[room.room_id] = event.event_id
 
@@ -1066,8 +1198,10 @@ class MatrixSession:
         else:
             title = room.display_name
         # notification_count already includes highlights (mentions); adding
-        # unread_highlights on top would count every mention twice.
+        # unread_highlights on top would count every mention twice. The
+        # highlight count is carried separately for the red (N!) badge.
         unread = room.unread_notifications or 0
+        highlights = room.unread_highlights or 0
         online = bool(person) and self.presence.get(person) == "online"
         is_favourite = "m.favourite" in (room.tags or {})
         return Entry(
@@ -1078,6 +1212,7 @@ class MatrixSession:
             person=person,
             last_ts=self.state["last_event_ts"].get(room_id, 0),
             is_space=is_space,
+            highlights=highlights,
             online=online,
             is_favourite=is_favourite,
         )
@@ -1085,12 +1220,12 @@ class MatrixSession:
     def dashboard(self, selected_space: str | None = None) -> dict:
         """Data for the three-column home screen.
 
-        Columns:
-        * spaces  -- the list of spaces, plus the child rooms of the selected
-                     one (room ids resolved from each space's m.space.child
-                     state, exposed by nio as room.children).
+        Keys:
+        * spaces / space_rooms -- the list of spaces, and the child rooms of
+                     the selected one (resolved from m.space.child state).
         * invites -- pending invitations (accept with Enter); shown above
-                     favourites, hidden when empty.
+                     Recent, hidden when empty.
+        * recent  -- the rooms most recently opened in this client.
         * favourites -- rooms (or DMs) tagged m.favourite.
         * dms     -- one entry per person, most-recently-active first.
         """
@@ -1248,22 +1383,13 @@ class MatrixSession:
         return None
 
     def search(self, query: str) -> list[Entry]:
-        # Accent-insensitive: fold both sides, so "agnes" finds "Ágnes" and
-        # typing the accents still works.
-        def fold(text: str) -> str:
-            return "".join(
-                c
-                for c in unicodedata.normalize("NFKD", text.lower())
-                if not unicodedata.combining(c)
-            )
-
-        q = fold(query.strip())
+        q = fold_text(query.strip())
         if not q:
             return []
         out = []
         for room in self.client.rooms.values():
             e = self._entry(room)
-            haystack = fold(f"{e.title} {e.person or ''} {e.room_id}")
+            haystack = fold_text(f"{e.title} {e.person or ''} {e.room_id}")
             if q in haystack:
                 out.append(e)
         out.sort(key=lambda e: (e.unread == 0, -e.last_ts, e.title.lower()))
@@ -1276,6 +1402,29 @@ class MatrixSession:
         Encrypted events are decrypted here (server fetches do not decrypt);
         ones we lack keys for become a placeholder rather than being
         dropped."""
+        if isinstance(event, RedactedEvent):
+            # Only a deleted *message* gets a tombstone. Removing a reaction
+            # redacts an event too, and the timeline never showed that one, so
+            # marking it would invent a deletion the user cannot have seen.
+            if event.type not in ("m.room.message", "m.room.encrypted"):
+                return None
+            # Deletion strips the content server-side: nothing but who did it
+            # and when survives the fetch. Any text we received before that
+            # lives on in the timeline cache, which load_history's merge keeps.
+            because = (
+                (getattr(event, "source", {}) or {}).get("unsigned") or {}
+            ).get("redacted_because") or {}
+            return Message(
+                sender=event.sender,
+                sender_name=_clean(
+                    (room.user_name(event.sender) if room else event.sender)
+                    or event.sender
+                ),
+                body="",
+                ts=event.server_timestamp,
+                event_id=event.event_id,
+                redacted_ts=because.get("origin_server_ts") or event.server_timestamp,
+            )
         decrypt_error: Exception | None = None
         # Thread info comes from the wire-format event: the encrypted wrapper
         # still has the server's unsigned m.relations aggregation, which nio
@@ -1301,6 +1450,19 @@ class MatrixSession:
                 root, count = _thread_info(event)
                 thread_root = thread_root or root
                 thread_count = max(thread_count, count)
+        if isinstance(event, ReactionEvent):
+            # Arrived plaintext or just decrypted from the Megolm wrapper:
+            # record it and drop it. Reactions render as a badge on their
+            # target, never as their own row. The room id comes from the
+            # event itself when the rooms map is not populated yet.
+            self._note_reaction(
+                _event_room_id(room, event),
+                event.event_id,
+                event.sender,
+                event.reacts_to,
+                event.key,
+            )
+            return None
         if isinstance(event, RoomMessage):
             name = room.user_name(event.sender) if room else event.sender
             body = getattr(event, "body", None)
@@ -1310,6 +1472,22 @@ class MatrixSession:
             if not body:
                 body = f"[{type(event).__name__}]"
         elif isinstance(event, MegolmEvent):
+            # An encrypted reaction we hold no key for is still fully legible:
+            # the spec requires the whole m.relates_to (target AND key) in the
+            # cleartext wrapper so servers can aggregate. Record it instead of
+            # rendering a "[could not decrypt]" row for a mere thumbs-up.
+            relates = (
+                (getattr(event, "source", {}) or {}).get("content", {}) or {}
+            ).get("m.relates_to") or {}
+            if isinstance(relates, dict) and relates.get("rel_type") == "m.annotation":
+                self._note_reaction(
+                    _event_room_id(room, event),
+                    event.event_id,
+                    event.sender,
+                    relates.get("event_id") or "",
+                    relates.get("key") or "",
+                )
+                return None
             name = room.user_name(event.sender) if room else event.sender
             if decrypt_error is not None:
                 body = f"[encrypted: could not decrypt ({_clean(str(decrypt_error))})]"
@@ -1347,6 +1525,7 @@ class MatrixSession:
             replaces=replaces,
             edited_ts=edited_ts,
             original_body=original_body,
+            mentions_me=self._mentions_me(event, body),
             **_media_info(event),
         )
 
@@ -1386,7 +1565,20 @@ class MatrixSession:
         for m in fetched:
             merged[m.event_id or f"ts:{m.ts}:{m.sender}"] = m
         for m in cached:
-            merged[m.event_id or f"ts:{m.ts}:{m.sender}"] = m
+            key = m.event_id or f"ts:{m.ts}:{m.sender}"
+            server = merged.get(key)
+            if server is not None and server.redacted_ts and not m.redacted_ts:
+                # The server says this one was deleted while we were away.
+                # Keep the text we already hold (nobody can fetch it again)
+                # but mark it, so the timeline shows the deletion.
+                m = replace(m, redacted_ts=server.redacted_ts)
+            if server is not None and server.ts != m.ts:
+                # Cached wins on content (it may be decrypted), but the
+                # server's origin_server_ts is authoritative: a send() echo
+                # carries this machine's wall clock, and a skewed clock would
+                # misplace our own messages in the ts-sorted timeline.
+                m = replace(m, ts=server.ts)
+            merged[key] = m
         history = sorted(merged.values(), key=lambda m: m.ts)
         # Write the merged history back into the in-memory timeline so the next
         # open (and the live-refresh path) does not refetch and re-decrypt the
@@ -1396,12 +1588,23 @@ class MatrixSession:
         timeline.extend(history)
         return history[-limit:]
 
-    async def load_older(self, room_id: str, limit: int = HISTORY_LIMIT) -> list[Message]:
+    def reset_pagination(self, room_id: str) -> None:
+        """Forget the back-pagination position for a room. Called when a room
+        screen opens: the messages fetched by load_older live only on the
+        screen and die with it, but the token would survive here, and a reopen
+        that resumed from it would silently skip everything between the fresh
+        visible window and the previous visit's depth."""
+        self.pagination_tokens.pop(room_id, None)
+        self.pagination_done.pop(room_id, None)
+
+    async def load_older(self, room_id: str, limit: int = HISTORY_LIMIT) -> list[Message] | None:
         """The next batch of history older than what has been fetched so far,
         oldest first. Returns [] once the room's very first event has been
-        reached (or on error). The position is tracked per room; the first
-        call continues from where load_history's initial window ended, so
-        repeated calls walk arbitrarily far back."""
+        reached, and None on a failed request: the two must stay distinct, or
+        one transient network error would masquerade as "beginning of history"
+        and stop back-pagination for the rest of the visit. The position is
+        tracked per room; the first call continues from where load_history's
+        initial window ended, so repeated calls walk arbitrarily far back."""
         if self.pagination_done.get(room_id):
             return []
         room = self.client.rooms.get(room_id)
@@ -1413,7 +1616,7 @@ class MatrixSession:
             limit=limit,
         )
         if isinstance(resp, RoomMessagesError):
-            return []
+            return None
         end = getattr(resp, "end", None)
         if end:
             self.pagination_tokens[room_id] = end
@@ -1459,8 +1662,40 @@ class MatrixSession:
                 fetched.append(msg)
 
         merged: dict[str, Message] = {m.event_id: m for m in fetched}
-        for m in self.timelines.get(room_id, []):
-            if m.thread_root == root.event_id and m.event_id:
+        cached = list(self.timelines.get(room_id, []))
+        for m in cached:
+            if m.thread_root != root.event_id or not m.event_id:
+                continue
+            server = merged.get(m.event_id)
+            if server is not None:
+                # Cached wins (it may be decrypted), but the server copy can
+                # know things the cache does not: an edit it bundled and
+                # _to_message folded in, or a deletion we were away for.
+                # Without this the thread view would show a reply's pre-edit
+                # text while the main timeline shows the current one.
+                if server.edited_ts > m.edited_ts and not server.body.startswith(
+                    UNDECRYPTABLE
+                ):
+                    m = replace(
+                        m,
+                        body=server.body,
+                        original_body=server.original_body or m.body,
+                        edited_ts=server.edited_ts,
+                    )
+                if server.redacted_ts and not m.redacted_ts:
+                    m = replace(m, redacted_ts=server.redacted_ts)
+            merged[m.event_id] = m
+        # A live edit of a thread reply sits in the cache with no thread root
+        # of its own (its relation is m.replace, not m.thread), and the
+        # /relations m.thread fetch never returns it either; splice those in
+        # so the screen's fold_edits can apply them.
+        for m in cached:
+            if (
+                m.event_id
+                and m.event_id not in merged
+                and m.replaces
+                and (m.replaces in merged or m.replaces == root.event_id)
+            ):
                 merged[m.event_id] = m
         replies = sorted(merged.values(), key=lambda m: m.ts)
         return [root] + replies
@@ -1480,16 +1715,21 @@ class MatrixSession:
         )
         headers = {"Authorization": f"Bearer {self.client.access_token}"}
         chunk: list = []
-        try:
-            # Bounded: this one backs a popup the user is waiting in front of.
-            timeout = aiohttp.ClientTimeout(total=10)
-            async with aiohttp.ClientSession(timeout=timeout) as http:
-                async with http.get(url, headers=headers, allow_redirects=False) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        chunk = data.get("chunk", []) or []
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
-            pass
+        # A deleted message has no server-side content left to ask about, so
+        # what we still hold locally is the whole history there is.
+        if not message.redacted_ts:
+            try:
+                # Bounded: this backs a popup the user is waiting in front of.
+                timeout = aiohttp.ClientTimeout(total=10)
+                async with aiohttp.ClientSession(timeout=timeout) as http:
+                    async with http.get(
+                        url, headers=headers, allow_redirects=False
+                    ) as r:
+                        if r.status == 200:
+                            data = await r.json()
+                            chunk = data.get("chunk", []) or []
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+                pass
 
         versions: dict[str, Message] = {}
         for source in chunk:
@@ -1564,6 +1804,67 @@ class MatrixSession:
             self.last_event_id[room_id] = resp.event_id
             return True, resp.event_id
         return False, getattr(resp, "message", "send failed")
+
+    async def send_edit(
+        self, room_id: str, target: Message, text: str
+    ) -> tuple[bool, str]:
+        """Rewrite one of our own messages: an m.replace event with the new
+        text in m.new_content and the "* " fallback body for clients that do
+        not understand edits (the same wire format we fold when receiving)."""
+        content = {
+            "msgtype": "m.text",
+            "body": f"* {text}",
+            "m.new_content": {"msgtype": "m.text", "body": text},
+            "m.relates_to": {
+                "rel_type": "m.replace",
+                "event_id": target.event_id,
+            },
+        }
+        try:
+            resp = await self.client.room_send(
+                room_id,
+                message_type="m.room.message",
+                content=content,
+                ignore_unverified_devices=self.cfg.allow_unverified,
+            )
+        except Exception as exc:
+            return False, str(exc)
+        if hasattr(resp, "event_id") and resp.event_id:
+            # Cache the edit right away so the very next redraw folds it; the
+            # sync echo later merges on the event id.
+            self.timelines[room_id].append(
+                Message(
+                    sender=self.cfg.user_id,
+                    sender_name=self.my_name,
+                    body=text,
+                    ts=int(time.time() * 1000),
+                    event_id=resp.event_id,
+                    replaces=target.event_id,
+                )
+            )
+            self.last_event_id[room_id] = resp.event_id
+            return True, resp.event_id
+        return False, getattr(resp, "message", "edit failed")
+
+    async def redact(self, room_id: str, event_id: str) -> tuple[bool, str]:
+        """Delete one of our own messages. On success the cached copy is
+        flagged immediately, exactly as if the redaction had arrived from the
+        server (see _on_redaction)."""
+        try:
+            resp = await self.client.room_redact(room_id, event_id)
+        except Exception as exc:
+            return False, str(exc)
+        if hasattr(resp, "event_id") and resp.event_id:
+            timeline = self.timelines.get(room_id)
+            for i, m in enumerate(timeline or ()):
+                if m.event_id == event_id:
+                    timeline[i] = replace(
+                        m, redacted_ts=int(time.time() * 1000)
+                    )
+                    break
+            self.last_event_id[room_id] = resp.event_id
+            return True, resp.event_id
+        return False, getattr(resp, "message", "delete failed")
 
     async def download_media(self, message: Message, directory) -> tuple[bool, str]:
         """Download an uploaded file into ``directory`` (a Path), decrypting

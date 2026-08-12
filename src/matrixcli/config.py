@@ -9,7 +9,7 @@ Three kinds of persistence live here:
   yourself before first run) and, after the first login, a cached access token +
   device id so later launches never need the password again.
 * ``state.json`` (non-secret): per-room "last event seen" and "last opened"
-  timestamps, used to rank the People and Rooms panels on the home screen.
+  timestamps, used to rank the home screen's Recent, Favourites, and DMs.
 """
 
 from __future__ import annotations
