@@ -88,7 +88,11 @@ On the home screen:
 - `/`: search people and rooms (accent-insensitive: `agnes` finds `Ágnes`);
   `↓`/`↑` move through the results while you keep typing, `Enter` opens the
   highlighted hit
-- `tab` / `shift+tab`: move between columns
+- `j` / `k` or `↓` / `↑`: move the selection down / up; `j` and `k` treat a
+  column as one continuous list, so they roll on from Spaces into its Rooms,
+  and from Invites through Recent into Favourites
+- `l` / `h` (or `tab` / `shift+tab`): move to the next / previous column,
+  landing back on the list you last used there
 - `Enter`: open the selected room or DM (on a space: list its rooms; on an
   invite: accept it)
 - `f`: toggle favourite on the selected room or DM
@@ -129,6 +133,13 @@ In a room:
   view you are in (`View: normal` / `View: threaded`). In threaded view,
   `h`/`l` jump out of / into a thread.
 - `T`: open the selected message's thread full-screen (or start a new one)
+- `H`: show the edit history of the selected message. A message the sender has
+  since rewritten is shown once, with its newest text and a trailing `*`
+  (rather than as two near-identical messages); the bottom bar offers `H`
+  whenever the selected message carries that marker, and the popup lists every
+  version oldest first with the time it was sent. The versions are fetched from
+  the server, so ones older than the loaded history are included too. `h` is
+  taken by threads, hence the capital.
 - `Enter`: send the editor's contents (`Shift+Enter` inserts a newline;
   `Alt+Enter` does too, for terminals where Shift+Enter is indistinguishable
   from Enter)

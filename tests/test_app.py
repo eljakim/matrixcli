@@ -541,3 +541,137 @@ class TestConnStatus:
         text = self.render(time.monotonic() - 120, True)
         assert "offline" in text.plain
         assert text.plain.endswith("2m")
+
+
+class TestEditedMessages:
+    """An edit folded into the timeline: one line, a trailing "*", and the "H"
+    key offered only while that line is selected."""
+
+    def screen(self, monkeypatch, history):
+        screen = RoomScreen(make_entry())
+
+        async def load_history(room_id):
+            return list(history)
+
+        fake_app = SimpleNamespace(
+            session=SimpleNamespace(
+                load_history=load_history,
+                my_name="Me",
+                cfg=SimpleNamespace(user_id="@me:hs"),
+            )
+        )
+        monkeypatch.setattr(
+            RoomScreen, "app", property(lambda self: fake_app), raising=False
+        )
+        screen.messages = asyncio.run(screen._load_messages())
+        return screen
+
+    def history(self):
+        return [
+            msg("$o", 100),
+            Message(
+                sender="@a:hs", sender_name="A", body="fixed", ts=200,
+                event_id="$e", replaces="$o",
+            ),
+            msg("$plain", 300),
+        ]
+
+    def body_cell(self, screen, index):
+        # Last row of the two-column grid: the timestamp and the message text.
+        grid = screen._render_message(screen.messages[index], None, index)
+        return list(grid.columns[1].cells)[-1].plain
+
+    def test_edit_collapses_into_one_line_with_a_marker(self, monkeypatch):
+        screen = self.screen(monkeypatch, self.history())
+        assert [m.event_id for m in screen.messages] == ["$o", "$plain"]
+        assert screen.messages[0].original_body == "$o"  # kept for the popup
+        assert self.body_cell(screen, 0) == "fixed *"
+
+    def test_plain_message_has_no_marker(self, monkeypatch):
+        screen = self.screen(monkeypatch, self.history())
+        assert self.body_cell(screen, 1) == "$plain"
+
+    def test_edits_key_is_offered_only_on_an_edited_message(self, monkeypatch):
+        screen = self.screen(monkeypatch, self.history())
+        screen.selected = 0
+        assert screen.check_action("edits", None) is True
+        screen.selected = 1
+        assert screen.check_action("edits", None) is False
+
+
+class TestHomeKeys:
+    """hjkl on the dashboard, driven through a real (headless) app so the
+    bindings, the hidden invites section, and focus all take part."""
+
+    def dashboard(self, invites=(), dms=("Dana", "Eve")):
+        def rooms(names, **kw):
+            return [make_entry(room_id=f"!{n}:hs", title=n, **kw) for n in names]
+
+        return {
+            "spaces": rooms(["Space1", "Space2"], is_space=True),
+            "space_rooms": rooms(["RoomA", "RoomB"]),
+            "invites": rooms(invites, is_invite=True),
+            "recent": rooms(["Chat1", "Chat2"]),
+            "favourites": rooms(["Fav1"]),
+            "dms": rooms(dms, is_direct=True),
+        }
+
+    def walk(self, keys, **kw):
+        """Press keys on a freshly mounted HomeScreen; return the (list id,
+        highlighted index) the cursor sits on after each one."""
+        from textual.app import App
+        from textual.widgets import ListView
+
+        data = self.dashboard(**kw)
+        session = SimpleNamespace(
+            cfg=SimpleNamespace(user_id="@me:hs", save_state=lambda state: None),
+            state={},
+            dashboard=lambda selected_space: data,
+        )
+
+        class HomeApp(App):
+            def on_mount(self):
+                self.session = session
+                return self.push_screen(HomeScreen())
+
+        async def run():
+            positions = []
+            app = HomeApp()
+            async with app.run_test() as pilot:
+                screen = app.screen
+                for key in keys:
+                    await pilot.press(key)
+                    await pilot.pause()
+                    for cid in [c for col in screen.COLUMNS for c in col]:
+                        lv = screen.query_one(f"#{cid}", ListView)
+                        if lv.has_focus:
+                            positions.append((cid, lv.index))
+                            break
+            return positions
+
+        return asyncio.run(run())
+
+    def test_j_and_k_walk_a_column_as_one_list(self):
+        # Focus starts on Recent; j runs off its end into Favourites below it,
+        # stops at the bottom of the column, and k retraces the same path.
+        assert self.walk("jjjkk") == [
+            ("recent", 1),
+            ("favourites", 0),
+            ("favourites", 0),
+            ("recent", 1),
+            ("recent", 0),
+        ]
+
+    def test_l_and_h_step_between_columns_and_wrap(self):
+        assert self.walk("lhh") == [("dms", 0), ("recent", 0), ("spaces", 0)]
+
+    def test_h_returns_to_the_row_you_left_the_column_on(self):
+        # Down to Favourites, out to DMs and back: Favourites, not the top.
+        assert self.walk("jjlh")[-1] == ("favourites", 0)
+
+    def test_hidden_and_empty_sections_are_skipped(self):
+        # Invites is displayed only when there are any, and an all-empty column
+        # is passed over rather than focused with nothing to highlight.
+        assert self.walk("kk") == [("recent", 0), ("recent", 0)]
+        assert self.walk("kk", invites=["Inv1"]) == [("invites", 0), ("invites", 0)]
+        assert self.walk("l", dms=()) == [("spaces", 0)]

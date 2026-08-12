@@ -49,7 +49,7 @@ from rich.text import Text
 
 from nio import SyncResponse
 
-from .client import Entry, MatrixSession
+from .client import Entry, MatrixSession, fold_edits
 from .config import Config
 
 
@@ -258,6 +258,9 @@ class RoomScreen(Screen):
         Binding("t", "threads_on", "View: normal"),
         Binding("t", "threads_off", "View: threaded"),
         ("T", "thread", "Open thread"),
+        # Shown by check_action only while the selected message carries a "*",
+        # so the footer offers it exactly when there is history to show.
+        ("H", "edits", "Edits"),
         ("c", "toggle_compact", "Compact"),
     ]
 
@@ -313,6 +316,9 @@ class RoomScreen(Screen):
             for m in messages:
                 merged[m.event_id] = m
             messages = sorted(merged.values(), key=lambda m: m.ts)
+        # After the splice, so an edit found by back-pagination still folds
+        # into a target from the live window (and vice versa).
+        messages = fold_edits(messages)
         counts: dict[str, int] = {}
         replies: dict[str, list] = {}
         main = []
@@ -550,6 +556,9 @@ class RoomScreen(Screen):
     def _highlight(self, scroll: bool = True) -> None:
         for line in self.query(MessageLine):
             line.set_class(line.msg_index == self.selected, "selected")
+        # The "Edits" key belongs to the selected message, so the footer has to
+        # re-evaluate it every time the selection moves.
+        self.refresh_bindings()
         if not scroll:
             return
         try:
@@ -755,6 +764,12 @@ class RoomScreen(Screen):
             return not self.threaded
         if action == "threads_off":
             return self.threaded
+        if action == "edits":
+            # The framework re-checks this on every footer redraw, which can
+            # land between a reload and the selection being clamped to it.
+            if self.selected >= len(self.messages):
+                return False
+            return bool(self.messages[self.selected].edited_ts)
         return True
 
     def _toggle_threads(self) -> None:
@@ -804,6 +819,7 @@ class RoomScreen(Screen):
             if size:
                 label.append(f"  ({size})", style="dim")
             label.append("  Enter to download", style="dim italic")
+            self._mark_edited(label, m)
             grid.add_row(_fmt_time(m.ts), label)
         else:
             # An unconfirmed local echo renders dimmer than a delivered own
@@ -818,12 +834,19 @@ class RoomScreen(Screen):
                 # also mouse-clickable in terminals that support it; the
                 # underline marks it in the ones that do not.
                 text.stylize(f"underline deep_sky_blue1 link {url}", start, end)
+            self._mark_edited(text, m)
             grid.add_row(_fmt_time(m.ts), text)
         count = self.thread_counts.get(m.event_id, 0)
         if count and not self.threaded and m.event_id not in self.expanded:
             label = "reply" if count == 1 else "replies"
             grid.add_row("", Text(f"⤷ {count} {label}", style="dim italic"))
         return grid
+
+    def _mark_edited(self, text: Text, m) -> None:
+        """A trailing "*" on a message the sender has since rewritten. The
+        timeline shows the newest version; "H" opens the earlier ones."""
+        if m.edited_ts:
+            text.append(" *", style="dim")
 
     def action_compose(self) -> None:
         self.reply_to = None
@@ -839,6 +862,13 @@ class RoomScreen(Screen):
         self.reply_to = m
         self._composing = False
         self.run_worker(self._redraw())
+
+    def action_edits(self) -> None:
+        if not self.messages:
+            return
+        m = self.messages[self.selected]
+        if m.edited_ts:
+            self.app.push_screen(EditsScreen(self.entry, m))
 
     def action_open(self) -> None:
         """Enter on the selected message: an uploaded file asks where to save
@@ -1077,7 +1107,7 @@ class ThreadScreen(RoomScreen):
 
     async def _load_messages(self) -> list:
         thread = await self.app.session.load_thread(self.entry.room_id, self.root)
-        return self._splice_pending(thread)
+        return self._splice_pending(fold_edits(thread))
 
     def _first_unread_index(self) -> int | None:
         """The room-level unread count counts main-timeline events, so it says
@@ -1216,6 +1246,59 @@ class LinkScreen(PickerScreen):
         self.dismiss(getattr(event.item, "url", None))
 
 
+class EditsScreen(ModalScreen):
+    """Every version of a message the sender has rewritten, oldest first, each
+    with the time it was sent and the newest marked as the one on screen.
+    Escape (or H again) closes it."""
+
+    BINDINGS = [
+        ("escape", "dismiss", "Close"),
+        ("enter", "dismiss", "Close"),
+        ("H", "dismiss", "Close"),
+    ]
+
+    def __init__(self, entry: Entry, message) -> None:
+        super().__init__()
+        self.entry = entry
+        self.message = message
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="editsbox"):
+            # escape(): the display name comes from the sender, and unescaped
+            # a "[" in it is parsed as console markup.
+            title = f"Edit history: {escape(self.message.sender_name)}"
+            yield Label(title, id="editstitle")
+            with VerticalScroll(id="versions"):
+                yield Static(Text("fetching earlier versions...", style="dim italic"))
+
+    def on_mount(self) -> None:
+        # In a worker, so Escape closes the popup even while the fetch is in
+        # flight; until it lands the box shows its placeholder line.
+        self.run_worker(self._fill())
+
+    async def _fill(self) -> None:
+        versions = await self.app.session.load_edits(
+            self.entry.room_id, self.message
+        )
+        if not self.is_attached:
+            return
+        box = self.query_one("#versions", VerticalScroll)
+        await box.remove_children()
+        for i, v in enumerate(versions):
+            grid = Table.grid(expand=True, padding=(0, 1, 0, 0))
+            grid.add_column(width=5, justify="left", style="dim", vertical="top")
+            grid.add_column(ratio=1, justify="left")
+            # The bodies are remote text: Text() (not markup) keeps "[b" and
+            # friends literal, exactly as the timeline renders them.
+            text = Text((v.body or "").strip() or "[no text]")
+            if i == len(versions) - 1 and len(versions) > 1:
+                text.append("  (shown in the timeline)", style="dim italic")
+            grid.add_row(_fmt_time(v.ts), text)
+            await box.mount(Static(grid))
+            if i != len(versions) - 1:
+                await box.mount(Rule(line_style="dashed"))
+
+
 class AboutScreen(ModalScreen):
     BINDINGS = [
         ("escape", "dismiss", "Close"),
@@ -1323,17 +1406,33 @@ class LoadingScreen(Screen):
 class HomeScreen(Screen):
     BINDINGS = [
         ("slash", "app.search", "Search"),
-        ("tab", "focus_next_column", "Next column"),
-        ("shift+tab", "focus_prev_column", "Prev column"),
+        # The four movement keys take one footer slot: "hjkl" reads as a unit,
+        # so only this binding is shown and the rest stay live but unlisted.
+        Binding("j", "down", "Select room", key_display="hjkl"),
+        Binding("k", "up", show=False),
+        Binding("l", "focus_next_column", show=False),
+        Binding("h", "focus_prev_column", show=False),
+        Binding("tab", "focus_next_column", show=False),
+        Binding("shift+tab", "focus_prev_column", show=False),
         ("f", "toggle_favourite", "Favourite"),
         ("q", "app.quit", "Quit"),
     ]
 
-    COLUMN_IDS = ["spaces", "favourites", "dms"]
+    # The three visual columns, each a top-to-bottom stack of lists. "j"/"k"
+    # walk a whole column as if it were one list (spilling from the bottom of
+    # one into the top of the next), "h"/"l" step between columns.
+    COLUMNS = [
+        ["spaces", "space_rooms"],
+        ["invites", "recent", "favourites"],
+        ["dms"],
+    ]
 
     def __init__(self) -> None:
         super().__init__()
         self._last_signature = None
+        # Column index -> id of the list last focused there, so "h"/"l" return
+        # you to the row you were using instead of the top of the column.
+        self._last_in_column: dict[int, str] = {}
         # refresh_data is reached from both the app pump (background sync) and
         # this screen's own handlers; the lock keeps rebuilds from interleaving.
         self._refresh_lock = asyncio.Lock()
@@ -1480,11 +1579,58 @@ class HomeScreen(Screen):
         )
 
     def _focused_list(self) -> "ListView | None":
-        for cid in self.COLUMN_IDS + ["space_rooms", "invites", "recent"]:
+        for cid in [c for column in self.COLUMNS for c in column]:
             lv = self.query_one(f"#{cid}", ListView)
             if lv.has_focus:
                 return lv
         return None
+
+    def _focused_column(self) -> int:
+        for i, column in enumerate(self.COLUMNS):
+            if any(self.query_one(f"#{c}", ListView).has_focus for c in column):
+                return i
+        return 0
+
+    def _entries_of(self, lv: ListView) -> list:
+        # Empty lists hold a single disabled "(none)" placeholder, so the row
+        # count is not the entry count; real entries always start at index 0.
+        return [c for c in lv.children if isinstance(c, EntryItem)]
+
+    def on_descendant_focus(self, event: textual.events.DescendantFocus) -> None:
+        for i, column in enumerate(self.COLUMNS):
+            if event.widget.id in column:
+                self._last_in_column[i] = event.widget.id
+
+    def action_down(self) -> None:
+        self._step(1)
+
+    def action_up(self) -> None:
+        self._step(-1)
+
+    def _step(self, delta: int) -> None:
+        lv = self._focused_list()
+        if lv is None:
+            return
+        if self._entries_of(lv):
+            before = lv.index
+            if delta > 0:
+                lv.action_cursor_down()
+            else:
+                lv.action_cursor_up()
+            if lv.index != before:
+                return
+        # Already at the end of this list: continue into the next one down (or
+        # up) in the same column, skipping hidden and empty sections.
+        ids = self.COLUMNS[self._focused_column()]
+        i = (ids.index(lv.id) if lv.id in ids else 0) + delta
+        while 0 <= i < len(ids):
+            nxt = self.query_one(f"#{ids[i]}", ListView)
+            entries = self._entries_of(nxt)
+            if nxt.display and entries:
+                nxt.index = 0 if delta > 0 else len(entries) - 1
+                nxt.focus()
+                return
+            i += delta
 
     def action_focus_next_column(self) -> None:
         self._cycle_column(1)
@@ -1493,14 +1639,21 @@ class HomeScreen(Screen):
         self._cycle_column(-1)
 
     def _cycle_column(self, delta: int) -> None:
-        order = [
-            c
-            for c in ["spaces", "space_rooms", "invites", "recent", "favourites", "dms"]
-            if self.query_one(f"#{c}", ListView).display
-        ]
-        current = next((c for c in order if self.query_one(f"#{c}", ListView).has_focus), order[0])
-        i = (order.index(current) + delta) % len(order)
-        self.query_one(f"#{order[i]}", ListView).focus()
+        # Columns with nothing to highlight are skipped rather than focused, so
+        # "h"/"l" never land you somewhere the cursor cannot go.
+        start = self._focused_column()
+        for step in range(1, len(self.COLUMNS) + 1):
+            target = (start + delta * step) % len(self.COLUMNS)
+            ids = self.COLUMNS[target]
+            remembered = self._last_in_column.get(target)
+            order = ([remembered] if remembered in ids else []) + [
+                c for c in ids if c != remembered
+            ]
+            for cid in order:
+                lv = self.query_one(f"#{cid}", ListView)
+                if lv.display and self._entries_of(lv):
+                    lv.focus()
+                    return
 
     async def on_list_view_selected(self, event: ListView.Selected) -> None:
         if not isinstance(event.item, EntryItem):
@@ -1587,7 +1740,7 @@ class MatrixApp(App):
         background: $panel;
     }
     #searchbox #results { max-height: 20; }
-    #downloadbox, #linkbox {
+    #downloadbox, #linkbox, #editsbox {
         width: 70%;
         height: auto;
         margin: 4 10;
@@ -1595,8 +1748,12 @@ class MatrixApp(App):
         border: round $accent;
         background: $panel;
     }
-    #downloadtitle, #linktitle { text-style: bold; padding: 0 0 1 0; }
+    #downloadtitle, #linktitle, #editstitle {
+        text-style: bold;
+        padding: 0 0 1 0;
+    }
     #linkbox #links { max-height: 12; }
+    #editsbox #versions { height: auto; max-height: 20; }
     AboutScreen { align: center middle; }
     #aboutbox {
         width: auto;

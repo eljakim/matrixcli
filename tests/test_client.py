@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import aiohttp
 from nio.events.room_events import RoomMessageText
 
-from matrixcli.client import Message
+from matrixcli.client import Message, fold_edits
 
 ME = "@me:example.org"
 ALICE = "@alice:example.org"
@@ -25,6 +25,30 @@ def text_event(event_id, sender, ts, body, relates=None, unsigned=None):
     if unsigned:
         event["unsigned"] = unsigned
     return RoomMessageText.from_dict(event)
+
+
+def edit_source(event_id, sender, ts, new_body, target):
+    """The wire form of an m.replace edit, as senders write it: the new text in
+    m.new_content, and a "* "-prefixed copy in body for clients that do not
+    understand edits."""
+    return {
+        "type": "m.room.message",
+        "event_id": event_id,
+        "sender": sender,
+        "origin_server_ts": ts,
+        "content": {
+            "msgtype": "m.text",
+            "body": f"* {new_body}",
+            "m.new_content": {"msgtype": "m.text", "body": new_body},
+            "m.relates_to": {"rel_type": "m.replace", "event_id": target},
+        },
+    }
+
+
+def edit_event(event_id, sender, ts, new_body, target):
+    return RoomMessageText.from_dict(
+        edit_source(event_id, sender, ts, new_body, target)
+    )
 
 
 class TestEntry:
@@ -480,6 +504,129 @@ class TestToMessageEncrypted:
         assert m.thread_root == "$root"
         assert m.thread_count == 5
         assert "encrypted" in m.body
+
+
+class TestEdits:
+    """m.replace edits: parsed out of the event, folded into the message they
+    rewrite, and never trusted from anyone but the original sender."""
+
+    def msg(self, event_id, sender, ts, body, **kw):
+        return Message(
+            sender=sender, sender_name=sender, body=body, ts=ts,
+            event_id=event_id, **kw,
+        )
+
+    def test_new_content_is_preferred_over_the_star_fallback(self, session):
+        m = session._to_message(None, edit_event("$e", ALICE, 200, "fixed", "$o"))
+        assert m.replaces == "$o"
+        assert m.body == "fixed"
+
+    def test_star_fallback_is_stripped_when_new_content_is_missing(self, session):
+        ev = text_event(
+            "$e", ALICE, 200, "* fixed",
+            relates={"rel_type": "m.replace", "event_id": "$o"},
+        )
+        assert session._to_message(None, ev).body == "fixed"
+
+    def test_fold_rewrites_the_target_and_drops_the_edit(self):
+        folded = fold_edits([
+            self.msg("$o", ALICE, 100, "typo"),
+            self.msg("$e", ALICE, 200, "fixed", replaces="$o"),
+        ])
+        assert [m.event_id for m in folded] == ["$o"]
+        assert folded[0].body == "fixed"
+        assert folded[0].original_body == "typo"
+        assert folded[0].edited_ts == 200
+
+    def test_fold_applies_only_the_newest_edit(self):
+        folded = fold_edits([
+            self.msg("$o", ALICE, 100, "v1"),
+            self.msg("$e1", ALICE, 200, "v2", replaces="$o"),
+            self.msg("$e2", ALICE, 300, "v3", replaces="$o"),
+        ])
+        assert [m.body for m in folded] == ["v3"]
+        assert folded[0].original_body == "v1"
+
+    def test_another_users_replace_is_not_folded_in(self):
+        # Anyone may send an m.replace pointing at anyone's event; folding one
+        # in would let a stranger rewrite what someone else said.
+        folded = fold_edits([
+            self.msg("$o", ALICE, 100, "as written"),
+            self.msg("$e", BOB, 200, "as forged", replaces="$o"),
+        ])
+        assert [m.body for m in folded] == ["as written", "as forged"]
+        assert folded[0].edited_ts == 0
+
+    def test_edit_of_a_message_outside_the_window_stays_visible(self):
+        folded = fold_edits([self.msg("$e", ALICE, 200, "fixed", replaces="$gone")])
+        assert [m.body for m in folded] == ["fixed"]
+
+    def test_undecryptable_edit_marks_but_does_not_replace(self):
+        folded = fold_edits([
+            self.msg("$o", ALICE, 100, "readable"),
+            self.msg("$e", ALICE, 200, "[encrypted: no key]", replaces="$o"),
+        ])
+        assert folded[0].body == "readable"
+        assert folded[0].edited_ts == 200
+
+    def test_bundled_edit_applies_without_the_edit_event(self, session):
+        # The server aggregates the newest edit onto the event it rewrites, so
+        # an old message shows current text even when the edit is far outside
+        # the fetched window.
+        ev = text_event(
+            "$o", ALICE, 100, "typo",
+            unsigned={"m.relations": {"m.replace": edit_source("$e", ALICE, 200, "fixed", "$o")}},
+        )
+        m = session._to_message(None, ev)
+        assert (m.body, m.original_body, m.edited_ts) == ("fixed", "typo", 200)
+        # Folding the same edit in again from the window must not lose the
+        # original text it already replaced.
+        folded = fold_edits([m, self.msg("$e", ALICE, 200, "fixed", replaces="$o")])
+        assert [m.event_id for m in folded] == ["$o"]
+        assert (folded[0].body, folded[0].original_body) == ("fixed", "typo")
+
+    def test_bundled_edit_from_another_sender_is_ignored(self, session):
+        ev = text_event(
+            "$o", ALICE, 100, "as written",
+            unsigned={"m.relations": {"m.replace": edit_source("$e", BOB, 200, "as forged", "$o")}},
+        )
+        m = session._to_message(None, ev)
+        assert (m.body, m.edited_ts) == ("as written", 0)
+
+
+class TestLoadEdits:
+    def run(self, session, chunk, message, monkeypatch, status=200):
+        fake = TestRefreshSpaceChildren.FakeHttp({"chunk": chunk}, status=status)
+        # **kw: this call passes a ClientTimeout to the session constructor.
+        monkeypatch.setattr(
+            "matrixcli.client.aiohttp.ClientSession", lambda **kw: fake
+        )
+        return asyncio.run(session.load_edits("!a:hs", message))
+
+    def folded(self):
+        return Message(
+            sender=ALICE, sender_name="Alice", body="v3", ts=100,
+            event_id="$o", edited_ts=300, original_body="v1",
+        )
+
+    def test_versions_come_back_oldest_first(self, session, monkeypatch):
+        chunk = [
+            edit_source("$e2", ALICE, 300, "v3", "$o"),
+            edit_source("$e1", ALICE, 200, "v2", "$o"),
+        ]
+        versions = self.run(session, chunk, self.folded(), monkeypatch)
+        assert [v.body for v in versions] == ["v1", "v2", "v3"]
+
+    def test_replaces_from_other_senders_are_dropped(self, session, monkeypatch):
+        chunk = [edit_source("$e", BOB, 200, "as forged", "$o")]
+        versions = self.run(session, chunk, self.folded(), monkeypatch)
+        assert [v.body for v in versions] == ["v1", "v3"]
+
+    def test_falls_back_to_the_folded_versions_when_offline(
+        self, session, monkeypatch
+    ):
+        versions = self.run(session, [], self.folded(), monkeypatch, status=500)
+        assert [(v.ts, v.body) for v in versions] == [(100, "v1"), (300, "v3")]
 
 
 class TestRefreshDirectMap:

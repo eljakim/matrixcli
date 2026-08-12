@@ -61,6 +61,10 @@ from .config import Config
 
 HISTORY_LIMIT = 40
 TIMELINE_CAP = 200
+# Prefix of the placeholders _to_message renders in place of a message it could
+# not decrypt; edit folding checks it so an unreadable edit never displaces
+# readable text.
+UNDECRYPTABLE = "[encrypted"
 # Refuse to buffer/decrypt/write an attachment bigger than this. nio's download
 # reads the whole body into memory, so an unbounded one is a trivial OOM; the
 # sender also controls the advertised size, so both are checked.
@@ -130,6 +134,9 @@ class Message:
     media_size: int = 0  # bytes, from content.info, 0 if unknown
     media_crypt: dict | None = None  # key/iv/hash for encrypted attachments
     pending: bool = False  # local echo awaiting the server's event id
+    replaces: str = ""  # an m.replace edit: the event id whose text it rewrites
+    edited_ts: int = 0  # newest edit folded into this message (0: never edited)
+    original_body: str = ""  # the text before the first edit, for the "H" popup
 
 
 def _media_info(event) -> dict:
@@ -172,6 +179,76 @@ def _thread_info(event) -> tuple[str, int]:
     thread = relations.get("m.thread") if isinstance(relations, dict) else None
     count = thread.get("count", 0) or 0 if isinstance(thread, dict) else 0
     return root, count
+
+
+def _edit_target(event) -> str:
+    """The event id this event rewrites (an m.replace edit), or "". Read from
+    the wire-format event for the same reason as _thread_info: an encrypted
+    edit carries m.relates_to in its cleartext wrapper, with the new text
+    inside the ciphertext."""
+    src = getattr(event, "source", {}) or {}
+    relates = (src.get("content", {}) or {}).get("m.relates_to") or {}
+    if isinstance(relates, dict) and relates.get("rel_type") == "m.replace":
+        return relates.get("event_id") or ""
+    return ""
+
+
+def _edit_body(event, fallback: str) -> str:
+    """The replacement text of an m.replace edit. Senders put it in
+    m.new_content and duplicate it in body prefixed with "* " as a fallback for
+    clients that do not understand edits; strip that prefix when it is all we
+    have (which is what made an edit look like a repeated message)."""
+    src = getattr(event, "source", {}) or {}
+    new_content = (src.get("content", {}) or {}).get("m.new_content") or {}
+    body = new_content.get("body") if isinstance(new_content, dict) else None
+    if body:
+        return body
+    return fallback[2:] if fallback.startswith("* ") else fallback
+
+
+def fold_edits(messages: list[Message]) -> list[Message]:
+    """Collapse m.replace edits into the message they rewrite: the newest text
+    takes the original's place in the timeline, the text it replaced is kept
+    for the history popup, and the edit event itself drops out. An edit whose
+    target is outside the loaded window stays as its own message, so nothing a
+    sender wrote is silently hidden."""
+    targets = {m.event_id: m for m in messages if m.event_id and not m.replaces}
+
+    def rewrites(m: Message) -> bool:
+        # Anyone in a room can send an m.replace pointing at anyone's message;
+        # only the original sender's own edits count, or a stranger could
+        # rewrite what someone else said in front of us.
+        target = targets.get(m.replaces)
+        return target is not None and target.sender == m.sender
+
+    newest: dict[str, Message] = {}
+    for m in messages:
+        if rewrites(m):
+            current = newest.get(m.replaces)
+            if current is None or m.ts > current.ts:
+                newest[m.replaces] = m
+    out: list[Message] = []
+    for m in messages:
+        if rewrites(m):
+            continue
+        edit = newest.get(m.event_id)
+        # The server bundles the latest edit onto the original (see
+        # _to_message), so a message can arrive already folded; only a newer
+        # edit event than that one has anything to add.
+        if edit is not None and edit.ts >= m.edited_ts:
+            # An edit we hold no key for marks the message as edited but must
+            # not displace text we can read.
+            if edit.body.startswith(UNDECRYPTABLE):
+                m = replace(m, edited_ts=edit.ts)
+            else:
+                m = replace(
+                    m,
+                    body=edit.body,
+                    original_body=m.original_body or m.body,
+                    edited_ts=edit.ts,
+                )
+        out.append(m)
+    return out
 
 
 class MatrixSession:
@@ -831,6 +908,11 @@ class MatrixSession:
         body = getattr(event, "body", None)
         if body is None:
             body = f"<{type(event).__name__}>"
+        # Edits arrive as ordinary messages; they are cached with the id they
+        # rewrite and folded into it at display time (see fold_edits).
+        replaces = _edit_target(event)
+        if replaces:
+            body = _edit_body(event, body)
         body = _clean(body)
         timeline = self.timelines[room.room_id]
         # The event may already be cached as our own local echo (send()
@@ -849,6 +931,7 @@ class MatrixSession:
                     event_id=event.event_id,
                     thread_root=thread_root,
                     thread_count=thread_count,
+                    replaces=replaces,
                     **_media_info(event),
                 )
             )
@@ -1188,7 +1271,7 @@ class MatrixSession:
 
     # --- room view --------------------------------------------------------
 
-    def _to_message(self, room, event) -> Message | None:
+    def _to_message(self, room, event, follow_bundle: bool = True) -> Message | None:
         """A fetched nio event as a Message, or None for non-message events.
         Encrypted events are decrypted here (server fetches do not decrypt);
         ones we lack keys for become a placeholder rather than being
@@ -1198,6 +1281,14 @@ class MatrixSession:
         # still has the server's unsigned m.relations aggregation, which nio
         # drops when it rebuilds the event from the decrypted payload.
         thread_root, thread_count = _thread_info(event)
+        replaces = _edit_target(event)
+        # The server aggregates edits onto the event they rewrite and bundles
+        # the most recent one, in full, under unsigned. Using it means an old
+        # message shows its current text even when the edit event itself is far
+        # outside the fetched history window.
+        unsigned = (getattr(event, "source", {}) or {}).get("unsigned") or {}
+        relations = unsigned.get("m.relations") or {}
+        bundled = relations.get("m.replace") if follow_bundle else None
         if isinstance(event, MegolmEvent):
             try:
                 event = self.client.decrypt_event(event)
@@ -1226,14 +1317,36 @@ class MatrixSession:
                 body = "[encrypted: no key for this message]"
         else:
             return None
+        if replaces:
+            body = _edit_body(event, body)
+        body = _clean(body)
+        original_body = ""
+        edited_ts = 0
+        if isinstance(bundled, dict) and bundled.get("event_id"):
+            newest = self._to_message(
+                room, Event.parse_event(bundled), follow_bundle=False
+            )
+            if (
+                newest is not None
+                and newest.replaces == event.event_id
+                and newest.sender == event.sender
+            ):
+                edited_ts = newest.ts
+                # An edit we hold no key for must not displace text we can
+                # read; the marker still says a newer version exists.
+                if not newest.body.startswith(UNDECRYPTABLE):
+                    original_body, body = body, newest.body
         return Message(
             sender=event.sender,
             sender_name=_clean(name or event.sender),
-            body=_clean(body),
+            body=body,
             ts=event.server_timestamp,
             event_id=event.event_id,
             thread_root=thread_root,
             thread_count=thread_count,
+            replaces=replaces,
+            edited_ts=edited_ts,
+            original_body=original_body,
             **_media_info(event),
         )
 
@@ -1351,6 +1464,52 @@ class MatrixSession:
                 merged[m.event_id] = m
         replies = sorted(merged.values(), key=lambda m: m.ts)
         return [root] + replies
+
+    async def load_edits(self, room_id: str, message: Message) -> list[Message]:
+        """Every version of a message, oldest first: the text as first sent,
+        then one entry per edit. Fetched from the same /relations endpoint as
+        threads, so versions older than the loaded history window are included;
+        falls back to the two versions folded into the message itself when the
+        request fails."""
+        room = self.client.rooms.get(room_id)
+        url = (
+            f"{self.cfg.homeserver}/_matrix/client/v1/rooms/"
+            f"{quote(room_id, safe='')}"
+            f"/relations/{quote(message.event_id, safe='')}/m.replace"
+            f"?dir=b&limit=50"
+        )
+        headers = {"Authorization": f"Bearer {self.client.access_token}"}
+        chunk: list = []
+        try:
+            # Bounded: this one backs a popup the user is waiting in front of.
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as http:
+                async with http.get(url, headers=headers, allow_redirects=False) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        chunk = data.get("chunk", []) or []
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            pass
+
+        versions: dict[str, Message] = {}
+        for source in chunk:
+            edit = self._to_message(room, Event.parse_event(source))
+            # Only replacements of this message, and only from its own sender:
+            # anyone in the room may send an m.replace pointing at it, but the
+            # server ignores the ones that are not the sender's own.
+            if (
+                edit is not None
+                and edit.replaces == message.event_id
+                and edit.sender == message.sender
+            ):
+                versions[edit.event_id] = edit
+        edits = sorted(versions.values(), key=lambda m: m.ts)
+        if not edits and message.edited_ts:
+            edits = [replace(message, ts=message.edited_ts)]
+        original = replace(
+            message, body=message.original_body or message.body, edited_ts=0
+        )
+        return [original] + edits
 
     async def send(
         self,
