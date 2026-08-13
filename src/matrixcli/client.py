@@ -300,11 +300,33 @@ class MatrixSession:
         )
         self.last_event_id: dict[str, str] = {}  # room_id -> latest event id seen
         self.presence: dict[str, str] = {}  # user_id -> presence ("online" etc.)
-        self.space_children: dict[str, set[str]] = {}  # space id -> child room ids
+        # space id -> child room ids, restored from state.json so a resumed
+        # launch can paint the space columns before the (slow) raw-state
+        # refresh has run; refresh_space_children keeps the mirror current.
+        self.space_children: dict[str, set[str]] = {
+            sid: {c for c in kids if isinstance(c, str)}
+            for sid, kids in (self.state.get("space_children") or {}).items()
+            if isinstance(kids, list)
+        }
+        self._space_refresh = None  # background refresh task (GC guard)
         # Back-pagination state per room: the /messages token to continue
         # from, and whether the very beginning of history has been reached.
         self.pagination_tokens: dict[str, str] = {}
         self.pagination_done: dict[str, bool] = {}
+        # Rooms whose initial /messages window was fetched and merged into
+        # the timeline cache this session. Reloads then serve the cache: live
+        # events keep it current via the sync callbacks, so refetching the
+        # same window (seconds per call on a slow homeserver) buys nothing.
+        # A gappy sync un-marks the room (see _record_room_timestamps).
+        self.history_loaded: set[str] = set()
+        # In-flight full member-list fetches by room id (see _fetch_members).
+        # Holding the Task matters: asyncio keeps only weak references, so an
+        # unreferenced background task can be garbage-collected mid-flight.
+        self._member_fetches: dict[str, asyncio.Task] = {}
+        # Called with a room id after a background member fetch lands and
+        # cached sender names were re-resolved; the app points this at the
+        # open room screen so raw @user:server ids repaint as display names.
+        self.on_members_loaded = None
         # room id -> target event id -> reaction key -> senders. Sets of
         # senders, not counts: history refetches and redelivered syncs would
         # double-count, and removing a reaction must subtract exactly one.
@@ -538,35 +560,22 @@ class MatrixSession:
             if progress is not None:
                 progress(msg)
 
-        step("loading direct-message list")
-        await self._refresh_direct_map()
-        try:
-            name_resp = await self.client.get_displayname()
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-            # A dropped connection here is not worth failing startup over; the
-            # display name is cosmetic and user_name() falls back to the id.
-            name_resp = None
-        if getattr(name_resp, "displayname", None):
-            self.my_name = name_resp.displayname
-        # Force one fresh (non-incremental) sync so the server returns recent
-        # timelines for ALL rooms, seeding last-activity timestamps: resuming
-        # from a stored token gives quiet rooms empty timelines, ranking them
-        # as if silent (yesterday's DM would vanish). nio resolves the sync
-        # position as `next_batch or loaded_sync_token` (the latter restored by
-        # store_sync_tokens=True), so BOTH must be cleared; afterwards a new
-        # token is stored and the live loop continues incrementally.
-        self.client.next_batch = ""
-        self.client.loaded_sync_token = ""
-        # lazy_load_members is what makes this launch-time sync affordable:
-        # with full member state the server has to serialize every member of
-        # every room (the big IOI rooms put that at minutes of server-side
-        # work before the first byte arrives); lazily it returns in seconds.
-        # Names still resolve: the server includes member events for timeline
-        # senders and for each room's "heroes", which is exactly what DM and
-        # group-name calculation needs. The full member list of a room is
-        # fetched once on first open (load_history), and nio itself fetches
-        # it before the first send in an encrypted room (members_synced stays
-        # False until a joined_members fetch, which room_send checks).
+        # The DM map and our own display name are independent HTTP calls;
+        # fetch them alongside the sync instead of paying their latency
+        # (measured ~5 s on a loaded server) before it even starts. Both are
+        # awaited right after the sync; both are cosmetic-only on failure.
+        direct_fetch = asyncio.ensure_future(self._refresh_direct_map())
+        name_fetch = asyncio.ensure_future(self.client.get_displayname())
+        # lazy_load_members keeps any launch sync affordable: with full
+        # member state the server has to serialize every member of every
+        # room (the big IOI rooms put that at minutes of server-side work
+        # before the first byte arrives). Names still resolve: the server
+        # includes member events for timeline senders and each room's
+        # "heroes", which is what DM and group-name calculation needs. The
+        # full member list of a room is fetched in the background on first
+        # open (see _fetch_members), and nio itself fetches it before the
+        # first send in an encrypted room (members_synced stays False until
+        # a joined_members fetch, which room_send checks).
         sync_filter = {
             "room": {
                 "timeline": {"limit": 10},
@@ -574,20 +583,49 @@ class MatrixSession:
             },
             "presence": {"limit": 1000},
         }
-        step("syncing rooms and messages")
+        # Resuming from the stored token is the only affordable launch path
+        # on a loaded homeserver. Measured against matrix.ioinformatics.org:
+        # a from-scratch sync (no ``since``) is Synapse's slowest code path,
+        # 8 minutes wall clock while the server trickled 4.6MB for 86 rooms;
+        # even full_state=True on an incremental sync costs ~30 s of
+        # server-side state resolution; incremental without full_state took
+        # 2 s. So after the first run, sync incrementally and lean on what
+        # is persisted: recency and titles/badges from state.json
+        # (room_meta, maintained by dashboard()), the encrypted-room set
+        # from nio's own store (rooms absent from the in-memory map are
+        # re-registered before a send, see _ensure_room), and the space
+        # child map from its raw-state fetch. Quiet rooms then never enter
+        # client.rooms this session, which is fine: the dashboard serves
+        # them from room_meta and opening one fetches history via /messages.
+        resume = bool(
+            (self.client.next_batch or self.client.loaded_sync_token)
+            and self.state.get("room_meta")
+        )
+        if resume:
+            step("syncing new messages")
+        else:
+            # First run (or a state file predating room_meta): one big
+            # seeding sync so ALL rooms get state, titles, and last-activity
+            # timestamps. Clear BOTH token fields: nio resolves the sync
+            # position as `next_batch or loaded_sync_token` (the latter
+            # restored by store_sync_tokens=True), so clearing only one
+            # would still resume and leave quiet rooms unranked.
+            self.client.next_batch = ""
+            self.client.loaded_sync_token = ""
+            step("syncing all rooms (first run, this can take a while)")
         # Non-429 errors come back immediately as SyncError (nio only retries
         # rate limits itself), and a connection that dies mid-response never
         # becomes a response at all: nio lets the raw aiohttp error through
         # (ClientPayloadError / ConnectionResetError), which is easy to hit
-        # because this is the one big full_state sync of the session. Retry a
-        # few times rather than killing the startup worker with a traceback or
-        # silently presenting an empty dashboard as "ready".
+        # on the big first-run sync. Retry a few times rather than killing
+        # the startup worker with a traceback or silently presenting an
+        # empty dashboard as "ready".
         resp = None
         for attempt in range(3):
             try:
                 resp = await self.client.sync(
-                    timeout=30000,
-                    full_state=True,
+                    timeout=0 if resume else 30000,
+                    full_state=not resume,
                     sync_filter=sync_filter,
                     set_presence="online",
                 )
@@ -608,8 +646,29 @@ class MatrixSession:
             await asyncio.sleep(2 * (attempt + 1))
         if resp is None or isinstance(resp, SyncError):
             step("initial sync failed; showing cached data, the background sync will keep retrying")
+        try:
+            await direct_fetch
+        except Exception:
+            pass  # DM titles fall back to user ids until the next refresh
+        try:
+            name_resp = await name_fetch
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            # A dropped connection here is not worth failing startup over; the
+            # display name is cosmetic and user_name() falls back to the id.
+            name_resp = None
+        if getattr(name_resp, "displayname", None):
+            self.my_name = name_resp.displayname
         step("loading space hierarchy")
-        await self.refresh_space_children()
+        if self.space_children:
+            # Restored from state.json: paint with the cached map now and
+            # refresh in the background (each space costs a multi-second
+            # raw-state fetch on a loaded server; the sync loop also refetches
+            # whenever a space's child links actually change).
+            self._space_refresh = asyncio.ensure_future(
+                self.refresh_space_children()
+            )
+        else:
+            await self.refresh_space_children()
         step("organizing dashboard")
         self._record_room_timestamps(resp)
         self._persist_recency()
@@ -624,7 +683,19 @@ class MatrixSession:
         last_ts == 0 and the dashboard columns come out in arbitrary order."""
         rooms = getattr(getattr(response, "rooms", None), "join", {}) or {}
         changed = False
+        # A left room must leave the persisted snapshot too, or a resumed
+        # launch (which never sees the room live) would list it forever.
+        left = getattr(getattr(response, "rooms", None), "leave", {}) or {}
+        meta = self.state.get("room_meta") or {}
+        for room_id in left:
+            if meta.pop(room_id, None) is not None:
+                changed = True
         for room_id, joined in rooms.items():
+            # A "limited" timeline means the server skipped events between
+            # the last sync and this window: the cache is missing a chunk,
+            # so the next open must refetch instead of serving the cache.
+            if getattr(getattr(joined, "timeline", None), "limited", False):
+                self.history_loaded.discard(room_id)
             events = getattr(getattr(joined, "timeline", None), "events", []) or []
             for ev in events:
                 ts = getattr(ev, "server_timestamp", 0) or 0
@@ -1159,20 +1230,26 @@ class MatrixSession:
                 for rid, room in self.client.rooms.items()
                 if room.room_type == "m.space"
             ]
+            # A resumed (incremental) launch leaves quiet spaces out of
+            # client.rooms entirely; the persisted snapshot still knows them.
+            for rid, m in (self.state.get("room_meta") or {}).items():
+                if isinstance(m, dict) and m.get("is_space") and rid not in spaces:
+                    spaces.append(rid)
         headers = {"Authorization": f"Bearer {self.client.access_token}"}
         try:
             # Bounded: the background sync loop awaits this on every child-link
             # change, and a hung request there would freeze every live update.
             timeout = aiohttp.ClientTimeout(total=15)
             async with aiohttp.ClientSession(timeout=timeout) as http:
-                for sid in spaces:
+
+                async def fetch(sid: str) -> None:
                     url = (
                         f"{self.cfg.homeserver}/_matrix/client/v3/rooms/"
                         f"{quote(sid, safe='')}/state"
                     )
                     async with http.get(url, headers=headers, allow_redirects=False) as r:
                         if r.status != 200:
-                            continue
+                            return
                         state = await r.json()
                     children = set()
                     for ev in state if isinstance(state, list) else []:
@@ -1183,8 +1260,25 @@ class MatrixSession:
                         ):
                             children.add(ev["state_key"])
                     self.space_children[sid] = children
+
+                # In parallel: each space's raw state takes seconds on a
+                # loaded server, and sequential fetches made this scale with
+                # the number of spaces (~24 s of the launch for 4 spaces).
+                await asyncio.gather(*(fetch(sid) for sid in spaces))
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
             return
+        finally:
+            # Mirror into state.json so the next launch paints the space
+            # columns from disk and runs this refresh in the background.
+            mirror = self.state.setdefault("space_children", {})
+            changed = False
+            for sid, kids in self.space_children.items():
+                as_list = sorted(kids)
+                if mirror.get(sid) != as_list:
+                    mirror[sid] = as_list
+                    changed = True
+            if changed:
+                self._persist_recency()
 
     def spaces_with_child_changes(self, response) -> set[str]:
         """Ids of the rooms whose m.space.child state changed in this sync
@@ -1247,6 +1341,82 @@ class MatrixSession:
             is_favourite=is_favourite,
         )
 
+    def _all_entries(self) -> list[Entry]:
+        """One Entry per joined room: the live rooms from client.rooms plus,
+        for rooms with no activity since the resume token (which a resumed
+        launch never delivers, see initial_sync), entries rebuilt from the
+        persisted room_meta snapshot. As a side effect the snapshot is
+        refreshed from the live rooms, so the next launch's dashboard shows
+        current titles and unread badges before any sync has landed."""
+        meta = self.state.setdefault("room_meta", {})
+        entries = []
+        for room in self.client.rooms.values():
+            e = self._entry(room)
+            snap = meta.get(e.room_id)
+            # A room that went live through a resumed (incremental) sync has
+            # no state this session: no m.room.name, no m.room.create, no
+            # tags. nio then invents a display name from the member "heroes"
+            # ("ALB-DL-..., ALB-TL-... and 316 others"), which must never
+            # displace a real title: only an actual room name/alias, or a
+            # resolved DM peer, outranks the snapshot. (members being loaded
+            # is NOT enough: the room may well have a proper name in state
+            # this session simply never fetched.) The same rule keeps the
+            # snapshot from being poisoned for the next launch, since the
+            # refresh below writes the backfilled entry. Unread counts stay
+            # live; the server sends them with every mention of the room.
+            if isinstance(snap, dict):
+                named = (
+                    room.named_room_name()
+                    if hasattr(room, "named_room_name")
+                    else room.display_name
+                )
+                snap_title = snap.get("title") or ""
+                if (
+                    not named
+                    and not e.person
+                    and snap_title
+                    and not snap_title.startswith("!")
+                ):
+                    e = replace(e, title=snap_title)
+                if snap.get("is_space") and not e.is_space:
+                    e = replace(e, is_space=True)
+                if snap.get("is_favourite") and not (room.tags or {}):
+                    e = replace(e, is_favourite=True)
+            entries.append(e)
+        live = {e.room_id for e in entries}
+        changed = False
+        for e in entries:
+            snap = {
+                "title": e.title,
+                "is_space": e.is_space,
+                "person": e.person or "",
+                "is_favourite": e.is_favourite,
+                "unread": e.unread,
+                "highlights": e.highlights,
+            }
+            if meta.get(e.room_id) != snap:
+                meta[e.room_id] = snap
+                changed = True
+        if changed:
+            self._persist_recency()
+        for rid, m in meta.items():
+            if rid in live or not isinstance(m, dict):
+                continue
+            entries.append(
+                Entry(
+                    room_id=rid,
+                    title=m.get("title") or rid,
+                    unread=int(m.get("unread") or 0),
+                    is_direct=bool(m.get("person")),
+                    person=m.get("person") or None,
+                    last_ts=self.state["last_event_ts"].get(rid, 0),
+                    is_space=bool(m.get("is_space")),
+                    highlights=int(m.get("highlights") or 0),
+                    is_favourite=bool(m.get("is_favourite")),
+                )
+            )
+        return entries
+
     def dashboard(self, selected_space: str | None = None) -> dict:
         """Data for the three-column home screen.
 
@@ -1262,7 +1432,7 @@ class MatrixSession:
         * favourites -- rooms (or DMs) tagged m.favourite.
         * dms     -- one entry per person, most-recently-active first.
         """
-        entries = [self._entry(r) for r in self.client.rooms.values()]
+        entries = self._all_entries()
         by_id = {e.room_id: e for e in entries}
 
         invites = []
@@ -1441,15 +1611,18 @@ class MatrixSession:
         for room_id, room in self.client.rooms.items():
             if ref in (room_id, getattr(room, "canonical_alias", None)):
                 return self._entry(room)
-        return None
+        # Rooms a resumed launch has not synced live yet (aliases are not in
+        # the snapshot, so only an exact room id can match here).
+        return next(
+            (e for e in self._all_entries() if e.room_id == ref), None
+        )
 
     def search(self, query: str) -> list[Entry]:
         q = fold_text(query.strip())
         if not q:
             return []
         out = []
-        for room in self.client.rooms.values():
-            e = self._entry(room)
+        for e in self._all_entries():
             haystack = fold_text(f"{e.title} {e.person or ''} {e.room_id}")
             if q in haystack:
                 out.append(e)
@@ -1590,34 +1763,34 @@ class MatrixSession:
             **_media_info(event),
         )
 
-    async def load_history(self, room_id: str, limit: int = HISTORY_LIMIT) -> list[Message]:
+    async def load_history(
+        self,
+        room_id: str,
+        limit: int = HISTORY_LIMIT,
+        cached_only: bool = False,
+    ) -> list[Message]:
+        """The most recent window of a room's timeline, oldest first. Serves
+        the in-memory cache when it can answer (or when cached_only asks for
+        an instant, possibly shallow, list to paint before the network round
+        trip); otherwise fetches one /messages window and merges it in."""
         cached = list(self.timelines.get(room_id, []))
-        if len(cached) >= limit:
+        if cached_only or len(cached) >= limit or room_id in self.history_loaded:
             return cached[-limit:]
 
         room = self.client.rooms.get(room_id)
         # Startup syncs members lazily, so senders outside the last sync
-        # window would render as raw @user:server ids. Fill the room's member
-        # map once, alongside the history fetch so it adds no wall-clock; a
-        # failed fetch only costs display names, never the history.
-        member_fetch = None
+        # window would render as raw @user:server ids. Kick the full member
+        # fetch off in the background: on a slow homeserver /joined_members
+        # takes seconds for a big room, and awaiting it here made every
+        # first open hang on it. Names repaint when it lands.
         if room is not None and not room.members_synced:
-            member_fetch = asyncio.ensure_future(
-                self.client.joined_members(room_id)
-            )
-        try:
-            resp = await self.client.room_messages(
-                room_id,
-                start=self.client.next_batch or "",
-                direction=MessageDirection.back,
-                limit=limit,
-            )
-        finally:
-            if member_fetch is not None:
-                try:
-                    await member_fetch
-                except Exception:
-                    pass
+            self._fetch_members(room_id)
+        resp = await self.client.room_messages(
+            room_id,
+            start=self.client.next_batch or "",
+            direction=MessageDirection.back,
+            limit=limit,
+        )
         if isinstance(resp, RoomMessagesError):
             return cached[-limit:]
         # Seed the back-pagination position from this first window, but never
@@ -1663,7 +1836,42 @@ class MatrixSession:
         timeline = self.timelines[room_id]
         timeline.clear()
         timeline.extend(history)
+        self.history_loaded.add(room_id)
         return history[-limit:]
+
+    def _fetch_members(self, room_id: str) -> None:
+        """Fetch a room's full member list without blocking the caller.
+        Launch syncs members lazily (see initial_sync), so the map is filled
+        on first open instead; that fetch takes seconds on a big room and
+        must not hold up load_history's return. When it lands, sender names
+        in the cached timeline are re-resolved (they were built while the
+        member map was incomplete) and on_members_loaded tells the UI to
+        repaint them."""
+        if room_id in self._member_fetches:
+            return
+
+        async def fetch() -> None:
+            try:
+                await self.client.joined_members(room_id)
+            except Exception:
+                return  # only display names lost; the next open retries
+            finally:
+                self._member_fetches.pop(room_id, None)
+            room = self.client.rooms.get(room_id)
+            # An error response leaves members_synced False; nothing to do.
+            if room is None or not room.members_synced:
+                return
+            timeline = self.timelines.get(room_id)
+            changed = False
+            for i, m in enumerate(timeline or ()):
+                name = _clean(room.user_name(m.sender) or m.sender) or m.sender
+                if name != m.sender_name:
+                    timeline[i] = replace(m, sender_name=name)
+                    changed = True
+            if changed and self.on_members_loaded is not None:
+                self.on_members_loaded(room_id)
+
+        self._member_fetches[room_id] = asyncio.ensure_future(fetch())
 
     def reset_pagination(self, room_id: str) -> None:
         """Forget the back-pagination position for a room. Called when a room
@@ -1828,6 +2036,21 @@ class MatrixSession:
         )
         return [original] + edits
 
+    def _ensure_room(self, room_id: str) -> None:
+        """Sending under encryption makes nio look the room up in its
+        in-memory map, which a resumed (incremental) launch only fills for
+        rooms with fresh activity; a quiet room would raise instead of
+        sending. Register a bare MatrixRoom for it: the encrypted flag comes
+        from nio's own persisted encrypted-rooms set (so an encrypted room
+        stays encrypted even before any sync mentions it), and nio fetches
+        the member list itself before the first encrypted send."""
+        if room_id not in self.client.rooms:
+            self.client.rooms[room_id] = MatrixRoom(
+                room_id,
+                self.cfg.user_id,
+                room_id in getattr(self.client, "encrypted_rooms", set()),
+            )
+
     async def send(
         self,
         room_id: str,
@@ -1836,6 +2059,7 @@ class MatrixSession:
         thread_root: str | None = None,
         thread_latest: str | None = None,
     ) -> tuple[bool, str]:
+        self._ensure_room(room_id)
         content = {"msgtype": "m.text", "body": text}
         if thread_root:
             # A thread reply per the spec: is_falling_back marks the
@@ -1888,6 +2112,7 @@ class MatrixSession:
         """Rewrite one of our own messages: an m.replace event with the new
         text in m.new_content and the "* " fallback body for clients that do
         not understand edits (the same wire format we fold when receiving)."""
+        self._ensure_room(room_id)
         content = {
             "msgtype": "m.text",
             "body": f"* {text}",
@@ -2010,6 +2235,13 @@ class MatrixSession:
                 )
             except Exception:
                 pass
+        # Reading a room clears its badge in the persisted snapshot too; a
+        # room quiet since the resume token is never re-delivered by sync, so
+        # nothing else would ever zero the cached count.
+        snap = (self.state.get("room_meta") or {}).get(room_id)
+        if isinstance(snap, dict) and (snap.get("unread") or snap.get("highlights")):
+            snap["unread"] = 0
+            snap["highlights"] = 0
         self.record_opened(room_id)
 
     def record_opened(self, room_id: str) -> None:

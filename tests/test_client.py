@@ -339,28 +339,126 @@ class TestLoadHistory:
         session.client.room_messages = fake_room_messages
         return asyncio.run(session.load_history(room_id, limit=limit))
 
-    def test_fetches_members_once_when_lazily_synced(self, session, fake_room):
-        # Startup syncs members lazily; the first open of a room must fill its
-        # member map so older senders get display names, and a failed member
-        # fetch must not take the history down with it.
+    def test_member_fetch_runs_in_background(self, session, fake_room):
+        # Startup syncs members lazily; the first open of a room kicks off the
+        # member fetch so older senders get display names. On a big room
+        # /joined_members takes seconds server-side, so the history must
+        # return WITHOUT waiting for it (awaiting it froze every first open);
+        # when it lands, cached sender names re-resolve and the UI is told.
         room = fake_room("!a:hs")
         room.members_synced = False
         session.client.rooms["!a:hs"] = room
         calls = []
+        repainted = []
+        session.on_members_loaded = repainted.append
 
-        async def fake_joined_members(room_id):
-            calls.append(room_id)
-            raise RuntimeError("server hiccup")
+        async def main():
+            release = asyncio.Event()
 
-        session.client.joined_members = fake_joined_members
-        msgs = self.run(session, chunk=[text_event("$1", ALICE, 100, "hi")])
+            async def fake_joined_members(room_id):
+                calls.append(room_id)
+                await release.wait()
+                room._names[ALICE] = "Alice"
+                room.members_synced = True
+                return SimpleNamespace()
+
+            async def fake_room_messages(*args, **kwargs):
+                return SimpleNamespace(chunk=[text_event("$1", ALICE, 100, "hi")])
+
+            session.client.joined_members = fake_joined_members
+            session.client.room_messages = fake_room_messages
+            msgs = await session.load_history("!a:hs", limit=10)
+            # History arrived while the member fetch was still blocked.
+            assert [m.event_id for m in msgs] == ["$1"]
+            assert [m.sender_name for m in msgs] == [ALICE]
+            release.set()
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        asyncio.run(main())
+        assert calls == ["!a:hs"]
+        assert [m.sender_name for m in session.timelines["!a:hs"]] == ["Alice"]
+        assert repainted == ["!a:hs"]
+
+    def test_failed_member_fetch_only_costs_names(self, session, fake_room):
+        room = fake_room("!a:hs")
+        room.members_synced = False
+        session.client.rooms["!a:hs"] = room
+        repainted = []
+        session.on_members_loaded = repainted.append
+
+        async def main():
+            async def fake_joined_members(room_id):
+                raise RuntimeError("server hiccup")
+
+            async def fake_room_messages(*args, **kwargs):
+                return SimpleNamespace(chunk=[text_event("$1", ALICE, 100, "hi")])
+
+            session.client.joined_members = fake_joined_members
+            session.client.room_messages = fake_room_messages
+            msgs = await session.load_history("!a:hs", limit=10)
+            for _ in range(5):
+                await asyncio.sleep(0)
+            return msgs
+
+        msgs = asyncio.run(main())
         assert [m.event_id for m in msgs] == ["$1"]
-        assert calls == ["!a:hs"]
+        assert repainted == []
+        # The in-flight guard was released, so a later open can retry.
+        assert "!a:hs" not in session._member_fetches
 
-        # Once nio marks the room synced, no further fetches happen.
-        room.members_synced = True
-        self.run(session, chunk=[])
-        assert calls == ["!a:hs"]
+    def test_reloads_serve_the_cache_after_the_first_fetch(self, session):
+        # A room smaller than the window used to refetch /messages on every
+        # reload (each one seconds on a slow homeserver); once the initial
+        # window has been merged, the sync-fed cache is authoritative.
+        calls = []
+
+        async def fake_room_messages(*args, **kwargs):
+            calls.append(1)
+            return SimpleNamespace(chunk=[text_event("$1", ALICE, 100, "hi")])
+
+        session.client.room_messages = fake_room_messages
+        first = asyncio.run(session.load_history("!a:hs", limit=10))
+        again = asyncio.run(session.load_history("!a:hs", limit=10))
+        assert [m.event_id for m in first] == ["$1"]
+        assert [m.event_id for m in again] == ["$1"]
+        assert len(calls) == 1
+
+    def test_gappy_sync_forces_a_refetch(self, session):
+        # A "limited" sync timeline means events were skipped: the cache is
+        # missing a chunk, so serving it would show history with a hole.
+        calls = []
+
+        async def fake_room_messages(*args, **kwargs):
+            calls.append(1)
+            return SimpleNamespace(chunk=[text_event("$1", ALICE, 100, "hi")])
+
+        session.client.room_messages = fake_room_messages
+        asyncio.run(session.load_history("!a:hs", limit=10))
+        gappy = SimpleNamespace(
+            rooms=SimpleNamespace(
+                join={
+                    "!a:hs": SimpleNamespace(
+                        timeline=SimpleNamespace(events=[], limited=True)
+                    )
+                }
+            )
+        )
+        session._record_room_timestamps(gappy)
+        asyncio.run(session.load_history("!a:hs", limit=10))
+        assert len(calls) == 2
+
+    def test_cached_only_never_touches_the_network(self, session):
+        async def fake_room_messages(*args, **kwargs):
+            raise AssertionError("cached_only must not fetch")
+
+        session.client.room_messages = fake_room_messages
+        assert asyncio.run(session.load_history("!a:hs", cached_only=True)) == []
+        session.timelines["!a:hs"].append(
+            Message(sender=ALICE, sender_name="Alice", body="hi", ts=100, event_id="$1")
+        )
+        msgs = asyncio.run(session.load_history("!a:hs", cached_only=True))
+        assert [m.event_id for m in msgs] == ["$1"]
 
     def test_merges_on_event_id_and_keeps_same_timestamp_messages(self, session):
         # Server returns newest-first; two distinct events share ts=100.
@@ -963,7 +1061,7 @@ class TestInitialSync:
     raw aiohttp error instead of returning a SyncError; initial_sync must ride
     that out rather than let it kill the startup worker."""
 
-    def run(self, session, monkeypatch, syncs, get_displayname=None):
+    def run(self, session, monkeypatch, syncs, get_displayname=None, refresh=None):
         calls = []
 
         async def noop(*a, **kw):
@@ -977,7 +1075,7 @@ class TestInitialSync:
             return outcome
 
         monkeypatch.setattr(session, "_refresh_direct_map", noop)
-        monkeypatch.setattr(session, "refresh_space_children", noop)
+        monkeypatch.setattr(session, "refresh_space_children", refresh or noop)
         monkeypatch.setattr(
             session.client, "get_displayname", get_displayname or noop
         )
@@ -1013,6 +1111,172 @@ class TestInitialSync:
         )
         assert len(calls) == 1
         assert not any("retrying" in s for s in steps)
+
+    def test_first_run_syncs_from_scratch(self, session, monkeypatch):
+        # No stored token and no persisted snapshot: the one big seeding sync,
+        # from position zero, with full state.
+        good = SimpleNamespace(rooms=SimpleNamespace(join={}))
+        calls, steps = self.run(session, monkeypatch, [good])
+        assert calls[0]["full_state"] is True
+        assert calls[0]["timeout"] == 30000
+        assert session.client.next_batch == ""
+
+    def test_later_runs_resume_from_the_stored_token(self, session, monkeypatch):
+        # A from-scratch sync is Synapse's slowest path (minutes on a loaded
+        # server); once a token and the room_meta snapshot exist, launch must
+        # sync incrementally and must NOT clear the stored position.
+        session.client.loaded_sync_token = "s123"
+        session.state["room_meta"] = {"!a:hs": {"title": "A"}}
+        good = SimpleNamespace(rooms=SimpleNamespace(join={}))
+        calls, steps = self.run(session, monkeypatch, [good])
+        assert calls[0]["full_state"] is False
+        assert calls[0]["timeout"] == 0
+        assert session.client.loaded_sync_token == "s123"
+        assert any("syncing new messages" in s for s in steps)
+
+    def test_cached_space_hierarchy_refreshes_in_the_background(
+        self, session, monkeypatch
+    ):
+        # With the child map restored from state.json, startup must not wait
+        # for the raw-state refetch (multi-second per space on a loaded
+        # server): a refresh that never finishes would otherwise hang this.
+        session.space_children = {"!s:hs": {"!c:hs"}}
+        started = []
+
+        async def never_finishes(space_id=None):
+            started.append(True)
+            await asyncio.Event().wait()
+
+        good = SimpleNamespace(rooms=SimpleNamespace(join={}))
+        self.run(session, monkeypatch, [good], refresh=never_finishes)
+
+    def test_empty_space_map_still_blocks_on_the_first_fetch(
+        self, session, monkeypatch
+    ):
+        # First run: nothing cached, so the space columns would be empty
+        # without waiting for the fetch.
+        done = []
+
+        async def refresh(space_id=None):
+            done.append(True)
+
+        good = SimpleNamespace(rooms=SimpleNamespace(join={}))
+        self.run(session, monkeypatch, [good], refresh=refresh)
+        assert done == [True]
+
+
+class TestRoomMetaSnapshot:
+    """A resumed (incremental) launch never delivers quiet rooms, so the
+    dashboard serves them from the room_meta snapshot persisted in state.json
+    and refreshed from every live dashboard build."""
+
+    def test_dashboard_lists_snapshot_rooms_missing_from_client(self, session):
+        session.state["room_meta"] = {
+            "!quiet:hs": {
+                "title": "Quiet room",
+                "is_space": False,
+                "person": "",
+                "is_favourite": True,
+                "unread": 2,
+                "highlights": 1,
+            },
+            "!dm:hs": {"title": "Alice", "person": ALICE},
+        }
+        session.state["last_event_ts"]["!quiet:hs"] = 1234
+        dash = session.dashboard()
+        fav = next(e for e in dash["favourites"] if e.room_id == "!quiet:hs")
+        assert fav.title == "Quiet room"
+        assert fav.unread == 2
+        assert fav.highlights == 1
+        assert fav.last_ts == 1234
+        assert [e.room_id for e in dash["dms"]] == ["!dm:hs"]
+
+    def test_live_rooms_win_over_and_refresh_the_snapshot(self, session, fake_room):
+        session.state["room_meta"] = {"!a:hs": {"title": "Stale name"}}
+        session.client.rooms["!a:hs"] = fake_room("!a:hs", display_name="Fresh name")
+        dash = session.dashboard()
+        entries = [e for e in dash["all"] if e.room_id == "!a:hs"]
+        assert [e.title for e in entries] == ["Fresh name"]
+        assert session.state["room_meta"]["!a:hs"]["title"] == "Fresh name"
+
+    def test_stateless_live_room_backfills_from_snapshot(self, session, fake_room):
+        # A room delivered by a resumed (incremental) sync has no state this
+        # session: nio invents a title and knows nothing of space/favourite
+        # status. Those fields must come from the snapshot, and the snapshot
+        # must not be poisoned by the stateless entry either.
+        session.state["room_meta"] = {
+            "!a:hs": {"title": "IOI 2026", "is_space": True, "is_favourite": True}
+        }
+        room = fake_room("!a:hs", display_name="Empty Room")
+        room.named_room_name = lambda: None
+        session.client.rooms["!a:hs"] = room
+        dash = session.dashboard()
+        e = next(x for x in dash["all"] if x.room_id == "!a:hs")
+        assert e.title == "IOI 2026"
+        assert e.is_space
+        assert e.is_favourite
+        assert session.state["room_meta"]["!a:hs"]["title"] == "IOI 2026"
+
+    def test_heroes_blob_title_never_beats_the_snapshot(self, session, fake_room):
+        # An ACTIVE room in a resumed session has members (lazy loading still
+        # delivers the message senders' member events), and nio then builds a
+        # heroes-based group name. That blob must not displace the real name
+        # in the snapshot; only m.room.name/alias or a DM peer outranks it.
+        session.state["room_meta"] = {"!d:hs": {"title": "ioi.discuss"}}
+        room = fake_room(
+            "!d:hs",
+            display_name="ALB-DL-Emanuel, ALB-TL-Erida and 316 others",
+            users={"@alb:hs": None, "@arg:hs": None},
+        )
+        room.named_room_name = lambda: None
+        session.client.rooms["!d:hs"] = room
+        dash = session.dashboard()
+        e = next(x for x in dash["all"] if x.room_id == "!d:hs")
+        assert e.title == "ioi.discuss"
+        assert session.state["room_meta"]["!d:hs"]["title"] == "ioi.discuss"
+
+    def test_real_room_name_beats_the_snapshot(self, session, fake_room):
+        session.state["room_meta"] = {"!d:hs": {"title": "old name"}}
+        room = fake_room("!d:hs", display_name="new name")
+        room.named_room_name = lambda: "new name"
+        session.client.rooms["!d:hs"] = room
+        dash = session.dashboard()
+        e = next(x for x in dash["all"] if x.room_id == "!d:hs")
+        assert e.title == "new name"
+        assert session.state["room_meta"]["!d:hs"]["title"] == "new name"
+
+    def test_left_room_is_dropped_from_the_snapshot(self, session):
+        session.state["room_meta"] = {"!gone:hs": {"title": "Left"}}
+        response = SimpleNamespace(
+            rooms=SimpleNamespace(join={}, leave={"!gone:hs": SimpleNamespace()})
+        )
+        session._record_room_timestamps(response)
+        assert "!gone:hs" not in session.state["room_meta"]
+
+    def test_mark_read_zeroes_the_snapshot_badge(self, session):
+        session.state["room_meta"] = {
+            "!a:hs": {"title": "A", "unread": 5, "highlights": 2}
+        }
+        asyncio.run(session.mark_read("!a:hs"))
+        assert session.state["room_meta"]["!a:hs"]["unread"] == 0
+        assert session.state["room_meta"]["!a:hs"]["highlights"] == 0
+
+    def test_ensure_room_registers_with_persisted_encryption_flag(self, session):
+        # Sending into a room the resumed session has not seen live: nio's
+        # room_send looks the room up (KeyError without this) and its
+        # encrypted flag decides plaintext vs megolm, so it MUST come from
+        # nio's persisted encrypted-rooms set, never default to False.
+        session.client.encrypted_rooms = {"!enc:hs"}
+        session._ensure_room("!enc:hs")
+        session._ensure_room("!plain:hs")
+        assert session.client.rooms["!enc:hs"].encrypted is True
+        assert session.client.rooms["!plain:hs"].encrypted is False
+
+    def test_ensure_room_leaves_known_rooms_alone(self, session, fake_room):
+        room = fake_room("!a:hs")
+        session.client.rooms["!a:hs"] = room
+        session._ensure_room("!a:hs")
+        assert session.client.rooms["!a:hs"] is room
 
 
 class TestInvites:
@@ -1649,6 +1913,9 @@ class TestRefreshSpaceChildren:
         # The space id is percent-encoded into the path so a hostile id
         # containing "/../" or "?" cannot re-target the request.
         assert "/rooms/%21s%3Ahs/state" in fake.urls[0]
+        # Mirrored into state.json, so the next launch can paint the space
+        # columns without waiting for this fetch.
+        assert session.state["space_children"]["!s:hs"] == ["!badvia:hs", "!good:hs"]
 
     def test_error_response_leaves_existing_map_alone(
         self, session, fake_room, monkeypatch

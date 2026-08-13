@@ -368,7 +368,7 @@ class TestLoadMessagesDisplay:
     def make_screen(self, monkeypatch, history, threaded=False, older=()):
         screen = RoomScreen(make_entry())
 
-        async def load_history(room_id):
+        async def load_history(room_id, cached_only=False):
             return list(history)
 
         fake_app = SimpleNamespace(
@@ -441,7 +441,7 @@ class TestExpandedThreads:
     def make_screen(self, monkeypatch, history, expanded=(), fetched=None):
         screen = RoomScreen(make_entry())
 
-        async def load_history(room_id):
+        async def load_history(room_id, cached_only=False):
             return list(history)
 
         fake_app = SimpleNamespace(
@@ -670,7 +670,7 @@ class TestEditedMessages:
     def screen(self, monkeypatch, history):
         screen = RoomScreen(make_entry())
 
-        async def load_history(room_id):
+        async def load_history(room_id, cached_only=False):
             return list(history)
 
         fake_app = SimpleNamespace(
@@ -750,6 +750,58 @@ class TestEditedMessages:
         assert screen._signature(deleted) != before
 
 
+class TestRefreshNames:
+    """The member list arrives seconds after a room opens (fetched in the
+    background, see MatrixSession._fetch_members); senders that painted as
+    raw @user:server ids must repaint in place, without touching selection."""
+
+    def make_screen(self, monkeypatch, cached):
+        screen = RoomScreen(make_entry())
+
+        async def load_history(room_id, cached_only=False):
+            return list(cached)
+
+        fake_app = SimpleNamespace(
+            session=SimpleNamespace(load_history=load_history)
+        )
+        monkeypatch.setattr(
+            RoomScreen, "app", property(lambda self: fake_app), raising=False
+        )
+        monkeypatch.setattr(
+            RoomScreen, "is_attached", property(lambda self: True), raising=False
+        )
+        redraws = []
+
+        async def fake_redraw(keep_scroll=False):
+            redraws.append(keep_scroll)
+
+        screen._redraw = fake_redraw
+        return screen, redraws
+
+    def test_resolved_name_repaints_in_place(self, monkeypatch):
+        raw = Message(
+            sender="@a:hs", sender_name="@a:hs", body="hi", ts=100, event_id="$1"
+        )
+        screen, redraws = self.make_screen(
+            monkeypatch, [replace(raw, sender_name="Alice")]
+        )
+        screen.messages = [raw]
+        screen.selected = 0
+        asyncio.run(screen.refresh_names())
+        assert [m.sender_name for m in screen.messages] == ["Alice"]
+        assert redraws == [True]  # keep_scroll: only the text changed
+        assert screen.selected == 0
+
+    def test_unchanged_names_skip_the_redraw(self, monkeypatch):
+        m = Message(
+            sender="@a:hs", sender_name="Alice", body="hi", ts=100, event_id="$1"
+        )
+        screen, redraws = self.make_screen(monkeypatch, [m])
+        screen.messages = [m]
+        asyncio.run(screen.refresh_names())
+        assert redraws == []
+
+
 class TestComposerPanel:
     """The composer is docked under the timeline, not mounted inside it, so a
     long draft scrolls in its own five rows and a live refresh cannot disturb
@@ -774,7 +826,7 @@ class TestComposerPanel:
             my_name="Me",
             client=SimpleNamespace(rooms={}),
             last_event_id={},
-            load_history=lambda room_id, limit=40: _async(list(history)),
+            load_history=lambda room_id, limit=40, cached_only=False: _async(list(history)),
             mark_read=lambda room_id: _async(None),
             reset_pagination=lambda room_id: None,
             drafts={},
@@ -1067,7 +1119,7 @@ class TestSendResilience:
             my_name="Me",
             client=SimpleNamespace(rooms={}),
             last_event_id={},
-            load_history=lambda room_id, limit=40: _async([]),
+            load_history=lambda room_id, limit=40, cached_only=False: _async([]),
             mark_read=lambda room_id: _async(None),
             reset_pagination=lambda room_id: None,
             drafts={},
@@ -1136,7 +1188,7 @@ class TestRoomFlows:
             my_name="Me",
             client=SimpleNamespace(rooms={}),
             last_event_id={},
-            load_history=lambda room_id, limit=40: _async(list(messages)),
+            load_history=lambda room_id, limit=40, cached_only=False: _async(list(messages)),
             mark_read=lambda room_id: _async(None),
             reset_pagination=lambda room_id: None,
             drafts={},

@@ -191,7 +191,7 @@ class Config:
         # Callers index these directly; guarantee well-typed dicts even if
         # state.json predates a key or was edited by hand (a null or list
         # value would crash the first .get on it).
-        for key in ("last_event_ts", "last_opened_ts"):
+        for key in ("last_event_ts", "last_opened_ts", "room_meta", "space_children"):
             if not isinstance(state.get(key), dict):
                 state[key] = {}
         return state

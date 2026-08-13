@@ -79,12 +79,19 @@ class TestLoad:
 
 class TestState:
     def test_defaults_when_file_missing(self, cfg):
-        assert cfg.load_state() == {"last_event_ts": {}, "last_opened_ts": {}}
+        assert cfg.load_state() == {
+            "last_event_ts": {},
+            "last_opened_ts": {},
+            "room_meta": {},
+            "space_children": {},
+        }
 
     def test_roundtrip(self, cfg):
         state = {
             "last_event_ts": {"!r:hs": 123},
             "last_opened_ts": {"!r:hs": 456},
+            "room_meta": {"!r:hs": {"title": "R"}},
+            "space_children": {"!s:hs": ["!r:hs"]},
             "selected_space": "!s:hs",
         }
         cfg.save_state(state)
@@ -93,11 +100,21 @@ class TestState:
 
     def test_corrupt_file_falls_back_to_defaults(self, cfg):
         cfg.state_path.write_text("{not json")
-        assert cfg.load_state() == {"last_event_ts": {}, "last_opened_ts": {}}
+        assert cfg.load_state() == {
+            "last_event_ts": {},
+            "last_opened_ts": {},
+            "room_meta": {},
+            "space_children": {},
+        }
 
     def test_non_dict_json_falls_back_to_defaults(self, cfg):
         cfg.state_path.write_text(json.dumps([1, 2, 3]))
-        assert cfg.load_state() == {"last_event_ts": {}, "last_opened_ts": {}}
+        assert cfg.load_state() == {
+            "last_event_ts": {},
+            "last_opened_ts": {},
+            "room_meta": {},
+            "space_children": {},
+        }
 
     def test_missing_keys_are_added(self, cfg):
         cfg.state_path.write_text(json.dumps({"selected_space": "!s:hs"}))

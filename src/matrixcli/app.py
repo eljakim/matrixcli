@@ -323,15 +323,19 @@ class RoomScreen(Screen):
         yield Vertical(id="composer")
         yield StatusFooter()
 
-    async def _load_messages(self) -> list:
+    async def _load_messages(self, cached_only: bool = False) -> list:
         """The message list this screen renders. Normal view: the room's main
         timeline with thread replies collapsed out (they live in their own
         ThreadScreen) and per-root reply counts collected for the ⤷ badges.
         Threaded view: replies render indented directly under their root, and
         replies whose root fell out of the history window stay inline at their
         own position so nothing is hidden. ThreadScreen overrides this to load
-        a single thread instead."""
-        messages = await self.app.session.load_history(self.entry.room_id)
+        a single thread instead. cached_only skips the network and serves
+        whatever the timeline cache already holds; on_mount uses it to paint
+        instantly before the (slow) full fetch."""
+        messages = await self.app.session.load_history(
+            self.entry.room_id, cached_only=cached_only
+        )
         if self.older:
             # Scrolled-back history lives on the screen (the session cache
             # only keeps a recent window); splice it back in on every reload.
@@ -426,8 +430,37 @@ class RoomScreen(Screen):
         room = self.app.session.client.rooms.get(self.entry.room_id)
         self._opened_read_marker = getattr(room, "fully_read_marker", None)
         self._reset_history_position()
-        self.messages = await self._load_messages()
-        self.selected = max(0, len(self.messages) - 1)
+        # Paint whatever the sync-seeded cache already holds before touching
+        # the network: the full /messages fetch takes seconds on a slow
+        # homeserver, and a shallow timeline right away beats a blank
+        # screen. The unread divider waits for the full window below, whose
+        # count fallback needs the complete opening snapshot.
+        quick = await self._load_messages(cached_only=True)
+        if quick:
+            self.messages = quick
+            self.selected = len(quick) - 1
+            await self._redraw()
+        messages = await self._load_messages()
+        if not self.is_attached:
+            return  # backed out of the room while the fetch was in flight
+        # The quick paint made the screen interactive during the fetch; if
+        # the user moved off the tail meanwhile, keep their place (by event
+        # id, since the full window may have inserted rows above it).
+        follow = not self.messages or self.selected >= len(self.messages) - 1
+        anchor = None if follow else self.messages[self.selected].event_id
+        self.messages = messages
+        if follow:
+            self.selected = max(0, len(messages) - 1)
+        else:
+            pos = next(
+                (i for i, m in enumerate(messages) if m.event_id == anchor),
+                None,
+            )
+            self.selected = (
+                pos
+                if pos is not None
+                else min(self.selected, max(0, len(messages) - 1))
+            )
         # Anchor the "new" divider to an event id now: the count fallback in
         # _first_unread_index is only meaningful against the opening snapshot,
         # and recomputing it as live messages grow the list would drift the
@@ -443,8 +476,26 @@ class RoomScreen(Screen):
         self._last_seen_event = self.app.session.last_event_id.get(
             self.entry.room_id
         )
-        await self._redraw()
+        await self._redraw(keep_scroll=not follow)
         await self.app.session.mark_read(self.entry.room_id)
+
+    async def refresh_names(self) -> None:
+        """Called by the app when the background member fetch for this room
+        lands (launch syncs members lazily, see MatrixSession._fetch_members):
+        senders that painted as raw @user:server ids get their display names.
+        Selection and scroll stay put; only the text changes."""
+        if not self.is_attached:
+            return
+        messages = await self._load_messages(cached_only=True)
+        if not messages or not self.is_attached:
+            return
+        if [m.sender_name for m in messages] == [
+            m.sender_name for m in self.messages
+        ]:
+            return
+        self.messages = messages
+        self.selected = min(self.selected, len(messages) - 1)
+        await self._redraw(keep_scroll=True)
 
     async def refresh_messages(self) -> None:
         """Called by the app after each background sync. Reload and redraw if
@@ -491,10 +542,12 @@ class RoomScreen(Screen):
     def _signature(self, messages: list) -> list:
         """What a reload has to change for the timeline to need redrawing. Not
         just the event ids: an edit, a deletion, or a reaction changes a
-        message in place, leaving the list of ids exactly as it was."""
+        message in place, leaving the list of ids exactly as it was; so does
+        a sender name resolving once the member list arrives."""
         return [
             (
                 m.event_id,
+                m.sender_name,
                 m.edited_ts,
                 m.redacted_ts,
                 tuple(
@@ -1437,7 +1490,11 @@ class ThreadScreen(RoomScreen):
         lines = (self.root.body or "").strip().splitlines() or [""]
         self.sub_title = lines[0][:60]
 
-    async def _load_messages(self) -> list:
+    async def _load_messages(self, cached_only: bool = False) -> list:
+        # A thread is fetched whole via /relations; there is no local cache
+        # to serve a quick first paint (or a name refresh) from.
+        if cached_only:
+            return []
         thread = await self.app.session.load_thread(self.entry.room_id, self.root)
         return self._splice_pending(fold_edits(thread))
 
@@ -2416,6 +2473,9 @@ class MatrixApp(App):
         super().__init__()
         self.cfg = cfg
         self.session = MatrixSession(cfg)
+        # Repaint the open room when its background member-list fetch lands
+        # and raw @user:server ids can resolve to display names.
+        self.session.on_members_loaded = self._on_members_loaded
         self.fatal: str | None = None
         # Connection health for the footer's ConnStatus: monotonic time of the
         # last successful sync (None until the first one lands) and whether
@@ -2562,6 +2622,11 @@ class MatrixApp(App):
             if isinstance(screen, HomeScreen):
                 self.call_later(screen.refresh_data)
                 break
+
+    def _on_members_loaded(self, room_id: str) -> None:
+        for screen in self.screen_stack:
+            if isinstance(screen, RoomScreen) and screen.entry.room_id == room_id:
+                self.call_later(screen.refresh_names)
 
     async def on_unmount(self) -> None:
         await self.session.close()
