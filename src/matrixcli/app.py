@@ -3,7 +3,8 @@ overlay, and a per-room read/send view.
 
 The home screen shows three columns:
 
-    Spaces             your spaces, with the selected space's rooms below
+    Spaces             your spaces, with the selected space's rooms below,
+                       then rooms that belong to no space at all
     Recent/Favourites  the 5 last-opened rooms, then rooms and DMs tagged
                        m.favourite (toggle with "f"); invites on top when any
     DMs                one entry per person, most-recently-active first
@@ -253,11 +254,12 @@ class RoomScreen(Screen):
         ("h", "collapse", "Fold thread"),
         ("u", "first_unread", "First unread"),
         Binding("slash", "search_room", "Search", show=False),
-        # One key, three labels: check_action leaves exactly the one enabled
+        # One key, four labels: check_action leaves exactly the one enabled
         # that says what Enter will do to the selected message (nothing at all
         # for a plain one), so the footer never promises what it cannot do.
         Binding("enter", "open_download", "Download"),
         Binding("enter", "open_link", "Open link"),
+        Binding("enter", "open_reactions", "Who reacted"),
         Binding("enter", "open_actions", "Message actions"),
         # Enter acts on what a message says; Shift+Enter looks behind it, at
         # the versions of an edited one or the text of a deleted one.
@@ -1093,6 +1095,8 @@ class RoomScreen(Screen):
         actions.extend(
             (f"Open {url}", ("link", url)) for _, _, url in _find_urls(m.body or "")
         )
+        if self.app.session.reaction_summary(self.entry.room_id, m.event_id):
+            actions.append(("Who reacted", ("reactions", "")))
         return actions
 
     def _selected_actions(self) -> list[tuple[str, tuple[str, str]]]:
@@ -1129,12 +1133,15 @@ class RoomScreen(Screen):
         if self._has_history(m):
             self.app.push_screen(HistoryScreen(self.entry, m))
 
-    # Three names for one key: check_action enables exactly the one that
+    # Four names for one key: check_action enables exactly the one that
     # describes what Enter will do here, so the footer names it.
     def action_open_download(self) -> None:
         self._open_selected()
 
     def action_open_link(self) -> None:
+        self._open_selected()
+
+    def action_open_reactions(self) -> None:
         self._open_selected()
 
     def action_open_actions(self) -> None:
@@ -1167,6 +1174,8 @@ class RoomScreen(Screen):
                     self.run_worker(self._download(m, directory))
 
             self.app.push_screen(DownloadScreen(m), when_chosen)
+        elif kind == "reactions":
+            self.app.push_screen(ReactionsScreen(self.entry, m))
         else:
             self._open_url(argument)
 
@@ -1657,6 +1666,68 @@ class HistoryScreen(ModalScreen):
             await box.mount(Rule(line_style="dashed"), Static(note))
 
 
+class ReactionsScreen(ModalScreen):
+    """Who is behind each reaction badge on one message: a line per emoji
+    with the names of everyone who sent it. Escape or Enter closes it."""
+
+    BINDINGS = [
+        ("escape", "dismiss", "Close"),
+        ("enter", "dismiss", "Close"),
+        # A well-voted message can outgrow the box; same keys as everywhere.
+        Binding("j", "scroll_reactors(1)", "Down", show=False),
+        Binding("k", "scroll_reactors(-1)", "Up", show=False),
+        Binding("down", "scroll_reactors(1)", "Down", show=False),
+        Binding("up", "scroll_reactors(-1)", "Up", show=False),
+    ]
+
+    def action_scroll_reactors(self, direction: int) -> None:
+        box = self.query_one("#reactors", VerticalScroll)
+        box.scroll_relative(y=direction, animate=False)
+
+    def __init__(self, entry: Entry, message) -> None:
+        super().__init__()
+        self.entry = entry
+        self.message = message
+
+    def compose(self) -> ComposeResult:
+        # escape(): the display name comes from the sender, and unescaped a
+        # "[" in it is parsed as console markup.
+        with Vertical(id="reactionsbox"):
+            yield Label(
+                f"Reactions: {escape(self.message.sender_name)}",
+                id="reactionstitle",
+            )
+            yield VerticalScroll(id="reactors")
+
+    async def on_mount(self) -> None:
+        session = self.app.session
+        detail = session.reaction_detail(
+            self.entry.room_id, self.message.event_id
+        )
+        box = self.query_one("#reactors", VerticalScroll)
+        if not detail:
+            # The last reaction can be withdrawn between the footer offering
+            # the popup and Enter opening it.
+            await box.mount(Static(Text("no reactions", style="dim italic")))
+            return
+        for key, senders in detail:
+            grid = Table.grid(expand=True, padding=(0, 1, 0, 0))
+            grid.add_column(width=5, justify="left", style="dim", vertical="top")
+            grid.add_column(ratio=1, justify="left")
+            names = Text()
+            for i, (sender, name) in enumerate(senders):
+                if i:
+                    names.append(", ", style="dim")
+                # The same colors the timeline gives these people's names, so
+                # the popup reads as the same cast.
+                if sender == session.cfg.user_id:
+                    names.append(session.my_name, style=MY_COLOR)
+                else:
+                    names.append(name, style=_sender_color(sender))
+            grid.add_row(f"{key} {len(senders)}", names)
+            await box.mount(Static(grid))
+
+
 class ConfirmScreen(ModalScreen):
     """A yes/no gate for destructive actions: Enter confirms, Escape backs
     out. Dismisses with True/False."""
@@ -1881,7 +1952,7 @@ class HomeScreen(Screen):
     # walk a whole column as if it were one list (spilling from the bottom of
     # one into the top of the next), "h"/"l" step between columns.
     COLUMNS = [
-        ["spaces", "space_rooms"],
+        ["spaces", "space_rooms", "other_rooms"],
         ["invites", "recent", "favourites"],
         ["dms"],
     ]
@@ -1908,6 +1979,8 @@ class HomeScreen(Screen):
                 yield ListView(id="spaces")
                 yield Label("Rooms", classes="section", id="roomslabel")
                 yield ListView(id="space_rooms")
+                yield Label("Other rooms", classes="section", id="otherslabel")
+                yield ListView(id="other_rooms")
             with VerticalScroll(classes="column"):
                 yield Label("Invites", classes="section", id="inviteslabel")
                 yield ListView(id="invites")
@@ -2020,8 +2093,15 @@ class HomeScreen(Screen):
             self.query_one("#inviteslabel", Label).display = show_invites
             self.query_one("#invites", ListView).display = show_invites
 
+            # Same for Other rooms: most accounts have every room in a space,
+            # and an always-present "(none)" would just push Rooms around.
+            show_others = bool(data["others"])
+            self.query_one("#otherslabel", Label).display = show_others
+            self.query_one("#other_rooms", ListView).display = show_others
+
             await fill("spaces", data["spaces"], selected_space=self.selected_space)
             await fill("space_rooms", data["space_rooms"])
+            await fill("other_rooms", data["others"])
             await fill("invites", data["invites"])
             await fill("recent", data["recent"])
             await fill("favourites", data["favourites"])
@@ -2039,6 +2119,7 @@ class HomeScreen(Screen):
             self.selected_space,
             col(data["spaces"]),
             col(data["space_rooms"]),
+            col(data["others"]),
             col(data["invites"]),
             col(data["recent"]),
             col(data["favourites"]),
@@ -2230,7 +2311,7 @@ class MatrixApp(App):
         background: $panel;
     }
     #searchbox #results { max-height: 20; }
-    #downloadbox, #actionbox, #editsbox {
+    #downloadbox, #actionbox, #editsbox, #reactionsbox {
         width: 70%;
         height: auto;
         margin: 4 10;
@@ -2238,12 +2319,13 @@ class MatrixApp(App):
         border: round $accent;
         background: $panel;
     }
-    #downloadtitle, #actiontitle, #editstitle {
+    #downloadtitle, #actiontitle, #editstitle, #reactionstitle {
         text-style: bold;
         padding: 0 0 1 0;
     }
     #actionbox #actions { max-height: 12; }
     #editsbox #versions { height: auto; max-height: 20; }
+    #reactionsbox #reactors { height: auto; max-height: 20; }
     AboutScreen, ConfirmScreen { align: center middle; }
     #confirmbox {
         width: auto;

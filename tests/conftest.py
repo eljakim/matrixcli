@@ -64,6 +64,8 @@ class FakeRoom:
         self.member_count = (
             member_count if member_count is not None else len(self.users)
         )
+        # True so load_history does not try to fetch the member list.
+        self.members_synced = True
         self._names = names or {}
 
     def user_name(self, user_id):

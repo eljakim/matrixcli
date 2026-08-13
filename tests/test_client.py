@@ -141,6 +141,34 @@ class TestDashboard:
         rooms = session.dashboard("!s:hs")["space_rooms"]
         assert {e.room_id for e in rooms} == {"!orphan:hs"}
 
+    def test_others_lists_rooms_outside_every_space(self, session, fake_room):
+        # In a space via each of the three link kinds: none of these are
+        # orphans. The space itself, DMs, and never-linked rooms are judged
+        # on their own rules.
+        space = fake_room("!s:hs", room_type="m.space", children={"!child:hs"})
+        child = fake_room("!child:hs")
+        viaparent = fake_room("!via:hs", parents={"!s:hs"})
+        fallback = fake_room("!fb:hs")
+        dm = fake_room("!dm:hs", users={ME: {}, ALICE: {}})
+        orphan = fake_room("!weoi:hs")
+        # A parent pointer at a space we are not joined to does not rescue a
+        # room: it would still be unreachable from the Spaces column.
+        stray = fake_room("!stray:hs", parents={"!unjoined:hs"})
+        session.client.rooms.update(
+            {
+                "!s:hs": space,
+                "!child:hs": child,
+                "!via:hs": viaparent,
+                "!fb:hs": fallback,
+                "!dm:hs": dm,
+                "!weoi:hs": orphan,
+                "!stray:hs": stray,
+            }
+        )
+        session.space_children["!s:hs"] = {"!fb:hs"}
+        others = session.dashboard()["others"]
+        assert {e.room_id for e in others} == {"!weoi:hs", "!stray:hs"}
+
     def test_recent_lists_last_opened_first_capped_at_five(
         self, session, fake_room
     ):
@@ -310,6 +338,29 @@ class TestLoadHistory:
 
         session.client.room_messages = fake_room_messages
         return asyncio.run(session.load_history(room_id, limit=limit))
+
+    def test_fetches_members_once_when_lazily_synced(self, session, fake_room):
+        # Startup syncs members lazily; the first open of a room must fill its
+        # member map so older senders get display names, and a failed member
+        # fetch must not take the history down with it.
+        room = fake_room("!a:hs")
+        room.members_synced = False
+        session.client.rooms["!a:hs"] = room
+        calls = []
+
+        async def fake_joined_members(room_id):
+            calls.append(room_id)
+            raise RuntimeError("server hiccup")
+
+        session.client.joined_members = fake_joined_members
+        msgs = self.run(session, chunk=[text_event("$1", ALICE, 100, "hi")])
+        assert [m.event_id for m in msgs] == ["$1"]
+        assert calls == ["!a:hs"]
+
+        # Once nio marks the room synced, no further fetches happen.
+        room.members_synced = True
+        self.run(session, chunk=[])
+        assert calls == ["!a:hs"]
 
     def test_merges_on_event_id_and_keeps_same_timestamp_messages(self, session):
         # Server returns newest-first; two distinct events share ts=100.
@@ -1141,6 +1192,22 @@ class TestReactions:
         assert session.reaction_summary("!a:hs", "$m") == [("👍", 2), ("🎉", 1)]
         # The room view is nudged to redraw.
         assert session.last_event_id["!a:hs"] == "$r3"
+
+    def test_reaction_detail_names_the_senders(self, session, fake_room):
+        # Keys in badge (summary) order, names resolved through the member
+        # map and sorted; an unknown sender falls back to the bare id.
+        room = fake_room("!a:hs", names={ALICE: "Alice", BOB: "Bob"})
+        session.client.rooms["!a:hs"] = room
+        for eid, sender, key in (
+            ("$r1", BOB, "👍"),
+            ("$r2", ALICE, "👍"),
+            ("$r3", "@stranger:hs", "🎉"),
+        ):
+            asyncio.run(session._on_reaction(room, self.react(eid, sender, "$m", key)))
+        assert session.reaction_detail("!a:hs", "$m") == [
+            ("👍", [(ALICE, "Alice"), (BOB, "Bob")]),
+            ("🎉", [("@stranger:hs", "@stranger:hs")]),
+        ]
 
     def test_variation_selector_variants_count_as_one_key(self, session, fake_room):
         # "👍" and "👍️" are the same vote; clients disagree on which

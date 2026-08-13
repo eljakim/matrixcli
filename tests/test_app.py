@@ -10,6 +10,7 @@ from matrixcli.app import (
     DownloadScreen,
     HistoryScreen,
     HomeScreen,
+    ReactionsScreen,
     RoomScreen,
     ThreadScreen,
     _find_urls,
@@ -118,19 +119,24 @@ class TestActionOpen:
             super().__init__(*a, **kw)
             self.opened = []
             self.pushed = []
+            self.reactions = []  # (key, count) pairs _actions_for consults
             self.app = SimpleNamespace(
-                push_screen=lambda screen, cb=None: self.pushed.append(screen)
+                push_screen=lambda screen, cb=None: self.pushed.append(screen),
+                session=SimpleNamespace(
+                    reaction_summary=lambda room_id, event_id: list(self.reactions)
+                ),
             )
 
         def _open_url(self, url):
             self.opened.append(url)
 
-    def make_screen(self, body="", **kw):
+    def make_screen(self, body="", reactions=(), **kw):
         screen = self.Screen(make_entry())
         screen.messages = [
             Message(sender="@a:hs", sender_name="A", body=body, ts=1, event_id="$1", **kw)
         ]
         screen.selected = 0
+        screen.reactions = list(reactions)
         return screen
 
     def test_single_link_opens_directly(self):
@@ -154,6 +160,29 @@ class TestActionOpen:
         screen._open_selected()
         assert screen.opened == []
         assert isinstance(screen.pushed[0], DownloadScreen)
+
+    def test_reactions_open_the_who_reacted_popup(self):
+        screen = self.make_screen("popular take", reactions=[("👍", 2)])
+        screen._open_selected()
+        assert screen.opened == []
+        assert isinstance(screen.pushed[0], ReactionsScreen)
+
+    def test_link_and_reactions_show_the_picker(self):
+        screen = self.make_screen(
+            "see https://a.example", reactions=[("👍", 2)]
+        )
+        screen._open_selected()
+        assert isinstance(screen.pushed[0], ActionScreen)
+        assert [a for _, a in screen.pushed[0].actions] == [
+            ("link", "https://a.example"),
+            ("reactions", ""),
+        ]
+
+    def test_deleted_message_hides_its_reactions(self):
+        screen = self.make_screen(
+            "kept", reactions=[("👍", 2)], redacted_ts=400
+        )
+        assert screen._selected_actions() == []
 
     def test_shift_enter_opens_the_history(self):
         screen = self.make_screen("fixed", edited_ts=200, original_body="typo")
@@ -198,6 +227,7 @@ class TestActionOpen:
         cases = {
             "open_link": self.make_screen("https://a.example"),
             "open_download": self.make_screen("f.png", media_url="mxc://x/y"),
+            "open_reactions": self.make_screen("hot take", reactions=[("👍", 2)]),
             "open_actions": self.make_screen(
                 "f.png https://a.example", media_url="mxc://x/y"
             ),
@@ -1252,13 +1282,14 @@ class TestHomeKeys:
     """hjkl on the dashboard, driven through a real (headless) app so the
     bindings, the hidden invites section, and focus all take part."""
 
-    def dashboard(self, invites=(), dms=("Dana", "Eve")):
+    def dashboard(self, invites=(), dms=("Dana", "Eve"), others=()):
         def rooms(names, **kw):
             return [make_entry(room_id=f"!{n}:hs", title=n, **kw) for n in names]
 
         return {
             "spaces": rooms(["Space1", "Space2"], is_space=True),
             "space_rooms": rooms(["RoomA", "RoomB"]),
+            "others": rooms(others),
             "invites": rooms(invites, is_invite=True),
             "recent": rooms(["Chat1", "Chat2"]),
             "favourites": rooms(["Fav1"]),
@@ -1374,3 +1405,16 @@ class TestHomeKeys:
         assert self.walk("kk") == [("recent", 0), ("recent", 0)]
         assert self.walk("kk", invites=["Inv1"]) == [("invites", 0), ("invites", 0)]
         assert self.walk("l", dms=()) == [("spaces", 0)]
+
+    def test_other_rooms_join_the_left_column(self):
+        # With orphan rooms present, j rolls off the bottom of Rooms into the
+        # Other rooms section; when there are none the section is hidden and
+        # the walk stops at the bottom of Rooms.
+        assert self.walk("hjjjj", others=["Weoi"]) == [
+            ("spaces", 0),
+            ("spaces", 1),
+            ("space_rooms", 0),
+            ("space_rooms", 1),
+            ("other_rooms", 0),
+        ]
+        assert self.walk("hjjjj")[-1] == ("space_rooms", 1)

@@ -557,10 +557,21 @@ class MatrixSession:
         # token is stored and the live loop continues incrementally.
         self.client.next_batch = ""
         self.client.loaded_sync_token = ""
-        # No lazy_load_members: we need full member state so user_name() can
-        # resolve display names (otherwise DMs show as raw @user:server ids).
+        # lazy_load_members is what makes this launch-time sync affordable:
+        # with full member state the server has to serialize every member of
+        # every room (the big IOI rooms put that at minutes of server-side
+        # work before the first byte arrives); lazily it returns in seconds.
+        # Names still resolve: the server includes member events for timeline
+        # senders and for each room's "heroes", which is exactly what DM and
+        # group-name calculation needs. The full member list of a room is
+        # fetched once on first open (load_history), and nio itself fetches
+        # it before the first send in an encrypted room (members_synced stays
+        # False until a joined_members fetch, which room_send checks).
         sync_filter = {
-            "room": {"timeline": {"limit": 10}},
+            "room": {
+                "timeline": {"limit": 10},
+                "state": {"lazy_load_members": True},
+            },
             "presence": {"limit": 1000},
         }
         step("syncing rooms and messages")
@@ -1046,6 +1057,25 @@ class MatrixSession:
             key=lambda kv: (-kv[1], kv[0]),
         )
 
+    def reaction_detail(
+        self, room_id: str, event_id: str
+    ) -> list[tuple[str, list[tuple[str, str]]]]:
+        """Who is behind each reaction badge: (key, [(sender id, display
+        name), ...]) pairs, keys in reaction_summary order so the popup lines
+        up with the badges, names alphabetically within a key. Names resolve
+        through the room's member map and fall back to the bare user id."""
+        room = self.client.rooms.get(room_id)
+        by_key = self.reactions.get(room_id, {}).get(event_id) or {}
+        out = []
+        for key, _count in self.reaction_summary(room_id, event_id):
+            senders = [
+                (s, _clean((room.user_name(s) if room else None) or s) or s)
+                for s in by_key.get(key, ())
+            ]
+            senders.sort(key=lambda sn: sn[1].lower())
+            out.append((key, senders))
+        return out
+
     async def _on_reaction(self, room: MatrixRoom, event: ReactionEvent) -> None:
         self._note_reaction(
             room.room_id, event.event_id, event.sender, event.reacts_to, event.key
@@ -1223,6 +1253,9 @@ class MatrixSession:
         Keys:
         * spaces / space_rooms -- the list of spaces, and the child rooms of
                      the selected one (resolved from m.space.child state).
+        * others  -- joined rooms that belong to no space at all (Element's
+                     Home view shows these; without this key they would be
+                     reachable only through search).
         * invites -- pending invitations (accept with Enter); shown above
                      Recent, hidden when empty.
         * recent  -- the rooms most recently opened in this client.
@@ -1281,6 +1314,33 @@ class MatrixSession:
                 key=lambda e: (e.unread == 0, -recency(e), e.title.lower()),
             )
 
+        # --- Other rooms: joined rooms outside every space -----------------
+        # A room counts as "in a space" when any joined space links to it from
+        # either side: the space's child set (nio-parsed or the raw-state
+        # fallback map) or the room's own parent pointer at a joined space.
+        # Everything else would be invisible on this screen (search aside), so
+        # it gets its own section.
+        space_ids = {e.room_id for e in entries if e.is_space}
+        in_some_space: set[str] = set()
+        for sid in space_ids:
+            room = self.client.rooms.get(sid)
+            in_some_space |= set(getattr(room, "children", set()) or ())
+        for children in self.space_children.values():
+            in_some_space |= children
+        for rid, room in self.client.rooms.items():
+            if space_ids & (getattr(room, "parents", set()) or set()):
+                in_some_space.add(rid)
+        others = sorted(
+            (
+                e
+                for e in entries
+                if not e.is_space
+                and not e.is_direct
+                and e.room_id not in in_some_space
+            ),
+            key=lambda e: (e.unread == 0, -recency(e), e.title.lower()),
+        )
+
         # --- Recent column: rooms you last opened, newest first -----------
         recent = sorted(
             (e for e in entries if not e.is_space and opened.get(e.room_id)),
@@ -1323,6 +1383,7 @@ class MatrixSession:
         return {
             "spaces": spaces,
             "space_rooms": space_rooms,
+            "others": others,
             "invites": invites,
             "recent": recent,
             "favourites": favourites,
@@ -1535,12 +1596,28 @@ class MatrixSession:
             return cached[-limit:]
 
         room = self.client.rooms.get(room_id)
-        resp = await self.client.room_messages(
-            room_id,
-            start=self.client.next_batch or "",
-            direction=MessageDirection.back,
-            limit=limit,
-        )
+        # Startup syncs members lazily, so senders outside the last sync
+        # window would render as raw @user:server ids. Fill the room's member
+        # map once, alongside the history fetch so it adds no wall-clock; a
+        # failed fetch only costs display names, never the history.
+        member_fetch = None
+        if room is not None and not room.members_synced:
+            member_fetch = asyncio.ensure_future(
+                self.client.joined_members(room_id)
+            )
+        try:
+            resp = await self.client.room_messages(
+                room_id,
+                start=self.client.next_batch or "",
+                direction=MessageDirection.back,
+                limit=limit,
+            )
+        finally:
+            if member_fetch is not None:
+                try:
+                    await member_fetch
+                except Exception:
+                    pass
         if isinstance(resp, RoomMessagesError):
             return cached[-limit:]
         # Seed the back-pagination position from this first window, but never
