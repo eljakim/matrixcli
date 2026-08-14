@@ -130,3 +130,19 @@ class TestState:
         state = cfg.load_state()
         assert state["last_event_ts"] == {}
         assert state["last_opened_ts"] == {}
+
+
+class TestVersion:
+    def test_dunder_version_matches_pyproject(self):
+        # The version lives in two places: pyproject.toml feeds the packaged
+        # metadata the footer displays, __init__.__version__ is the in-code
+        # copy. Nothing else ties them together, so pin it here.
+        import tomllib
+        from pathlib import Path
+
+        import matrixcli
+
+        pyproject = Path(__file__).parents[1] / "pyproject.toml"
+        with pyproject.open("rb") as f:
+            data = tomllib.load(f)
+        assert matrixcli.__version__ == data["project"]["version"]

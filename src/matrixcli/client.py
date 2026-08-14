@@ -1906,7 +1906,8 @@ class MatrixSession:
         """The most recent window of a room's timeline, oldest first. Serves
         the in-memory cache when it can answer (or when cached_only asks for
         an instant, possibly shallow, list to paint before the network round
-        trip); otherwise fetches one /messages window and merges it in."""
+        trip); otherwise fetches /messages windows, paginating deeper while
+        the result is starved of main-timeline messages, and merges them in."""
         cached = list(self.timelines.get(room_id, []))
         # Startup syncs members lazily, so senders outside the last sync
         # window would render as raw @user:server ids; worse, a resumed
@@ -1929,31 +1930,70 @@ class MatrixSession:
         # used to bypass that). history_loaded itself is re-added below only
         # if no new gap appeared during the fetch, so it stays trustworthy.
         gen = self.gap_gen.get(room_id, 0)
-        cache_ok = gen == 0 and len(cached) >= limit
-        if cached_only or cache_ok or room_id in self.history_loaded:
-            return cached[-limit:]
-        resp = await self.client.room_messages(
-            room_id,
-            start=self.client.next_batch or "",
-            direction=MessageDirection.back,
-            limit=limit,
-        )
-        if isinstance(resp, RoomMessagesError):
-            return cached[-limit:]
-        # Seed the back-pagination position from this first window, but never
-        # overwrite a token load_older has already advanced deeper.
-        end = getattr(resp, "end", None)
-        if end:
-            self.pagination_tokens.setdefault(room_id, end)
-        else:
-            self.pagination_done[room_id] = True
+        # Everything below counts the window in MAIN-timeline messages, not
+        # list entries or raw events: reactions and redactions never become
+        # Messages at all, and thread replies collapse out of the normal
+        # view. A burst of reaction/thread traffic (an active room during an
+        # event) can fill a whole raw window with them, and a plain [-limit:]
+        # slice can be all thread replies, either of which used to paint a
+        # busy room as "(no messages yet)".
+        floor = limit // 2
 
+        def window(msgs: list[Message]) -> list[Message]:
+            main = 0
+            for i in range(len(msgs) - 1, -1, -1):
+                if not msgs[i].thread_root:
+                    main += 1
+                    if main >= floor:
+                        return msgs[max(0, min(i, len(msgs) - limit)):]
+            return msgs
+
+        cache_ok = (
+            gen == 0
+            and len(cached) >= limit
+            and sum(1 for m in cached if not m.thread_root) >= floor
+        )
+        if cached_only or cache_ok or room_id in self.history_loaded:
+            return window(cached)
         fetched: list[Message] = []
-        for event in resp.chunk:
-            msg = self._to_message(room, event)
-            if msg is not None:
-                fetched.append(msg)
-        fetched.reverse()  # chunk comes newest-first when paginating back
+        start = self.client.next_batch or ""
+        deepest = None
+        exhausted = False
+        # Paginate until the fetch holds enough main-timeline messages, the
+        # room's history runs out, or TIMELINE_CAP raw events have been
+        # walked (the cache would not keep more anyway). The common quiet
+        # room still costs exactly one round trip.
+        for _ in range(max(1, TIMELINE_CAP // limit)):
+            resp = await self.client.room_messages(
+                room_id,
+                start=start,
+                direction=MessageDirection.back,
+                limit=limit,
+            )
+            if isinstance(resp, RoomMessagesError):
+                if deepest is None:
+                    return window(cached)
+                break  # keep the windows that did arrive
+            for event in resp.chunk:
+                msg = self._to_message(room, event)
+                if msg is not None:
+                    fetched.append(msg)
+            end = getattr(resp, "end", None)
+            if end:
+                deepest = end
+            if not end or not resp.chunk:
+                exhausted = True
+                break
+            if sum(1 for m in fetched if not m.thread_root) >= floor:
+                break
+            start = end
+        # Seed the back-pagination position from the deepest window consumed,
+        # but never overwrite a token load_older has already advanced deeper.
+        if deepest:
+            self.pagination_tokens.setdefault(room_id, deepest)
+        if exhausted:
+            self.pagination_done[room_id] = True
+        fetched.reverse()  # chunks come newest-first when paginating back
         # Merge on event id (timestamps collide for messages sent in the same
         # millisecond); cached entries win because they may already be decrypted.
         # Re-read the cache: a sync callback may have appended during the fetch.
@@ -2000,7 +2040,7 @@ class MatrixSession:
         # it off and let the next refresh refetch.
         if self.gap_gen.get(room_id, 0) == gen:
             self.history_loaded.add(room_id)
-        return history[-limit:]
+        return window(history)
 
     def _fetch_members(self, room_id: str) -> None:
         """Fetch a room's full member list without blocking the caller.

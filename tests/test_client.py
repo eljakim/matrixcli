@@ -752,6 +752,200 @@ class TestLoadHistory:
         assert [m.body for m in msgs] == ["0", "1", "2", "3", "4"]
 
 
+def reaction_event(event_id, sender, ts, target):
+    from nio.events.room_events import Event
+
+    return Event.parse_event(
+        {
+            "type": "m.reaction",
+            "event_id": event_id,
+            "sender": sender,
+            "origin_server_ts": ts,
+            "content": {
+                "m.relates_to": {
+                    "rel_type": "m.annotation",
+                    "event_id": target,
+                    "key": "👍",
+                }
+            },
+        }
+    )
+
+
+class TestLoadHistoryStarvedWindow:
+    """A raw /messages window says nothing about how many rows it paints:
+    reactions and redactions never become Messages, and thread replies
+    collapse out of the normal view. A reaction/thread flood (a busy room
+    during a live event) used to leave the first window with zero
+    main-timeline messages and the room rendered as "(no messages yet)"."""
+
+    def serve(self, session, windows):
+        """Serve each (chunk, end) in turn and record the start tokens."""
+        calls = []
+
+        async def fake_room_messages(room_id, start, direction, limit):
+            calls.append(start)
+            chunk, end = windows[min(len(calls) - 1, len(windows) - 1)]
+            return SimpleNamespace(chunk=list(chunk), end=end)
+
+        session.client.room_messages = fake_room_messages
+        return calls
+
+    def test_reaction_flood_paginates_to_real_messages(self, session):
+        flood = [
+            reaction_event(f"$r{i}", ALICE, 300 - i, "$old") for i in range(10)
+        ]
+        older = [
+            text_event(f"${i}", ALICE, 200 - i, f"msg {i}") for i in range(10)
+        ]
+        calls = self.serve(session, [(flood, "t1"), (older, "t2")])
+        msgs = asyncio.run(session.load_history("!a:hs", limit=10))
+        assert calls == ["", "t1"]
+        assert len(msgs) == 10
+        assert all(m.body.startswith("msg") for m in msgs)
+        # load_older must continue from the deepest window consumed, not
+        # refetch the flood.
+        assert session.pagination_tokens["!a:hs"] == "t2"
+
+    def test_thread_heavy_tail_extends_the_returned_slice(self, session):
+        threads = [
+            text_event(
+                f"$t{i}",
+                ALICE,
+                300 - i,
+                f"reply {i}",
+                relates={"rel_type": "m.thread", "event_id": "$root"},
+            )
+            for i in range(7)
+        ]
+        first = threads + [
+            text_event(f"$m{i}", BOB, 250 - i, f"main {i}") for i in range(3)
+        ]
+        older = [
+            text_event(f"$o{i}", BOB, 200 - i, f"older {i}") for i in range(5)
+        ]
+        self.serve(session, [(first, "t1"), (older, "t2")])
+        msgs = asyncio.run(session.load_history("!a:hs", limit=10))
+        # The slice grows past `limit` entries until it holds limit // 2
+        # main-timeline messages; the thread replies ride along inside it.
+        assert sum(1 for m in msgs if not m.thread_root) == 5
+        assert sum(1 for m in msgs if m.thread_root) == 7
+
+    def test_quiet_room_still_costs_one_round_trip(self, session):
+        chunk = [text_event(f"${i}", ALICE, 200 - i, f"m{i}") for i in range(6)]
+        calls = self.serve(session, [(chunk, "t1")])
+        msgs = asyncio.run(session.load_history("!a:hs", limit=10))
+        assert len(calls) == 1
+        assert len(msgs) == 6
+
+    def test_pagination_stops_at_start_of_history(self, session):
+        flood = [
+            reaction_event(f"$r{i}", ALICE, 300 - i, "$old") for i in range(10)
+        ]
+        calls = self.serve(session, [(flood, "t1"), ([], None)])
+        msgs = asyncio.run(session.load_history("!a:hs", limit=10))
+        assert calls == ["", "t1"]
+        assert msgs == []
+        assert session.pagination_done["!a:hs"]
+
+    def test_error_mid_pagination_keeps_the_windows_that_arrived(self, session):
+        from nio.responses import RoomMessagesError
+
+        chunk = [text_event("$1", ALICE, 100, "hi")]
+        calls = []
+
+        async def fake_room_messages(room_id, start, direction, limit):
+            calls.append(start)
+            if len(calls) == 1:
+                return SimpleNamespace(chunk=list(chunk), end="t1")
+            return RoomMessagesError("boom")
+
+        session.client.room_messages = fake_room_messages
+        msgs = asyncio.run(session.load_history("!a:hs", limit=10))
+        assert [m.event_id for m in msgs] == ["$1"]
+        assert len(calls) == 2
+
+    def test_thread_only_cache_does_not_short_circuit(self, session):
+        # A cache holding `limit` messages used to satisfy any reload, even
+        # when every one of them is a thread reply and the main view would
+        # still paint empty.
+        for i in range(10):
+            session.timelines["!a:hs"].append(
+                Message(
+                    sender=ALICE,
+                    sender_name="A",
+                    body=f"reply {i}",
+                    ts=100 + i,
+                    event_id=f"$t{i}",
+                    thread_root="$root",
+                )
+            )
+        chunk = [text_event(f"$m{i}", BOB, 90 - i, f"main {i}") for i in range(6)]
+        calls = self.serve(session, [(chunk, "t1")])
+        msgs = asyncio.run(session.load_history("!a:hs", limit=10))
+        assert len(calls) == 1
+        # The slice walks back to limit // 2 main-timeline messages.
+        assert sum(1 for m in msgs if not m.thread_root) == 5
+
+    def test_floor_unreachable_returns_everything_held(self, session):
+        # A room whose entire history holds fewer main-timeline messages
+        # than the floor must return what exists, not loop or come back
+        # empty.
+        chunk = [text_event(f"${i}", ALICE, 200 - i, f"m{i}") for i in range(3)]
+        calls = self.serve(session, [(chunk, "t1"), ([], None)])
+        msgs = asyncio.run(session.load_history("!a:hs", limit=10))
+        assert calls == ["", "t1"]
+        assert [m.body for m in msgs] == ["m2", "m1", "m0"]
+        assert session.pagination_done["!a:hs"]
+
+    def test_pagination_is_capped_at_timeline_cap_raw_events(self, session):
+        from matrixcli.client import TIMELINE_CAP
+
+        # A pathological room that never yields a main-timeline message
+        # (endless reactions) must stop at the raw-event budget, not walk
+        # history forever.
+        flood = [
+            reaction_event(f"$r{i}", ALICE, 300 - i, "$old") for i in range(10)
+        ]
+        calls = self.serve(session, [(flood, "next")])
+        msgs = asyncio.run(session.load_history("!a:hs", limit=10))
+        assert len(calls) == TIMELINE_CAP // 10
+        assert msgs == []
+
+    def test_starved_cached_only_paint_serves_the_whole_cache(self, session):
+        for i in range(3):
+            session.timelines["!a:hs"].append(
+                Message(
+                    sender=BOB,
+                    sender_name="B",
+                    body=f"main {i}",
+                    ts=50 + i,
+                    event_id=f"$m{i}",
+                )
+            )
+        for i in range(10):
+            session.timelines["!a:hs"].append(
+                Message(
+                    sender=ALICE,
+                    sender_name="A",
+                    body=f"reply {i}",
+                    ts=100 + i,
+                    event_id=f"$t{i}",
+                    thread_root="$root",
+                )
+            )
+
+        async def boom(*args, **kwargs):
+            raise AssertionError("cached_only must not fetch")
+
+        session.client.room_messages = boom
+        msgs = asyncio.run(session.load_history("!a:hs", limit=10, cached_only=True))
+        # A plain [-limit:] tail would be thread replies only; the slice
+        # keeps reaching back, here to the whole cache.
+        assert len(msgs) == 13
+        assert sum(1 for m in msgs if not m.thread_root) == 3
+
+
 class TestThreads:
     def test_send_attaches_thread_relation(self, session):
         sent = {}
