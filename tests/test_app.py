@@ -611,18 +611,28 @@ class TestAppChrome:
 
         assert MatrixApp.ENABLE_COMMAND_PALETTE is False
 
-    def test_ctrl_q_neutralized_q_quits_and_about_bound(self):
-        from matrixcli.app import MatrixApp
+    def test_ctrl_q_neutralized_quit_keys_and_about_bound(self):
+        # Quitting is q on the home screen or the ":q!" command; a global q
+        # would make one keystroke while reading a room exit the whole app,
+        # so the app level must NOT bind it.
+        from matrixcli.app import HomeScreen, MatrixApp, RoomScreen
 
-        actions = {}
-        for b in MatrixApp.BINDINGS:
-            key = b.key if hasattr(b, "key") else b[0]
-            action = b.action if hasattr(b, "action") else b[1]
-            actions[key] = action
-        assert actions["ctrl+q"] == "noop"
-        assert actions["q"] == "quit"
-        assert actions["question_mark"] == "about"
-        assert actions["ctrl+r"] == "force_refresh"
+        def keymap(bindings):
+            actions = {}
+            for b in bindings:
+                key = b.key if hasattr(b, "key") else b[0]
+                action = b.action if hasattr(b, "action") else b[1]
+                actions[key] = action
+            return actions
+
+        app_actions = keymap(MatrixApp.BINDINGS)
+        assert app_actions["ctrl+q"] == "noop"
+        assert "q" not in app_actions
+        assert app_actions["colon"] == "command_line"
+        assert app_actions["question_mark"] == "about"
+        assert app_actions["ctrl+r"] == "force_refresh"
+        assert keymap(HomeScreen.BINDINGS)["q"] == "app.quit"
+        assert keymap(RoomScreen.BINDINGS)["q"] == "app.go_home"
 
 
 class TestConnStatus:
@@ -881,7 +891,7 @@ class TestComposerPanel:
 
     def test_a_long_draft_scrolls_inside_the_panel(self):
         async def steps(pilot, screen, panel, composer_area):
-            await pilot.press("R")
+            await pilot.press("n")
             await pilot.pause()
             editor = screen.query_one("#editor", composer_area)
             for _ in range(9):
@@ -907,7 +917,7 @@ class TestComposerPanel:
 
     def test_a_redraw_leaves_the_draft_and_focus_alone(self):
         async def steps(pilot, screen, panel, composer_area):
-            await pilot.press("R")
+            await pilot.press("n")
             await pilot.pause()
             editor = screen.query_one("#editor", composer_area)
             for ch in "hi":
@@ -926,7 +936,7 @@ class TestComposerPanel:
 
     def test_escape_closes_the_panel_and_unmounts_the_editor(self):
         async def steps(pilot, screen, panel, composer_area):
-            await pilot.press("R")
+            await pilot.press("n")
             await pilot.pause()
             await pilot.press("escape")
             await pilot.pause()
@@ -976,6 +986,31 @@ class TestMessageRendering:
         time_cell = list(grid.columns[0].cells)[-1]
         assert isinstance(time_cell, Text) and time_cell.style == "bold red"
         assert self.body_cell(screen, ping).plain.endswith(" @")
+
+    def test_reply_quote_prefers_the_loaded_target(self, monkeypatch):
+        screen = self.screen(monkeypatch)
+        screen.messages = [
+            Message(sender="@a:hs", sender_name="Alice",
+                    body="original text\nmore", ts=1, event_id="$orig"),
+        ]
+        m = Message(sender="@b:hs", sender_name="Bob", body="the reply", ts=2,
+                    event_id="$r", reply_to="$orig", reply_name="@a:hs",
+                    reply_snippet="stale fallback")
+        grid = screen._render_message(m, None, 0)
+        cells = [c.plain for c in grid.columns[1].cells if isinstance(c, Text)]
+        assert "> Alice: original text" in cells
+        assert cells[-1] == "the reply"
+
+    def test_reply_quote_falls_back_to_the_fallback_text(self, monkeypatch):
+        # Target outside the loaded window: what the sender's text fallback
+        # said is all we have.
+        screen = self.screen(monkeypatch)
+        m = Message(sender="@b:hs", sender_name="Bob", body="the reply", ts=2,
+                    event_id="$r", reply_to="$gone", reply_name="Alice",
+                    reply_snippet="what she said")
+        grid = screen._render_message(m, None, 0)
+        cells = [c.plain for c in grid.columns[1].cells if isinstance(c, Text)]
+        assert "> Alice: what she said" in cells
 
     def test_reaction_row_renders_counts(self, monkeypatch):
         screen = self.screen(monkeypatch, reactions=[("👍", 3), ("🎉", 1)])
@@ -1199,6 +1234,9 @@ class TestRoomFlows:
 
         class RoomApp(App):
             CSS = MatrixApp.CSS
+            BINDINGS = MatrixApp.BINDINGS
+            action_go_home = MatrixApp.action_go_home
+            action_command_line = MatrixApp.action_command_line
 
             def on_mount(self):
                 self.session = session
@@ -1217,14 +1255,14 @@ class TestRoomFlows:
 
     def test_escape_stashes_the_draft_and_r_hands_it_back(self):
         async def steps(pilot, app, screen, session, calls, composer_area):
-            await pilot.press("R")
+            await pilot.press("n")
             await pilot.pause()
             for ch in "wip":
                 await pilot.press(ch)
             await pilot.press("escape")
             await pilot.pause()
             stashed = dict(session.drafts)
-            await pilot.press("R")
+            await pilot.press("n")
             await pilot.pause()
             editor = screen.query_one("#editor", composer_area)
             return stashed, editor.text
@@ -1304,6 +1342,86 @@ class TestRoomFlows:
         assert modal == "RoomSearchScreen"
         assert back == "RoomScreen"
         assert selected == 1  # jumped to "from Tashkent"
+
+    def test_q_leaves_the_room_instead_of_quitting(self):
+        async def steps(pilot, app, screen, session, calls, composer_area):
+            await pilot.press("q")
+            await pilot.pause()
+            return type(app.screen).__name__, bool(app._exit)
+
+        top, exited = self.run(steps)
+        assert top != "RoomScreen"
+        assert exited is False
+
+    def test_colon_q_bang_quits_from_a_room(self):
+        async def steps(pilot, app, screen, session, calls, composer_area):
+            await pilot.press("colon")
+            await pilot.pause()
+            for key in ("q", "exclamation_mark", "enter"):
+                await pilot.press(key)
+            await pilot.pause()
+            return bool(app._exit)
+
+        assert self.run(steps) is True
+
+    def test_colon_q_bang_typed_into_the_composer_stays_text(self):
+        async def steps(pilot, app, screen, session, calls, composer_area):
+            await pilot.press("n")
+            await pilot.pause()
+            for key in ("colon", "q", "exclamation_mark"):
+                await pilot.press(key)
+            await pilot.pause()
+            editor = screen.query_one("#editor", composer_area)
+            return editor.text, bool(app._exit)
+
+        text, exited = self.run(steps)
+        assert text == ":q!"
+        assert exited is False
+
+    def test_first_message_of_a_day_keeps_its_name_header(self):
+        # The name header is suppressed on a same-sender run; a divider must
+        # break the run, or the first message of a day (or of the unread
+        # block) renders attributed to nobody.
+        import html
+        import re
+
+        two_days = [
+            Message(sender="@a:hs", sender_name="Antonia", body="yesterday",
+                    ts=1786400000000, event_id="$1"),
+            Message(sender="@a:hs", sender_name="Antonia", body="today",
+                    ts=1786500000000, event_id="$2"),
+        ]
+
+        async def steps(pilot, app, screen, session, calls, composer_area):
+            await pilot.pause()
+            text = html.unescape(re.sub(r"<[^>]+>", "", app.export_screenshot()))
+            return text.replace("\xa0", " ")
+
+        text = self.run(steps, history=two_days)
+        assert text.count("Antonia") == 2
+
+    def test_absurd_timestamp_does_not_crash_the_render(self):
+        # origin_server_ts is whatever a federated server sent; a value
+        # outside localtime's range must degrade to a blank stamp, not tear
+        # the whole room down with an OSError mid-render.
+        import html
+        import re
+
+        weird = [
+            Message(sender="@a:hs", sender_name="A", body="fine",
+                    ts=1786400000000, event_id="$1"),
+            Message(sender="@b:hs", sender_name="B", body="from the far future",
+                    ts=10**20, event_id="$2"),
+        ]
+
+        async def steps(pilot, app, screen, session, calls, composer_area):
+            await pilot.pause()
+            text = html.unescape(re.sub(r"<[^>]+>", "", app.export_screenshot()))
+            return text.replace("\xa0", " ")
+
+        text = self.run(steps, history=weird)
+        assert "from the far future" in text
+        assert "--:--" in text
 
     def test_day_change_inserts_a_divider(self):
         import html
@@ -1387,6 +1505,18 @@ class TestHomeKeys:
         # Focus starts on Recent; j runs off its end into Favourites below it,
         # stops at the bottom of the column, and k retraces the same path.
         assert self.walk("jjjkk") == [
+            ("recent", 1),
+            ("favourites", 0),
+            ("favourites", 0),
+            ("recent", 1),
+            ("recent", 0),
+        ]
+
+    def test_arrow_keys_walk_the_column_like_j_and_k(self):
+        # The focused ListView binds the arrows itself, which would stop the
+        # cursor dead at each list's edge; the priority bindings route them
+        # through the same column-spilling _step as j/k.
+        assert self.walk(["down", "down", "down", "up", "up"]) == [
             ("recent", 1),
             ("favourites", 0),
             ("favourites", 0),

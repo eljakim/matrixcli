@@ -102,7 +102,12 @@ On the home screen:
   `Favourite` or `Unfavourite` to match the selected row, and disappears on
   rows that cannot be tagged)
 - `?`: about box
-- `q`: quit (`Ctrl+Q` and the `Ctrl+P` command palette are disabled)
+- `q`: quit, from the home screen only; on any other page `q` returns
+  straight to the home screen instead (`Ctrl+Q` and the `Ctrl+P` command
+  palette are disabled)
+- `:`: vim-style command line (works on any page when no editor is
+  focused): `:q!` quits immediately from anywhere, `:q` closes the current
+  page like the `q` key, `Esc` cancels
 
 Pending invitations appear in an `Invites` section (marked `✉`) above
 Favourites whenever there are any; `Enter` accepts.
@@ -143,12 +148,12 @@ In a room:
     marked with the deletion time. The server no longer holds that text, so it
     is only available in the session that saw it: after a restart the
     tombstone is all that is left, and there is nothing to open.
-- `r` / `R`: reply to the selected message / compose a new one. Both open a
+- `r` / `n`: reply to the selected message / compose a new one. Both open a
   five-line editor docked below the timeline (the history moves up to make
   room); its header line names what you are replying to. A draft longer than
   five lines scrolls inside the panel, and a message arriving mid-typing
   redraws the history without touching what you have written. Escape stashes
-  the draft rather than destroying it: `r`/`R` in the same room (or thread)
+  the draft rather than destroying it: `r`/`n` in the same room (or thread)
   hands it back, for as long as the app runs.
 - `e`: edit the selected message, when it is your own (the composer opens
   with its current text and sends the correction as a Matrix edit)
@@ -176,7 +181,12 @@ In a room:
   from Enter)
 - `c`: toggle compact mode (no blank line between speakers); the label reads
   `Compact: off` / `Compact: on`
-- `Esc`: cancel the editor, or go back to the home screen
+- `~`: toggle the sender column between display names and raw
+  `@user:server` ids (vim's toggle key); the label reads
+  `Show: names` / `Show: ids`
+- `Esc`: cancel the editor, or go back one page
+- `q`: straight back to the home screen, however deep you are (also from a
+  thread); quitting is `q` on the home screen or `:q!` anywhere
 
 In a thread (opened with `T`): the composer is ready immediately and sends
 into the thread; `r`, `j`/`k`, and `Esc` work as in a room.

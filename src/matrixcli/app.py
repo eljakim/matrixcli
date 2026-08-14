@@ -105,10 +105,21 @@ def _version() -> str:
         return ""
 
 
+def _safe_localtime(ts_ms: int):
+    """localtime of a server timestamp, or None when it is outside the
+    platform's range: origin_server_ts is whatever some federated server put
+    on the wire, and one absurd value must not crash the room render."""
+    try:
+        return time.localtime(ts_ms / 1000)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def _fmt_time(ts: int) -> str:
     if not ts:
         return "     "
-    return time.strftime("%H:%M", time.localtime(ts / 1000))
+    lt = _safe_localtime(ts)
+    return time.strftime("%H:%M", lt) if lt else "--:--"
 
 
 def _fmt_size(size: int) -> str:
@@ -201,6 +212,20 @@ class ComposerArea(TextArea):
         Binding("escape", "cancel", "Cancel", show=True),
     ]
 
+    def render_lines(self, crop):
+        # Textual wipes a pruned widget's styles, but the compositor can
+        # still paint one frame from its stale map before the next reflow
+        # drops the widget; TextArea's per-frame theme application then
+        # crashes the app on the half-torn-down state (closing the composer
+        # no longer forces the timeline reflow that used to hide this
+        # window). The editor is gone from the layout anyway: hand the
+        # compositor blank lines instead of rendering.
+        if not self.is_attached:
+            from textual.strip import Strip
+
+            return [Strip.blank(crop.size.width) for _ in range(crop.size.height)]
+        return super().render_lines(crop)
+
     class Submitted(textual.message.Message):
         def __init__(self, value: str) -> None:
             super().__init__()
@@ -244,6 +269,9 @@ class ComposerArea(TextArea):
 class RoomScreen(Screen):
     BINDINGS = [
         ("escape", "back", "Back"),
+        # Straight to the dashboard, however deep the page stack is; only
+        # the dashboard's own q quits (":q!" quits from anywhere).
+        Binding("q", "app.go_home", "Home", show=False),
         ("j", "down", "Down"),
         ("k", "up", "Up"),
         Binding("down", "down", "Down", show=False),
@@ -268,7 +296,7 @@ class RoomScreen(Screen):
         # Shift+Enter is indistinguishable from Enter (as in the composer).
         Binding("alt+enter", "open_details", "Show history", show=False),
         ("r", "reply", "Reply"),
-        ("R", "compose", "New message"),
+        ("n", "compose", "New message"),
         # Gated by check_action to our own delivered messages.
         ("e", "edit_own", "Edit"),
         ("d", "delete_own", "Delete"),
@@ -281,6 +309,11 @@ class RoomScreen(Screen):
         # one naming the current spacing, so the footer reads as state.
         Binding("c", "compact_on", "Compact: off"),
         Binding("c", "compact_off", "Compact: on"),
+        # Same pattern for "~" (vim's toggle-the-form key): the enabled label
+        # names what the sender column currently shows (display names or raw
+        # @user:server ids).
+        Binding("tilde", "ids_on", "Show: names"),
+        Binding("tilde", "ids_off", "Show: ids"),
     ]
 
     def __init__(self, entry: Entry) -> None:
@@ -289,6 +322,7 @@ class RoomScreen(Screen):
         self.messages: list = []
         self.reply_to = None  # a Message we are replying to, or None
         self.compact = False  # default: blank line above each name header
+        self.show_ids = False  # True: sender column shows @user:server ids
         self.selected = 0  # index of the currently highlighted message
         self.thread_counts: dict[str, int] = {}  # root event id -> reply count
         self.threaded = False  # True: replies shown indented under their root
@@ -304,9 +338,15 @@ class RoomScreen(Screen):
         # Event id of the first unread message, chosen once from the opening
         # snapshot (see on_mount); the divider is anchored to it thereafter.
         self._first_unread_event: str | None = None
-        self._composing = False  # True while an "R" new-message editor is open
+        self._composing = False  # True while an "n" new-message editor is open
         self._editing = None  # own Message being rewritten with "e", or None
         self._last_seen_event: str | None = None  # latest event id we rendered
+        # What _redraw last mounted: the per-message signature list, the
+        # view-mode tuple, and the (sender, day) carry at the tail, so a
+        # tail-append can continue instead of rebuilding everything.
+        self._drawn_sig: list | None = None
+        self._drawn_mode: tuple | None = None
+        self._drawn_tail: tuple = (None, None)
         # Local echoes still in flight: shown in gray immediately on Enter and
         # spliced back into every reload so a background sync cannot drop them
         # before the server confirms (see _finish_send).
@@ -318,7 +358,7 @@ class RoomScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         yield VerticalScroll(id="timeline")
-        # Docked below the timeline and empty until "r"/"R" fills it, so the
+        # Docked below the timeline and empty until "r"/"n" fills it, so the
         # editor is never part of the scrolling history.
         yield Vertical(id="composer")
         yield StatusFooter()
@@ -521,6 +561,15 @@ class RoomScreen(Screen):
             or self.thread_counts != prev_counts
         ):
             follow = not self.messages or self.selected >= len(self.messages) - 1
+            # Keep the selection on the same message by event id, not index:
+            # a thread reply arriving in threaded (or unfolded) view inserts
+            # ABOVE the selection, and a kept index would silently land the
+            # highlight on a different message.
+            anchor = (
+                None
+                if follow or self.selected >= len(self.messages)
+                else self.messages[self.selected].event_id
+            )
             # The reload built fresh Message objects; re-point the reply target
             # at its new incarnation, so the composer's header keeps quoting
             # the current text of the message being replied to.
@@ -533,7 +582,15 @@ class RoomScreen(Screen):
             if follow:
                 self.selected = max(0, len(messages) - 1)
             else:
-                self.selected = min(self.selected, max(0, len(messages) - 1))
+                pos = next(
+                    (i for i, m in enumerate(messages) if m.event_id == anchor),
+                    None,
+                )
+                self.selected = (
+                    pos
+                    if pos is not None
+                    else min(self.selected, max(0, len(messages) - 1))
+                )
             # Not following the tail means the user is reading somewhere
             # above; keep their scroll position instead of snapping back.
             await self._redraw(keep_scroll=not follow)
@@ -559,12 +616,97 @@ class RoomScreen(Screen):
             for m in messages
         ]
 
+    def _render_sig(self) -> list:
+        """Everything a message's mounted widget depends on, one tuple per
+        message. If an entry (and the _render_mode below) is unchanged, the
+        widget on screen is still correct; _redraw compares these to skip
+        work. A message also renders a quote of its reply TARGET, but any
+        change to the target changes the target's own entry, which breaks
+        the prefix match and forces the full rebuild that refreshes the
+        quote."""
+        return [
+            (
+                m.event_id,
+                m.sender,
+                m.sender_name,
+                m.body,
+                m.ts,
+                m.pending,
+                m.edited_ts,
+                m.redacted_ts,
+                m.media_url,
+                m.mentions_me,
+                self.thread_counts.get(m.event_id, 0) if m.event_id else 0,
+                tuple(
+                    self.app.session.reaction_summary(
+                        self.entry.room_id, m.event_id
+                    )
+                ),
+            )
+            for m in self.messages
+        ]
+
+    def _render_mode(self) -> tuple:
+        """View-wide switches the whole render depends on; any change forces
+        a full rebuild even when no message changed."""
+        return (
+            self.threaded,
+            self.compact,
+            self.show_ids,
+            self._first_unread_pos(),
+            tuple(sorted(self.expanded)),
+            self.app.session.my_name,
+        )
+
+    def _build_rows(self, start: int, prev, prev_day, first_unread):
+        """Widgets for messages[start:], continuing from the (previous
+        sender, previous day) carry; returns (rows, prev, prev_day) so an
+        append can resume where the last draw stopped."""
+        rows = []
+        for i in range(start, len(self.messages)):
+            m = self.messages[i]
+            # A divider wherever the calendar day changes, so scrolled-back
+            # history says which day it is (timestamps are HH:MM only).
+            lt = _safe_localtime(m.ts) if m.ts else None
+            day = lt[:3] if lt else prev_day
+            if day != prev_day and prev_day is not None:
+                stamp = time.strftime("%a %d %b %Y", lt)
+                rows.append(Static(Text(f"── {stamp} ──", style="dim")))
+                # The header is only drawn on a sender change; without this
+                # the first message of a day inherits suppression from the
+                # same sender's last message of the previous day and renders
+                # attributed to nobody.
+                prev = None
+            prev_day = day
+            if i == first_unread:
+                rows.append(
+                    Static(Text("── new ──", style="red"), classes="unread-marker")
+                )
+                prev = None  # same rule: the first unread names its sender
+            line = MessageLine(self._render_message(m, prev, i), i)
+            if m.thread_root and (
+                self.threaded or m.thread_root in self.expanded
+            ):
+                line.add_class("thread-reply")
+            rows.append(line)
+            prev = m.sender
+        return rows, prev, prev_day
+
     async def _redraw(self, keep_scroll: bool = False) -> None:
-        """Rebuild the timeline as one MessageLine widget per message.
-        Serialized by a lock: two interleaved rebuilds would duplicate widgets.
-        The composer is not part of this: it lives in its own docked panel
-        (see _sync_composer), so a rebuild can never swallow a half-typed
-        draft.
+        """Bring the timeline widgets in line with self.messages.
+        Serialized by a lock: two interleaved rebuilds would duplicate
+        widgets. The composer is not part of this: it lives in its own
+        docked panel (see _sync_composer), so a rebuild can never swallow a
+        half-typed draft.
+
+        The mounted widgets are tracked by signature so the common live
+        cases stay cheap: messages appended at the tail mount only the new
+        rows, and a refresh that changed nothing visible keeps every widget
+        in place. Anything else (an edit, a deletion, a reaction, a view
+        toggle, cap eviction at the head) rebuilds the whole list, batched
+        into a single mount call. A full teardown-and-remount used to cost
+        ~300 ms of blocked event loop per sync tick on a back-paginated
+        timeline.
 
         keep_scroll: restore the current scroll offset instead of snapping to
         the highlighted message. Live refreshes use it so a message arriving
@@ -577,36 +719,39 @@ class RoomScreen(Screen):
             except Exception:
                 return
             scroll_y = tl.scroll_y
-            await tl.remove_children()
-            if not self.messages:
-                await tl.mount(Static(Text("(no messages yet)", style="dim")))
-                await self._sync_composer()
-                return
-
-            first_unread = self._first_unread_pos()
-            prev = None
-            prev_day = None
-            for i, m in enumerate(self.messages):
-                # A divider wherever the calendar day changes, so scrolled-back
-                # history says which day it is (timestamps are HH:MM only).
-                day = time.localtime(m.ts / 1000)[:3] if m.ts else prev_day
-                if day != prev_day and prev_day is not None:
-                    stamp = time.strftime("%a %d %b %Y", time.localtime(m.ts / 1000))
-                    await tl.mount(
-                        Static(Text(f"── {stamp} ──", style="dim"))
+            sig = self._render_sig()
+            mode = self._render_mode()
+            drawn = self._drawn_sig
+            if (
+                self.messages
+                and drawn
+                and self._drawn_mode == mode
+                and len(sig) >= len(drawn)
+                and sig[: len(drawn)] == drawn
+            ):
+                if len(sig) > len(drawn):
+                    prev, prev_day = self._drawn_tail
+                    rows, prev, prev_day = self._build_rows(
+                        len(drawn), prev, prev_day, self._first_unread_pos()
                     )
-                prev_day = day
-                if i == first_unread:
-                    await tl.mount(
-                        Static(Text("── new ──", style="red"), classes="unread-marker")
-                    )
-                line = MessageLine(self._render_message(m, prev, i), i)
-                if m.thread_root and (
-                    self.threaded or m.thread_root in self.expanded
-                ):
-                    line.add_class("thread-reply")
-                await tl.mount(line)
-                prev = m.sender
+                    await tl.mount(*rows)
+                    self._drawn_sig = sig
+                    self._drawn_tail = (prev, prev_day)
+                # Equal length: nothing visible changed; keep every widget.
+            else:
+                await tl.remove_children()
+                if not self.messages:
+                    self._drawn_sig = None
+                    await tl.mount(Static(Text("(no messages yet)", style="dim")))
+                    await self._sync_composer()
+                    return
+                rows, prev, prev_day = self._build_rows(
+                    0, None, None, self._first_unread_pos()
+                )
+                await tl.mount(*rows)
+                self._drawn_sig = sig
+                self._drawn_mode = mode
+                self._drawn_tail = (prev, prev_day)
 
             if keep_scroll:
                 self._highlight(scroll=False)
@@ -693,6 +838,17 @@ class RoomScreen(Screen):
 
     def _toggle_compact(self) -> None:
         self.compact = not self.compact
+        self.refresh_bindings()  # flip the footer label with the state
+        self.run_worker(self._redraw())
+
+    def action_ids_on(self) -> None:
+        self._toggle_ids()
+
+    def action_ids_off(self) -> None:
+        self._toggle_ids()
+
+    def _toggle_ids(self) -> None:
+        self.show_ids = not self.show_ids
         self.refresh_bindings()  # flip the footer label with the state
         self.run_worker(self._redraw())
 
@@ -911,6 +1067,10 @@ class RoomScreen(Screen):
             return not self.compact
         if action == "compact_off":
             return self.compact
+        if action == "ids_on":
+            return not self.show_ids
+        if action == "ids_off":
+            return self.show_ids
         if action in ("edit_own", "delete_own"):
             if self.selected >= len(self.messages):
                 return False
@@ -977,7 +1137,10 @@ class RoomScreen(Screen):
         _redraw), which also draws the full-height thread bar on their left."""
         mine = m.sender == self.app.session.cfg.user_id
         body = (m.body or "").strip() or "[no text]"
-        name = self.app.session.my_name if mine else m.sender_name
+        if self.show_ids:
+            name = m.sender
+        else:
+            name = self.app.session.my_name if mine else m.sender_name
         name_color = MY_COLOR if mine else _sender_color(m.sender)
 
         grid = Table.grid(expand=True, padding=(0, 1, 0, 0))
@@ -988,6 +1151,43 @@ class RoomScreen(Screen):
             if not self.compact and prev_sender is not None:
                 grid.add_row("", "")  # blank spacer line above the name header
             grid.add_row("", Text(name, style=f"bold {name_color}"))
+        if (m.reply_to or m.reply_name) and not m.redacted_ts:
+            # A one-line quote of the replied-to message. The loaded window
+            # is the best source (current text, display name); a target
+            # outside it falls back to what the sender's text fallback said.
+            target = next(
+                (
+                    x
+                    for x in self.messages
+                    if m.reply_to and x.event_id == m.reply_to
+                ),
+                None,
+            )
+            if (
+                target is not None
+                and not target.redacted_ts
+                and (target.body or "").strip()
+            ):
+                if self.show_ids:
+                    qname = target.sender
+                else:
+                    qname = (
+                        self.app.session.my_name
+                        if target.sender == self.app.session.cfg.user_id
+                        else target.sender_name
+                    )
+                qtext = (target.body or "").strip().splitlines()[0]
+            else:
+                qname, qtext = m.reply_name, m.reply_snippet
+            if qname or qtext:
+                if len(qtext) > 70:
+                    qtext = qtext[:70] + "…"
+                quote = Text("> ", style="dim")
+                if qname:
+                    quote.append(qname, style="dim bold")
+                    quote.append(": ", style="dim")
+                quote.append(qtext, style="dim italic")
+                grid.add_row("", quote)
         # A mention paints the timestamp cell red and flags the line, so a
         # scan down the left margin finds every ping.
         time_cell = (
@@ -1098,7 +1298,10 @@ class RoomScreen(Screen):
 
         def when_answered(yes) -> None:
             if yes:
-                self.run_worker(self._finish_delete(m))
+                # An app worker, same as _finish_send: a screen worker dies
+                # with the screen, so confirming and then leaving the room
+                # during the round-trip would silently skip the deletion.
+                self.app.run_worker(self._finish_delete(m))
 
         first_line = ((m.body or "").strip().splitlines() or [""])[0][:60]
         self.app.push_screen(
@@ -1108,8 +1311,12 @@ class RoomScreen(Screen):
     async def _finish_delete(self, m) -> None:
         ok, info = await self.app.session.redact(self.entry.room_id, m.event_id)
         if not ok:
+            # The room is named because the user may have left it meanwhile
+            # and the toast can appear anywhere in the app (as _finish_send).
             self.app.notify(
-                f"Failed to delete: {info}", severity="error", timeout=10,
+                f"Failed to delete in {self.entry.title}: {info}",
+                severity="error",
+                timeout=10,
                 markup=False,
             )
         if self.is_attached:
@@ -1224,7 +1431,9 @@ class RoomScreen(Screen):
 
             def when_chosen(directory: str | None) -> None:
                 if directory:
-                    self.run_worker(self._download(m, directory))
+                    # App worker: leaving the room must not abort a save the
+                    # user asked for (screen workers die with the screen).
+                    self.app.run_worker(self._download(m, directory))
 
             self.app.push_screen(DownloadScreen(m), when_chosen)
         elif kind == "reactions":
@@ -1262,8 +1471,8 @@ class RoomScreen(Screen):
             ok, result = await self.app.session.download_media(m, directory)
         except Exception as exc:
             ok, result = False, str(exc)
-        if not self.is_attached:
-            return
+        # No is_attached gate: nothing below touches the screen, and the
+        # outcome of a download must be reported even after leaving the room.
         if ok:
             session = self.app.session
             session.state["download_dir"] = directory
@@ -1387,6 +1596,7 @@ class RoomScreen(Screen):
             ts=int(time.time() * 1000),
             event_id=f"~local.{uuid4().hex}",
             thread_root=kwargs.get("thread_root") or "",
+            reply_to=reply.event_id if reply else "",
             pending=True,
         )
         self._pending.append(echo)
@@ -1436,7 +1646,12 @@ class RoomScreen(Screen):
         if not self.is_attached:
             return
         if ok:
-            self._last_seen_event = info
+            # Deliberately NOT recorded as _last_seen_event: the sync batch
+            # that delivers our event can carry another user's message that
+            # landed just before it, and pre-marking ours as seen would make
+            # refresh_messages skip that batch entirely, hiding the other
+            # message until something else bumps the room. The refresh this
+            # costs is cheap (cache-served, signature-compared).
             if any(m.event_id == info for m in self.messages):
                 # The sync echo landed during the round-trip; drop the local
                 # copy instead of showing the message twice.
@@ -1479,6 +1694,7 @@ class ThreadScreen(RoomScreen):
     def __init__(self, entry: Entry, root) -> None:
         super().__init__(entry)
         self.root = root
+        self._thread_seen: tuple | None = None  # see refresh_messages
 
     async def on_mount(self) -> None:
         # Open with the composer ready: a thread is usually opened to reply.
@@ -1489,6 +1705,49 @@ class ThreadScreen(RoomScreen):
         # remote sender controls the body and " " must not crash the screen.
         lines = (self.root.body or "").strip().splitlines() or [""]
         self.sub_title = lines[0][:60]
+        self._thread_seen = self._thread_evidence()
+
+    def _thread_evidence(self) -> tuple:
+        """What the local caches know about this thread: new replies, edits,
+        deletions, and reactions all leave a trace here, because they arrive
+        through the room's sync stream like any other event."""
+        session = self.app.session
+        root_id = self.root.event_id
+        shown = {m.event_id for m in self.messages if m.event_id}
+        rows = tuple(
+            (m.event_id, m.edited_ts, m.redacted_ts)
+            for m in session.timelines.get(self.entry.room_id, ())
+            if m.event_id == root_id
+            or m.thread_root == root_id
+            or (m.replaces and (m.replaces == root_id or m.replaces in shown))
+        )
+        reacts = tuple(
+            tuple(session.reaction_summary(self.entry.room_id, m.event_id))
+            for m in self.messages
+            if m.event_id
+        )
+        return (rows, reacts)
+
+    async def refresh_messages(self) -> None:
+        # The room screen reloads from the timeline cache; this screen's
+        # reload refetches the whole thread over /relations (seconds on a
+        # loaded homeserver) and used to be triggered by EVERY room event,
+        # nearly all of which have nothing to do with this thread. Only pay
+        # for the fetch when the local caches show evidence the thread
+        # changed; a quiet tick still advances the seen marker and the read
+        # receipt.
+        if not self.is_attached:
+            return
+        latest = self.app.session.last_event_id.get(self.entry.room_id)
+        if not latest or latest == self._last_seen_event:
+            return
+        evidence = self._thread_evidence()
+        if evidence == self._thread_seen:
+            self._last_seen_event = latest
+            await self.app.session.mark_read(self.entry.room_id)
+            return
+        self._thread_seen = evidence
+        await super().refresh_messages()
 
     async def _load_messages(self, cached_only: bool = False) -> list:
         # A thread is fetched whole via /relations; there is no local cache
@@ -1829,6 +2088,26 @@ class AboutScreen(ModalScreen):
         yield Static(text, id="aboutbox")
 
 
+class CommandScreen(ModalScreen):
+    """":" anywhere outside a text editor: a one-line vim-style command
+    entry docked at the bottom, dismissing with the typed command on Enter
+    (None on Escape). The app interprets the result: "q!" quits
+    unconditionally, "q" closes the page like the q key."""
+
+    BINDINGS = [("escape", "dismiss", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="commandbox"):
+            yield Label(":", id="commandprompt")
+            yield Input(id="command", compact=True)
+
+    def on_mount(self) -> None:
+        self.query_one("#command", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip())
+
+
 class RoomSearchScreen(ModalScreen):
     """"/" inside a room: accent-insensitive search over the loaded history
     (including anything paged back this visit), newest hit first. Enter
@@ -1997,6 +2276,15 @@ class HomeScreen(Screen):
         Binding("h", "focus_prev_column", show=False),
         Binding("tab", "focus_next_column", show=False),
         Binding("shift+tab", "focus_prev_column", show=False),
+        # priority=True: the focused ListView binds the arrows (and enter)
+        # itself, which would stop the cursor dead at each list's edge; these
+        # route them through the same column-spilling _step as j/k, so the
+        # arrows behave exactly like j/k everywhere in the app. Same for
+        # Enter, which also puts "Open" in the footer (a focused widget's
+        # hidden binding otherwise outranks the screen's for display).
+        Binding("down", "down", show=False, priority=True),
+        Binding("up", "up", show=False, priority=True),
+        Binding("enter", "open_selected", "Open", priority=True),
         # Two labels for one key: check_action enables the one matching the
         # highlighted entry, and hides both on rows that cannot be tagged
         # (spaces, invites, empty placeholders).
@@ -2023,6 +2311,14 @@ class HomeScreen(Screen):
         # refresh_data is reached from both the app pump (background sync) and
         # this screen's own handlers; the lock keeps rebuilds from interleaving.
         self._refresh_lock = asyncio.Lock()
+        # Set by the app instead of refreshing while a room covers this
+        # screen; the deferred rebuild happens once, on resume.
+        self.stale = False
+
+    def on_screen_resume(self) -> None:
+        if self.stale:
+            self.stale = False
+            self.run_worker(self.refresh_data())
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -2130,9 +2426,12 @@ class HomeScreen(Screen):
                     placeholder.disabled = True
                     await lv.append(placeholder)
                     return
-                for e in entries:
-                    is_sel = e.room_id == selected_space
-                    await lv.append(EntryItem(e, self._label_for(e, is_sel)))
+                # One batched mount: appending row by row awaited a mount per
+                # entry, ~300 ms of blocked event loop for a full dashboard.
+                await lv.extend(
+                    EntryItem(e, self._label_for(e, e.room_id == selected_space))
+                    for e in entries
+                )
                 new_index = next(
                     (i for i, e in enumerate(entries) if e.room_id == highlighted),
                     None,
@@ -2229,6 +2528,14 @@ class HomeScreen(Screen):
             wants_remove = action == "favourite_remove"
             return entry.is_favourite == wants_remove
         return True
+
+    def action_open_selected(self) -> None:
+        # The priority Enter binding bypasses the focused ListView's own
+        # select action; delegate back to it (on_list_view_selected guards
+        # against placeholder rows).
+        lv = self._focused_list()
+        if lv is not None:
+            lv.action_select_cursor()
 
     def action_favourite_add(self) -> None:
         self.run_worker(self._toggle_favourite())
@@ -2368,6 +2675,13 @@ class MatrixApp(App):
         background: $panel;
     }
     #searchbox #results { max-height: 20; }
+    #commandbox {
+        dock: bottom;
+        height: 1;
+        background: $panel;
+    }
+    #commandprompt { width: 1; }
+    #commandbox Input { background: $panel; }
     #downloadbox, #actionbox, #editsbox, #reactionsbox {
         width: 70%;
         height: auto;
@@ -2437,12 +2751,48 @@ class MatrixApp(App):
     # commands are all covered by explicit bindings.
     ENABLE_COMMAND_PALETTE = False
     BINDINGS = [
-        ("q", "quit", "Quit"),
+        # "q" deliberately NOT bound here: on the dashboard it quits
+        # (HomeScreen binds it), on every other page it goes back to the
+        # dashboard (RoomScreen binds it), and quitting from anywhere is
+        # ":q!" below. A global q made one keystroke while reading a room
+        # exit the whole app.
         Binding("ctrl+q", "noop", show=False),
         Binding("question_mark", "about", "About", show=False),
         # Hidden to keep the footer lean.
         Binding("ctrl+r", "force_refresh", "Refresh", show=False),
+        # vim-style command line; ":" only reaches this binding when no text
+        # editor is focused (a focused TextArea/Input consumes the
+        # character), so typing ":q!" INTO a draft cannot quit anything.
+        Binding("colon", "command_line", "Command", show=False),
     ]
+
+    def action_go_home(self) -> None:
+        """Pop everything above the dashboard (q on any page)."""
+        while (
+            not isinstance(self.screen, HomeScreen) and len(self.screen_stack) > 1
+        ):
+            self.pop_screen()
+
+    def action_command_line(self) -> None:
+        def when_entered(cmd) -> None:
+            if not cmd:
+                return
+            if cmd == "q!":
+                self.exit()
+            elif cmd == "q":
+                # ":q" closes the current page, like the q key: back to the
+                # dashboard, or quit when already on it.
+                if isinstance(self.screen, HomeScreen):
+                    self.exit()
+                else:
+                    self.action_go_home()
+            else:
+                self.notify(
+                    f"Not a command: {cmd}", severity="warning", timeout=4,
+                    markup=False,
+                )
+
+        self.push_screen(CommandScreen(), when_entered)
 
     def action_noop(self) -> None:
         pass
@@ -2620,7 +2970,14 @@ class MatrixApp(App):
     def action_refresh_home(self) -> None:
         for screen in self.screen_stack:
             if isinstance(screen, HomeScreen):
-                self.call_later(screen.refresh_data)
+                # Rebuilding the dashboard costs real time, and at peak the
+                # unread counts change on nearly every sync; while a room
+                # covers the dashboard, just note the staleness and rebuild
+                # once on resume instead of on every tick.
+                if screen is self.screen:
+                    self.call_later(screen.refresh_data)
+                else:
+                    screen.stale = True
                 break
 
     def _on_members_loaded(self, room_id: str) -> None:

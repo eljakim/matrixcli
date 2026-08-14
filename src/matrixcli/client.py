@@ -60,6 +60,10 @@ from .config import Config
 
 HISTORY_LIMIT = 40
 TIMELINE_CAP = 200
+# Minimum seconds between read-marker POSTs per room (see mark_read): at peak
+# an open busy room refreshes once per sync tick, and marking every tick sends
+# redundant m.fully_read updates to an already loaded server.
+MARK_READ_INTERVAL = 2.0
 # Prefix of the placeholders _to_message renders in place of a message it could
 # not decrypt; edit folding checks it so an unreadable edit never displaces
 # readable text.
@@ -129,6 +133,9 @@ class Message:
     event_id: str = ""
     thread_root: str = ""  # event id of the thread this message replies in
     thread_count: int = 0  # server-aggregated reply count (thread roots only)
+    reply_to: str = ""  # event id this message replies to ("": not a reply)
+    reply_name: str = ""  # quoted sender's display name, from the text fallback
+    reply_snippet: str = ""  # first quoted line, from the text fallback
     media_url: str = ""  # mxc:// URL when this message is an uploaded file
     media_name: str = ""  # upload filename (body may be a caption)
     media_size: int = 0  # bytes, from content.info, 0 if unknown
@@ -231,6 +238,52 @@ def _edit_body(event, fallback: str) -> str:
     return fallback[2:] if fallback.startswith("* ") else fallback
 
 
+_REPLY_FALLBACK_RE = re.compile(r"<(@[^:>]+:[^>]+)> ?(.*)")
+
+
+def _reply_target(event) -> str:
+    """The event id this event replies to, or "". A thread relation marked
+    is_falling_back carries m.in_reply_to only as a compatibility pointer at
+    the latest thread message, not as a reply, and reads as ""."""
+    src = getattr(event, "source", {}) or {}
+    relates = (src.get("content", {}) or {}).get("m.relates_to") or {}
+    if not isinstance(relates, dict):
+        return ""
+    in_reply = relates.get("m.in_reply_to")
+    if not isinstance(in_reply, dict):
+        return ""
+    if relates.get("rel_type") == "m.thread" and relates.get("is_falling_back"):
+        return ""
+    return in_reply.get("event_id") or ""
+
+
+def _strip_reply_fallback(body: str) -> tuple[str, str, str]:
+    """(body without the rich-reply text fallback, quoted sender's user id,
+    first quoted line). Pre-v1.3 senders prefix a reply's body with the quoted
+    message as "> <@mxid> text" lines; only called on events that carry
+    m.in_reply_to, so a leading quote block is that fallback and not the
+    sender's own text. Bodies without the fallback pass through untouched."""
+    if not body.startswith("> "):
+        return body, "", ""
+    lines = body.split("\n")
+    i = 0
+    while i < len(lines) and lines[i].startswith(">"):
+        i += 1
+    rest = lines[i:]
+    while rest and not rest[0].strip():
+        rest.pop(0)
+    if not rest:
+        # Nothing but the quote block: the fallback assumption failed, keep
+        # the text rather than render an empty message.
+        return body, "", ""
+    match = _REPLY_FALLBACK_RE.search(lines[0])
+    sender = match.group(1) if match else ""
+    snippet = (match.group(2) if match else lines[0].lstrip("> ")).strip()
+    if not snippet and i > 1:
+        snippet = lines[1].lstrip("> ").strip()
+    return "\n".join(rest), sender, snippet
+
+
 def fold_edits(messages: list[Message]) -> list[Message]:
     """Collapse m.replace edits into the message they rewrite: the newest text
     takes the original's place in the timeline, the text it replaced is kept
@@ -319,6 +372,13 @@ class MatrixSession:
         # same window (seconds per call on a slow homeserver) buys nothing.
         # A gappy sync un-marks the room (see _record_room_timestamps).
         self.history_loaded: set[str] = set()
+        # Bumped per room every time a sync comes back "limited" (events were
+        # skipped, the cache has a hole). load_history snapshots it before its
+        # fetch: a bump seen afterwards means the merged window may already be
+        # stale, so the room must not be re-marked history_loaded; any bump at
+        # all means a full-looking cache can still hide a hole, so the
+        # size-based serve-from-cache shortcut is off for that room.
+        self.gap_gen: dict[str, int] = {}
         # In-flight full member-list fetches by room id (see _fetch_members).
         # Holding the Task matters: asyncio keeps only weak references, so an
         # unreferenced background task can be garbage-collected mid-flight.
@@ -334,6 +394,11 @@ class MatrixSession:
         # reaction event id -> (room, target, key, sender), so a redaction of
         # the reaction event can find what to subtract.
         self._reaction_events: dict[str, tuple[str, str, str, str]] = {}
+        # Read-marker debounce (see mark_read): last event id actually
+        # POSTed per room, when, and the in-flight trailing sender Task.
+        self._marker_sent: dict[str, str] = {}
+        self._marker_time: dict[str, float] = {}
+        self._marker_tasks: dict[str, asyncio.Task] = {}
         # Composer text stashed when an editor is cancelled, keyed by room id
         # (":<root>"-suffixed for threads); refilled the next time a composer
         # opens there. In-memory only: an Escape slip should not cost a
@@ -365,6 +430,36 @@ class MatrixSession:
         self.client.add_event_callback(self._on_reaction, ReactionEvent)
         self.client.add_event_callback(self._on_redaction, RedactionEvent)
         self.client.add_presence_callback(self._on_presence, PresenceEvent)
+
+        # nio decrypts a /messages chunk in place before room_messages()
+        # returns (receive_response -> _handle_messages_response), and the
+        # decrypted event it substitutes rebuilds ``unsigned`` with only the
+        # transaction id: the server's m.relations aggregation (thread reply
+        # counts, the bundled newest edit) is dropped, exactly what
+        # _to_message reads. In encrypted rooms that undercounted every
+        # thread badge and left out-of-window edits unfolded. Save each
+        # wrapper's unsigned before nio's handler runs and graft it back onto
+        # the decrypted replacement (its own keys win on collision).
+        orig_handle = self.client._handle_messages_response
+
+        def handle_messages(response) -> None:
+            wrappers = {
+                e.event_id: (getattr(e, "source", None) or {}).get("unsigned")
+                for e in response.chunk
+                if isinstance(e, MegolmEvent)
+            }
+            orig_handle(response)
+            for e in response.chunk:
+                u = wrappers.get(getattr(e, "event_id", None))
+                if not u or isinstance(e, MegolmEvent):
+                    continue  # nothing saved, or the event stayed encrypted
+                merged = dict(u)
+                merged.update(
+                    (getattr(e, "source", None) or {}).get("unsigned") or {}
+                )
+                e.source["unsigned"] = merged
+
+        self.client._handle_messages_response = handle_messages
 
     # --- connection -------------------------------------------------------
 
@@ -696,6 +791,7 @@ class MatrixSession:
             # so the next open must refetch instead of serving the cache.
             if getattr(getattr(joined, "timeline", None), "limited", False):
                 self.history_loaded.discard(room_id)
+                self.gap_gen[room_id] = self.gap_gen.get(room_id, 0) + 1
             events = getattr(getattr(joined, "timeline", None), "events", []) or []
             for ev in events:
                 ts = getattr(ev, "server_timestamp", 0) or 0
@@ -1041,6 +1137,12 @@ class MatrixSession:
         replaces = _edit_target(event)
         if replaces:
             body = _edit_body(event, body)
+        reply_to = "" if replaces else _reply_target(event)
+        reply_name = reply_snippet = ""
+        if reply_to:
+            body, quoted_sender, reply_snippet = _strip_reply_fallback(body)
+            if quoted_sender:
+                reply_name = room.user_name(quoted_sender) or quoted_sender
         body = _clean(body)
         timeline = self.timelines[room.room_id]
         # The event may already be cached as our own local echo (send()
@@ -1072,6 +1174,9 @@ class MatrixSession:
                     event_id=event.event_id,
                     thread_root=thread_root,
                     thread_count=thread_count,
+                    reply_to=reply_to,
+                    reply_name=_clean(reply_name),
+                    reply_snippet=_clean(reply_snippet),
                     replaces=replaces,
                     mentions_me=self._mentions_me(event, body),
                     **_media_info(event),
@@ -1633,10 +1738,26 @@ class MatrixSession:
 
     def _to_message(self, room, event, follow_bundle: bool = True) -> Message | None:
         """A fetched nio event as a Message, or None for non-message events.
-        Encrypted events are decrypted here (server fetches do not decrypt);
-        ones we lack keys for become a placeholder rather than being
-        dropped."""
+        A /messages chunk arrives with decryptable events already decrypted
+        by nio (and their wrapper's unsigned grafted back on, see
+        _new_client); events from the raw /relations fetch are still
+        encrypted and decrypted here. Ones we lack keys for become a
+        placeholder rather than being dropped."""
         if isinstance(event, RedactedEvent):
+            # A reaction we noted live whose redaction only ever reaches us
+            # as this tombstone (the sync that carried the redaction was
+            # skipped as gappy): subtract it now, or the badge stays one too
+            # high for the rest of the session. _on_redaction does the same
+            # subtraction when the redaction itself arrives.
+            noted = self._reaction_events.pop(event.event_id or "", None)
+            if noted is not None:
+                noted_room, target, key, sender = noted
+                senders = (
+                    self.reactions.get(noted_room, {}).get(target, {}).get(key)
+                )
+                if senders is not None:
+                    senders.discard(sender)
+                return None
             # Only a deleted *message* gets a tombstone. Removing a reaction
             # redacts an event too, and the timeline never showed that one, so
             # marking it would invent a deletion the user cannot have seen.
@@ -1660,9 +1781,11 @@ class MatrixSession:
                 redacted_ts=because.get("origin_server_ts") or event.server_timestamp,
             )
         decrypt_error: Exception | None = None
-        # Thread info comes from the wire-format event: the encrypted wrapper
-        # still has the server's unsigned m.relations aggregation, which nio
-        # drops when it rebuilds the event from the decrypted payload.
+        # Thread info is read before any decryption below: an encrypted
+        # wrapper carries m.relates_to in cleartext plus the server's
+        # unsigned m.relations aggregation, and nio's decrypt drops unsigned
+        # (already-decrypted /messages events had theirs grafted back, see
+        # _new_client).
         thread_root, thread_count = _thread_info(event)
         replaces = _edit_target(event)
         # The server aggregates edits onto the event they rewrite and bundles
@@ -1731,6 +1854,14 @@ class MatrixSession:
             return None
         if replaces:
             body = _edit_body(event, body)
+        reply_to = "" if replaces else _reply_target(event)
+        reply_name = reply_snippet = ""
+        if reply_to:
+            body, quoted_sender, reply_snippet = _strip_reply_fallback(body)
+            if quoted_sender:
+                reply_name = (
+                    room.user_name(quoted_sender) if room else None
+                ) or quoted_sender
         body = _clean(body)
         original_body = ""
         edited_ts = 0
@@ -1756,6 +1887,9 @@ class MatrixSession:
             event_id=event.event_id,
             thread_root=thread_root,
             thread_count=thread_count,
+            reply_to=reply_to,
+            reply_name=_clean(reply_name),
+            reply_snippet=_clean(reply_snippet),
             replaces=replaces,
             edited_ts=edited_ts,
             original_body=original_body,
@@ -1774,17 +1908,30 @@ class MatrixSession:
         an instant, possibly shallow, list to paint before the network round
         trip); otherwise fetches one /messages window and merges it in."""
         cached = list(self.timelines.get(room_id, []))
-        if cached_only or len(cached) >= limit or room_id in self.history_loaded:
-            return cached[-limit:]
-
-        room = self.client.rooms.get(room_id)
         # Startup syncs members lazily, so senders outside the last sync
-        # window would render as raw @user:server ids. Kick the full member
-        # fetch off in the background: on a slow homeserver /joined_members
-        # takes seconds for a big room, and awaiting it here made every
-        # first open hang on it. Names repaint when it lands.
-        if room is not None and not room.members_synced:
+        # window would render as raw @user:server ids; worse, a resumed
+        # (incremental) launch never mentions a quiet room at all, leaving it
+        # out of client.rooms entirely, and nio's joined_members handler
+        # silently drops the response for a room it does not know. Register
+        # the room (same reason send() does) and kick the full member fetch
+        # off in the background: on a slow homeserver /joined_members takes
+        # seconds for a big room, and awaiting it here made every first open
+        # hang on it. Names repaint when it lands. This runs before the
+        # cache early-return so a reopen retries a fetch that failed.
+        self._ensure_room(room_id)
+        room = self.client.rooms[room_id]
+        if not room.members_synced:
             self._fetch_members(room_id)
+        # Serving a big cache without a fetch is only safe while no gappy
+        # sync ever punched a hole in it: after one, "len >= limit" would
+        # happily return history with the skipped chunk silently missing
+        # (history_loaded is discarded on the gap, but this size shortcut
+        # used to bypass that). history_loaded itself is re-added below only
+        # if no new gap appeared during the fetch, so it stays trustworthy.
+        gen = self.gap_gen.get(room_id, 0)
+        cache_ok = gen == 0 and len(cached) >= limit
+        if cached_only or cache_ok or room_id in self.history_loaded:
+            return cached[-limit:]
         resp = await self.client.room_messages(
             room_id,
             start=self.client.next_batch or "",
@@ -1817,6 +1964,16 @@ class MatrixSession:
         for m in cached:
             key = m.event_id or f"ts:{m.ts}:{m.sender}"
             server = merged.get(key)
+            if (
+                server is not None
+                and m.body.startswith(UNDECRYPTABLE)
+                and not server.body.startswith(UNDECRYPTABLE)
+            ):
+                # Keys arrived since this placeholder was cached (live
+                # key-share, not --import-keys, which clears the cache): the
+                # fresh fetch decrypted what the cached copy could not, so
+                # for once the server copy wins outright.
+                continue
             if server is not None and server.redacted_ts and not m.redacted_ts:
                 # The server says this one was deleted while we were away.
                 # Keep the text we already hold (nobody can fetch it again)
@@ -1836,7 +1993,13 @@ class MatrixSession:
         timeline = self.timelines[room_id]
         timeline.clear()
         timeline.extend(history)
-        self.history_loaded.add(room_id)
+        # A limited sync that landed while the fetch above was in flight
+        # discarded history_loaded for a reason: the window just merged was
+        # anchored at the pre-gap token and cannot contain the skipped
+        # events. Re-adding the mark would declare the hole filled, so leave
+        # it off and let the next refresh refetch.
+        if self.gap_gen.get(room_id, 0) == gen:
+            self.history_loaded.add(room_id)
         return history[-limit:]
 
     def _fetch_members(self, room_id: str) -> None:
@@ -1948,10 +2111,33 @@ class MatrixSession:
 
         merged: dict[str, Message] = {m.event_id: m for m in fetched}
         cached = list(self.timelines.get(room_id, []))
+        # The caller passes the root Message it captured when the screen
+        # opened; a deletion arriving since then only flagged the CACHED copy
+        # (_on_redaction), and the merge below skips the root. Adopt the
+        # flag, or the thread keeps rendering the deleted text while the
+        # room view underneath shows the tombstone.
+        cached_root = next(
+            (m for m in cached if m.event_id == root.event_id), None
+        )
+        if (
+            cached_root is not None
+            and cached_root.redacted_ts
+            and not root.redacted_ts
+        ):
+            root = replace(root, redacted_ts=cached_root.redacted_ts)
         for m in cached:
             if m.thread_root != root.event_id or not m.event_id:
                 continue
             server = merged.get(m.event_id)
+            if (
+                server is not None
+                and m.body.startswith(UNDECRYPTABLE)
+                and not server.body.startswith(UNDECRYPTABLE)
+            ):
+                # Same rule as load_history's merge: a placeholder cached
+                # before the keys arrived must not displace the copy this
+                # fetch just decrypted.
+                continue
             if server is not None:
                 # Cached wins (it may be decrypted), but the server copy can
                 # know things the cache does not: an edit it bundled and
@@ -2100,6 +2286,7 @@ class MatrixSession:
                         ts=int(time.time() * 1000),
                         event_id=resp.event_id,
                         thread_root=thread_root or "",
+                        reply_to=reply_to or "",
                     )
                 )
             self.last_event_id[room_id] = resp.event_id
@@ -2227,14 +2414,25 @@ class MatrixSession:
         return True, str(target)
 
     async def mark_read(self, room_id: str) -> None:
+        """Move the room's read marker to its latest event. Called after
+        every refresh of an open room, which at peak traffic is once per
+        sync tick: the HTTP POST is debounced (immediately on the first
+        call, then at most one trailing send per window, carrying whatever
+        the latest event is when it fires), while the local badge state
+        below always updates right away."""
         event_id = self.last_event_id.get(room_id)
-        if event_id:
-            try:
-                await self.client.room_read_markers(
-                    room_id, fully_read_event=event_id, read_event=event_id
+        if event_id and self._marker_sent.get(room_id) != event_id:
+            if room_id not in self._marker_tasks:
+                last = self._marker_time.get(room_id)
+                delay = (
+                    0.0
+                    if last is None
+                    else MARK_READ_INTERVAL - (time.monotonic() - last)
                 )
-            except Exception:
-                pass
+                # Hold the Task ref: asyncio keeps only weak references.
+                self._marker_tasks[room_id] = asyncio.ensure_future(
+                    self._send_read_marker(room_id, delay)
+                )
         # Reading a room clears its badge in the persisted snapshot too; a
         # room quiet since the resume token is never re-delivered by sync, so
         # nothing else would ever zero the cached count.
@@ -2243,6 +2441,26 @@ class MatrixSession:
             snap["unread"] = 0
             snap["highlights"] = 0
         self.record_opened(room_id)
+
+    async def _send_read_marker(self, room_id: str, delay: float) -> None:
+        try:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            # Re-read after the wait so a burst's trailing send carries the
+            # newest event, not the one that scheduled it.
+            event_id = self.last_event_id.get(room_id)
+            if not event_id or self._marker_sent.get(room_id) == event_id:
+                return
+            try:
+                await self.client.room_read_markers(
+                    room_id, fully_read_event=event_id, read_event=event_id
+                )
+            except Exception:
+                return  # the next refresh retries; the marker is cosmetic
+            self._marker_sent[room_id] = event_id
+            self._marker_time[room_id] = time.monotonic()
+        finally:
+            self._marker_tasks.pop(room_id, None)
 
     def record_opened(self, room_id: str) -> None:
         self.state["last_opened_ts"][room_id] = int(time.time() * 1000)

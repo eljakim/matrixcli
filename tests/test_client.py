@@ -380,6 +380,37 @@ class TestLoadHistory:
         assert [m.sender_name for m in session.timelines["!a:hs"]] == ["Alice"]
         assert repainted == ["!a:hs"]
 
+    def test_quiet_room_absent_from_rooms_map_still_gets_names(self, session):
+        # A resumed (incremental) launch never mentions a room without fresh
+        # activity, so it is absent from client.rooms entirely. Opening one
+        # used to skip the member fetch (and nio would drop the /joined_members
+        # response for an unknown room anyway), leaving every sender a raw
+        # @user:server id forever. load_history must register the room itself
+        # so the background fetch runs and the names resolve.
+        repainted = []
+        session.on_members_loaded = repainted.append
+
+        async def main():
+            async def fake_joined_members(room_id):
+                room = session.client.rooms[room_id]
+                room.add_member(ALICE, "Alice", None)
+                room.members_synced = True
+                return SimpleNamespace()
+
+            async def fake_room_messages(*args, **kwargs):
+                return SimpleNamespace(chunk=[text_event("$1", ALICE, 100, "hi")])
+
+            session.client.joined_members = fake_joined_members
+            session.client.room_messages = fake_room_messages
+            await session.load_history("!quiet:hs", limit=10)
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+        asyncio.run(main())
+        assert "!quiet:hs" in session.client.rooms
+        assert [m.sender_name for m in session.timelines["!quiet:hs"]] == ["Alice"]
+        assert repainted == ["!quiet:hs"]
+
     def test_failed_member_fetch_only_costs_names(self, session, fake_room):
         room = fake_room("!a:hs")
         room.members_synced = False
@@ -423,6 +454,85 @@ class TestLoadHistory:
         assert [m.event_id for m in first] == ["$1"]
         assert [m.event_id for m in again] == ["$1"]
         assert len(calls) == 1
+
+    def test_gappy_sync_refetches_even_with_a_full_cache(self, session):
+        # A limited sync only discarded history_loaded, but the serve-from-
+        # cache size shortcut ran first: a room with >= limit cached messages
+        # kept serving the cache with the skipped chunk silently missing.
+        calls = []
+
+        async def fake_room_messages(*args, **kwargs):
+            calls.append(1)
+            return SimpleNamespace(chunk=[text_event("$s", ALICE, 5000, "srv")])
+
+        session.client.room_messages = fake_room_messages
+        for i in range(12):
+            session.timelines["!a:hs"].append(
+                Message(
+                    sender=ALICE,
+                    sender_name="Alice",
+                    body=f"m{i}",
+                    ts=i + 1,
+                    event_id=f"${i}",
+                )
+            )
+        gappy = SimpleNamespace(
+            rooms=SimpleNamespace(
+                join={
+                    "!a:hs": SimpleNamespace(
+                        timeline=SimpleNamespace(events=[], limited=True)
+                    )
+                }
+            )
+        )
+        session._record_room_timestamps(gappy)
+        asyncio.run(session.load_history("!a:hs", limit=10))
+        assert len(calls) == 1
+
+    def test_gap_landing_mid_fetch_leaves_the_room_unloaded(self, session):
+        # The fetch was anchored at the pre-gap sync token, so a limited sync
+        # completing during the await means the merged window cannot contain
+        # the skipped events; marking the room history_loaded anyway would
+        # declare the hole filled and never refetch.
+        async def main():
+            async def fake_room_messages(*args, **kwargs):
+                gappy = SimpleNamespace(
+                    rooms=SimpleNamespace(
+                        join={
+                            "!a:hs": SimpleNamespace(
+                                timeline=SimpleNamespace(events=[], limited=True)
+                            )
+                        }
+                    )
+                )
+                session._record_room_timestamps(gappy)
+                return SimpleNamespace(chunk=[text_event("$1", ALICE, 100, "hi")])
+
+            session.client.room_messages = fake_room_messages
+            await session.load_history("!a:hs", limit=10)
+
+        asyncio.run(main())
+        assert "!a:hs" not in session.history_loaded
+
+    def test_decrypted_fetch_beats_cached_placeholder(self, session):
+        # Keys that arrive mid-session (live key-share after verification)
+        # let a refetch decrypt what an earlier fetch could not; the cached
+        # "[encrypted: ...]" placeholder must not win the merge over it.
+        session.timelines["!a:hs"].append(
+            Message(
+                sender=ALICE,
+                sender_name="Alice",
+                body="[encrypted: no key for this message]",
+                ts=100,
+                event_id="$1",
+            )
+        )
+        async def fake_room_messages(*args, **kwargs):
+            return SimpleNamespace(chunk=[text_event("$1", ALICE, 100, "secret")])
+
+        session.client.room_messages = fake_room_messages
+        msgs = asyncio.run(session.load_history("!a:hs", limit=10))
+        assert [m.body for m in msgs] == ["secret"]
 
     def test_gappy_sync_forces_a_refetch(self, session):
         # A "limited" sync timeline means events were skipped: the cache is
@@ -511,6 +621,97 @@ class TestLoadHistory:
         assert by_id["$reply"].thread_root == "$root"
         assert by_id["$root"].thread_root == ""
         assert by_id["$root"].thread_count == 7
+
+    def test_reply_fallback_is_stripped_and_quoted(self, session, fake_room):
+        session.client.rooms["!a:hs"] = fake_room(
+            "!a:hs", names={ALICE: "Alice"}
+        )
+        chunk = [
+            text_event(
+                "$reply",
+                BOB,
+                200,
+                "> <@alice:example.org> original text\n"
+                "> second quoted line\n"
+                "\n"
+                "the actual reply",
+                relates={"m.in_reply_to": {"event_id": "$orig"}},
+            ),
+        ]
+        m = self.run(session, chunk=chunk)[0]
+        assert m.body == "the actual reply"
+        assert m.reply_to == "$orig"
+        assert m.reply_name == "Alice"
+        assert m.reply_snippet == "original text"
+
+    def test_reply_without_fallback_keeps_body_and_target(self, session):
+        chunk = [
+            text_event(
+                "$reply",
+                ALICE,
+                200,
+                "just the reply",
+                relates={"m.in_reply_to": {"event_id": "$orig"}},
+            )
+        ]
+        m = self.run(session, chunk=chunk)[0]
+        assert m.body == "just the reply"
+        assert m.reply_to == "$orig"
+        assert m.reply_name == ""
+        assert m.reply_snippet == ""
+
+    def test_thread_falling_back_pointer_is_not_a_reply(self, session):
+        chunk = [
+            text_event(
+                "$t",
+                ALICE,
+                200,
+                "in thread",
+                relates={
+                    "rel_type": "m.thread",
+                    "event_id": "$root",
+                    "is_falling_back": True,
+                    "m.in_reply_to": {"event_id": "$latest"},
+                },
+            )
+        ]
+        m = self.run(session, chunk=chunk)[0]
+        assert m.reply_to == ""
+        assert m.body == "in thread"
+
+    def test_explicit_thread_reply_is_a_reply(self, session):
+        chunk = [
+            text_event(
+                "$t",
+                ALICE,
+                200,
+                "answering you",
+                relates={
+                    "rel_type": "m.thread",
+                    "event_id": "$root",
+                    "is_falling_back": False,
+                    "m.in_reply_to": {"event_id": "$target"},
+                },
+            )
+        ]
+        m = self.run(session, chunk=chunk)[0]
+        assert m.reply_to == "$target"
+
+    def test_quoted_own_mxid_in_fallback_is_not_a_mention(self, session):
+        # Before the fallback was stripped, our own user id inside the quoted
+        # block made every reply-to-us light up as a mention.
+        chunk = [
+            text_event(
+                "$reply",
+                ALICE,
+                200,
+                f"> <{ME}> what I said\n\nagreed",
+                relates={"m.in_reply_to": {"event_id": "$mine"}},
+            )
+        ]
+        m = self.run(session, chunk=chunk)[0]
+        assert m.body == "agreed"
+        assert not m.mentions_me
 
     def test_media_metadata_is_extracted(self, session):
         from nio.events.room_events import Event
@@ -764,6 +965,44 @@ class TestToMessageEncrypted:
         assert m.thread_root == "$root"
         assert m.thread_count == 5
         assert "encrypted" in m.body
+
+    def test_messages_fetch_grafts_wrapper_unsigned_onto_decrypted(self, session):
+        # nio's _handle_messages_response swaps decryptable events for their
+        # decrypted forms IN the chunk, and those keep none of the wrapper's
+        # unsigned (thread counts, bundled edits). The wrap installed in
+        # _new_client must graft it back so _to_message still sees it.
+        from nio.events.room_events import Event
+
+        wrapper = Event.parse_event(
+            {
+                "type": "m.room.encrypted",
+                "event_id": "$enc",
+                "sender": ALICE,
+                "origin_server_ts": 100,
+                "room_id": "!a:hs",
+                "content": {
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                    "ciphertext": "xxx",
+                    "device_id": "DEV",
+                    "sender_key": "k",
+                    "session_id": "s",
+                },
+                "unsigned": {"m.relations": {"m.thread": {"count": 7}}},
+            }
+        )
+        decrypted = text_event(
+            "$enc", ALICE, 100, "hi", unsigned={"transaction_id": "t1"}
+        )
+        session.client.olm = SimpleNamespace(
+            _decrypt_megolm_no_error=lambda e: decrypted
+        )
+        resp = SimpleNamespace(chunk=[wrapper])
+        session.client._handle_messages_response(resp)
+        assert resp.chunk[0] is decrypted
+        unsigned = decrypted.source["unsigned"]
+        assert unsigned["m.relations"]["m.thread"]["count"] == 7
+        # The decrypted event's own unsigned keys win on collision.
+        assert unsigned["transaction_id"] == "t1"
 
 
 class TestEdits:
@@ -1261,6 +1500,36 @@ class TestRoomMetaSnapshot:
         assert session.state["room_meta"]["!a:hs"]["unread"] == 0
         assert session.state["room_meta"]["!a:hs"]["highlights"] == 0
 
+    def test_mark_read_debounces_the_marker_post(self, session, monkeypatch):
+        # At peak an open room refreshes (and marked read) once per sync
+        # tick; only the first call may POST immediately, a burst then folds
+        # into one trailing send carrying the newest event id.
+        import matrixcli.client as client_mod
+
+        monkeypatch.setattr(client_mod, "MARK_READ_INTERVAL", 0.05)
+        posts = []
+
+        async def fake_markers(room_id, fully_read_event=None, read_event=None):
+            posts.append(fully_read_event)
+
+        session.client.room_read_markers = fake_markers
+
+        async def main():
+            session.last_event_id["!a:hs"] = "$1"
+            await session.mark_read("!a:hs")
+            for _ in range(5):
+                await asyncio.sleep(0)
+            session.last_event_id["!a:hs"] = "$2"
+            await session.mark_read("!a:hs")
+            session.last_event_id["!a:hs"] = "$3"
+            await session.mark_read("!a:hs")
+            task = session._marker_tasks.get("!a:hs")
+            if task is not None:
+                await task
+
+        asyncio.run(main())
+        assert posts == ["$1", "$3"]
+
     def test_ensure_room_registers_with_persisted_encryption_flag(self, session):
         # Sending into a room the resumed session has not seen live: nio's
         # room_send looks the room up (KeyError without this) and its
@@ -1488,6 +1757,41 @@ class TestReactions:
         asyncio.run(session._on_reaction(room, self.react("$r1", ALICE, "$m")))
         asyncio.run(session._on_reaction(room, self.react("$r1", ALICE, "$m")))
         assert session.reaction_summary("!a:hs", "$m") == [("👍", 1)]
+
+    def test_refetched_reaction_tombstone_subtracts_that_sender(
+        self, session, fake_room
+    ):
+        # The redaction that removed a noted reaction can be skipped by a
+        # gappy sync; the only trace is then the reaction's tombstone in a
+        # /messages refetch, which must subtract the vote instead of leaving
+        # the badge one too high forever.
+        from nio.events.room_events import Event
+
+        room = fake_room("!a:hs")
+        session.client.rooms["!a:hs"] = room
+        asyncio.run(session._on_reaction(room, self.react("$r1", ALICE, "$m")))
+        assert session.reaction_summary("!a:hs", "$m") == [("👍", 1)]
+        tombstone = Event.parse_event(
+            {
+                "type": "m.reaction",
+                "event_id": "$r1",
+                "sender": ALICE,
+                "origin_server_ts": 100,
+                "content": {},
+                "unsigned": {
+                    "redacted_because": {
+                        "type": "m.room.redaction",
+                        "event_id": "$rx",
+                        "sender": ALICE,
+                        "origin_server_ts": 300,
+                        "content": {},
+                        "redacts": "$r1",
+                    }
+                },
+            }
+        )
+        assert session._to_message(room, tombstone) is None
+        assert session.reaction_summary("!a:hs", "$m") == []
 
     def test_redacting_a_reaction_subtracts_that_sender(self, session, fake_room):
         from nio import RedactionEvent

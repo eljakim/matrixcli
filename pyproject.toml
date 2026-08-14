@@ -1,6 +1,6 @@
 [project]
 name = "matrixcli"
-version = "2.0"
+version = "2.1"
 description = "A terminal Matrix client with an unread-first home dashboard, end-to-end encryption, and macOS Keychain credentials"
 authors = [{ name = "Eljakim" }]
 readme = "README.md"
