@@ -2765,3 +2765,74 @@ class TestInsecureHomeserver:
         session.cfg.homeserver = "http://evil.example"
         ok, msg = asyncio.run(session.connect())
         assert not ok and "insecure" in msg
+
+
+class TestToggleReaction:
+    def wire(self, session):
+        """Record sends and redactions; each returns a fresh event id."""
+        calls = {"sent": [], "redacted": []}
+
+        async def fake_room_send(room_id, message_type, content, **kwargs):
+            calls["sent"].append((room_id, message_type, content))
+            return SimpleNamespace(event_id=f"$sent{len(calls['sent'])}")
+
+        async def fake_room_redact(room_id, event_id):
+            calls["redacted"].append((room_id, event_id))
+            return SimpleNamespace(event_id=f"$redact{len(calls['redacted'])}")
+
+        session.client.room_send = fake_room_send
+        session.client.room_redact = fake_room_redact
+        return calls
+
+    def test_first_toggle_sends_an_annotation_and_shows_at_once(self, session):
+        calls = self.wire(session)
+        ok, event_id, added = asyncio.run(
+            session.toggle_reaction("!a:hs", "$msg", "👍")
+        )
+        assert (ok, added, event_id) == (True, True, "$sent1")
+        room_id, message_type, content = calls["sent"][0]
+        assert message_type == "m.reaction"
+        assert content["m.relates_to"] == {
+            "rel_type": "m.annotation",
+            "event_id": "$msg",
+            "key": "👍",
+        }
+        # Noted locally right away: the badge and the my-reaction check must
+        # not wait for the sync echo.
+        assert session.reaction_summary("!a:hs", "$msg") == [("👍", 1)]
+        assert session.my_reaction("!a:hs", "$msg", "👍") == "$sent1"
+        assert session.last_event_id["!a:hs"] == "$sent1"
+
+    def test_second_toggle_redacts_and_subtracts(self, session):
+        calls = self.wire(session)
+        asyncio.run(session.toggle_reaction("!a:hs", "$msg", "👍"))
+        ok, event_id, added = asyncio.run(
+            session.toggle_reaction("!a:hs", "$msg", "👍")
+        )
+        assert (ok, added) == (True, False)
+        assert calls["redacted"] == [("!a:hs", "$sent1")]
+        assert session.reaction_summary("!a:hs", "$msg") == []
+        assert session.my_reaction("!a:hs", "$msg", "👍") is None
+
+    def test_variation_selector_does_not_split_the_toggle(self, session):
+        # Sending "👍️" (with the invisible variation selector) and toggling
+        # with the bare "👍" must land in the same bucket and remove it.
+        calls = self.wire(session)
+        asyncio.run(session.toggle_reaction("!a:hs", "$msg", "👍️"))
+        ok, _event_id, added = asyncio.run(
+            session.toggle_reaction("!a:hs", "$msg", "👍")
+        )
+        assert (ok, added) == (True, False)
+        assert len(calls["sent"]) == 1 and len(calls["redacted"]) == 1
+        assert session.reaction_summary("!a:hs", "$msg") == []
+
+    def test_someone_elses_reaction_is_not_ours_to_remove(self, session):
+        calls = self.wire(session)
+        session._note_reaction("!a:hs", "$their", ALICE, "$msg", "👍")
+        ok, _event_id, added = asyncio.run(
+            session.toggle_reaction("!a:hs", "$msg", "👍")
+        )
+        # Alice's vote stands; ours is added next to it, nothing redacted.
+        assert (ok, added) == (True, True)
+        assert calls["redacted"] == []
+        assert session.reaction_summary("!a:hs", "$msg") == [("👍", 2)]

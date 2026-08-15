@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from rich.text import Text
 
 from matrixcli.app import (
+    DEFAULT_QUICK_REACTIONS,
     SENDER_COLORS,
     ActionScreen,
     DownloadScreen,
@@ -13,6 +14,7 @@ from matrixcli.app import (
     ReactionsScreen,
     RoomScreen,
     ThreadScreen,
+    _emoji_names,
     _find_urls,
     _fmt_time,
     _sender_color,
@@ -67,6 +69,34 @@ class TestLabelFor:
         assert plain.startswith("  ")
         assert self.label(make_entry(unread=3)).endswith("(3)[/b yellow]")
         assert "[green]●[/green]" in self.label(make_entry(online=True))
+
+
+class TestReact:
+    def screen(self, **kw):
+        s = RoomScreen(make_entry())
+        s.messages = [
+            Message(sender="@a:hs", sender_name="A", body="hi", ts=1,
+                    event_id="$1", **kw)
+        ]
+        s.selected = 0
+        return s
+
+    def test_a_delivered_message_offers_react(self):
+        assert self.screen().check_action("react", ()) is True
+
+    def test_pending_deleted_and_empty_do_not(self):
+        assert self.screen(pending=True).check_action("react", ()) is False
+        assert self.screen(redacted_ts=5).check_action("react", ()) is False
+        empty = RoomScreen(make_entry())
+        assert empty.check_action("react", ()) is False
+
+    def test_quick_defaults_fill_the_nine_digits(self):
+        assert len(DEFAULT_QUICK_REACTIONS) == 9
+        assert len(set(DEFAULT_QUICK_REACTIONS)) == 9
+
+    def test_search_finds_emoji_by_unicode_name(self):
+        assert "🦒" in [e for e, n in _emoji_names() if "giraff" in n]
+        assert "👍" in [e for e, n in _emoji_names() if "thumbs up" in n]
 
 
 class TestFindUrls:

@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from uuid import uuid4
 
@@ -94,6 +95,38 @@ def _find_urls(text: str) -> list[tuple[int, int, str]]:
             continue  # the strip ate the whole host, e.g. a bare "https://."
         spans.append((match.start(), match.start() + len(url), url))
     return spans
+
+
+# The out-of-the-box quick-reaction row ("a" then a digit); once reactions
+# have been sent, the ones actually used bubble to the front (see ReactScreen).
+DEFAULT_QUICK_REACTIONS = ["👍", "✅", "❤️", "😂", "🎉", "😮", "👀", "🙏", "➕"]
+
+_EMOJI_NAMES: list[tuple[str, str]] | None = None
+
+
+def _emoji_names() -> list[tuple[str, str]]:
+    """(emoji, lowercase Unicode name) pairs for the reaction search, built
+    once on first use from the emoji blocks. The formal names are good
+    search keys ("giraff" finds GIRAFFE, "thumbs" THUMBS UP SIGN) and need
+    no emoji-database dependency."""
+    global _EMOJI_NAMES
+    if _EMOJI_NAMES is None:
+        pairs = []
+        for start, stop in (
+            (0x1F300, 0x1F5FF),
+            (0x1F600, 0x1F64F),
+            (0x1F680, 0x1F6FF),
+            (0x1F900, 0x1F9FF),
+            (0x1FA70, 0x1FAFF),
+            (0x2600, 0x27BF),
+            (0x2B00, 0x2BFF),
+        ):
+            for cp in range(start, stop + 1):
+                name = unicodedata.name(chr(cp), "")
+                if name:
+                    pairs.append((chr(cp), name.lower()))
+        _EMOJI_NAMES = pairs
+    return _EMOJI_NAMES
 
 
 def _version() -> str:
@@ -296,6 +329,8 @@ class RoomScreen(Screen):
         # Shift+Enter is indistinguishable from Enter (as in the composer).
         Binding("alt+enter", "open_details", "Show history", show=False),
         ("r", "reply", "Reply"),
+        # Gated by check_action to delivered, undeleted messages.
+        ("a", "react", "React"),
         ("n", "compose", "New message"),
         # Gated by check_action to our own delivered messages.
         ("e", "edit_own", "Edit"),
@@ -1076,6 +1111,11 @@ class RoomScreen(Screen):
                 return False
             m = self.messages[self.selected]
             return self._can_edit(m) if action == "edit_own" else self._can_delete(m)
+        if action == "react":
+            if self.selected >= len(self.messages):
+                return False
+            m = self.messages[self.selected]
+            return bool(m.event_id) and not m.pending and not m.redacted_ts
         if action in ("expand", "collapse"):
             # Mirror exactly what the actions would do, so "l Unfold thread" /
             # "h Fold thread" appear only when pressing them changes anything.
@@ -1273,6 +1313,48 @@ class RoomScreen(Screen):
         self._editing = None
         self._composing = False
         self.run_worker(self._redraw())
+
+    def action_react(self) -> None:
+        """"a": react to the selected message. A digit sends from the quick
+        row instantly, "/" searches every emoji by name; picking one we
+        already sent takes it back."""
+        if self.selected >= len(self.messages):
+            return
+        m = self.messages[self.selected]
+        if m.pending or m.redacted_ts or not m.event_id:
+            return
+
+        def when_picked(key) -> None:
+            if key:
+                # An app worker, same as _finish_send: a screen worker dies
+                # with the screen, and leaving the room during the round-trip
+                # must not silently drop the reaction.
+                self.app.run_worker(self._finish_react(m, key))
+
+        self.app.push_screen(ReactScreen(self.entry, m), when_picked)
+
+    async def _finish_react(self, m, key: str) -> None:
+        session = self.app.session
+        ok, info, added = await session.toggle_reaction(
+            self.entry.room_id, m.event_id, key
+        )
+        if not ok:
+            # The room is named because the user may have moved on meanwhile
+            # and the toast can appear anywhere in the app (as _finish_send).
+            self.app.notify(
+                f"Failed to react in {self.entry.title}: {info}",
+                severity="error",
+                timeout=10,
+                markup=False,
+            )
+        elif added:
+            # Count the pick so the quick row converges on the reactions
+            # actually used; removals don't count against it.
+            usage = session.state.setdefault("reaction_usage", {})
+            usage[key] = usage.get(key, 0) + 1
+            session.cfg.save_state(session.state)
+        if self.is_attached:
+            await self._reload_view(keep=m.event_id)
 
     def action_edit_own(self) -> None:
         """"e": rewrite the selected own message; the composer opens with its
@@ -2044,6 +2126,126 @@ class ReactionsScreen(ModalScreen):
             await box.mount(Static(grid))
 
 
+class ReactScreen(ModalScreen):
+    """Pick an emoji to react to one message with: digits 1-9 send from the
+    quick row instantly, "/" opens a search over every emoji by Unicode name
+    (arrows to choose a hit, Enter sends it). Picking one we already sent
+    takes it back; the quick row ticks those. Dismisses with the emoji
+    string or None."""
+
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+        Binding("slash", "search", "Search", show=False),
+        # Arrows move the search-hit highlight while the Input keeps focus,
+        # same as the room search popup (j/k here would just type letters).
+        Binding("down", "cursor_down", "Down", show=False),
+        Binding("up", "cursor_up", "Up", show=False),
+        *[Binding(str(d), f"quick({d})", show=False) for d in range(1, 10)],
+    ]
+
+    def __init__(self, entry: Entry, message) -> None:
+        super().__init__()
+        self.entry = entry
+        self.message = message
+        self.quick: list[str] = []
+
+    def compose(self) -> ComposeResult:
+        # escape(): the display name comes from the sender, and unescaped a
+        # "[" in it is parsed as console markup.
+        with Vertical(id="reactbox"):
+            yield Label(
+                f"React: {escape(self.message.sender_name)}", id="reacttitle"
+            )
+            yield Static(id="quickrow")
+            yield Label(
+                Text("1-9 react · / search by name · esc cancel", style="dim"),
+                id="reacthint",
+            )
+
+    def on_mount(self) -> None:
+        session = self.app.session
+        # The quick row: reactions actually used before, most-used first,
+        # padded out of the defaults; capped at the nine digits.
+        usage = session.state.get("reaction_usage") or {}
+        for key in sorted(usage, key=lambda k: -usage[k]) + DEFAULT_QUICK_REACTIONS:
+            if key not in self.quick:
+                self.quick.append(key)
+        del self.quick[9:]
+        row = Text()
+        for i, key in enumerate(self.quick):
+            if i:
+                row.append("   ")
+            row.append(f"{i + 1} ", style="dim")
+            row.append(key)
+            if session.my_reaction(
+                self.entry.room_id, self.message.event_id, key
+            ):
+                # Already ours: the same digit now takes the reaction back.
+                row.append("✓", style="dim")
+        self.query_one("#quickrow", Static).update(row)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_quick(self, n: int) -> None:
+        if n <= len(self.quick):
+            self.dismiss(self.quick[n - 1])
+
+    def action_search(self) -> None:
+        if self.query("#reactquery"):
+            self.query_one("#reactquery", Input).focus()
+            return
+        box = self.query_one("#reactbox", Vertical)
+        box.mount(
+            Input(placeholder="Search emoji by name…", id="reactquery"),
+            after=self.query_one("#quickrow"),
+        )
+        box.mount(
+            ListView(id="reacthits"), after=self.query_one("#reactquery")
+        )
+        self.query_one("#reactquery", Input).focus()
+
+    async def on_input_changed(self, event: Input.Changed) -> None:
+        q = event.value.strip().lower()
+        lv = self.query_one("#reacthits", ListView)
+        await lv.clear()
+        if not q:
+            return
+        hits = [(e, n) for e, n in _emoji_names() if q in n]
+        hits.sort(
+            key=lambda en: (not en[1].startswith(q), en[1].find(q), len(en[1]))
+        )
+        for e, n in hits[:30]:
+            item = ListItem(Label(f"{e}  {n}"))
+            item.reaction_key = e
+            await lv.append(item)
+        if hits:
+            lv.index = 0  # Enter sends the best hit right away
+
+    def _pick(self, item) -> None:
+        key = getattr(item, "reaction_key", None)
+        if key:
+            self.dismiss(key)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        lv = self.query_one("#reacthits", ListView)
+        items = list(lv.children)
+        idx = lv.index if lv.index is not None else (0 if items else None)
+        if idx is not None and idx < len(items):
+            self._pick(items[idx])
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        self._pick(event.item)
+
+    def action_cursor_down(self) -> None:
+        for lv in self.query("#reacthits"):
+            lv.action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        for lv in self.query("#reacthits"):
+            lv.action_cursor_up()
+
+
 class ConfirmScreen(ModalScreen):
     """A yes/no gate for destructive actions: Enter confirms, Escape backs
     out. Dismisses with True/False."""
@@ -2682,7 +2884,7 @@ class MatrixApp(App):
     }
     #commandprompt { width: 1; }
     #commandbox Input { background: $panel; }
-    #downloadbox, #actionbox, #editsbox, #reactionsbox {
+    #downloadbox, #actionbox, #editsbox, #reactionsbox, #reactbox {
         width: 70%;
         height: auto;
         margin: 4 10;
@@ -2690,10 +2892,12 @@ class MatrixApp(App):
         border: round $accent;
         background: $panel;
     }
-    #downloadtitle, #actiontitle, #editstitle, #reactionstitle {
+    #downloadtitle, #actiontitle, #editstitle, #reactionstitle, #reacttitle {
         text-style: bold;
         padding: 0 0 1 0;
     }
+    #reactbox #reacthint { padding: 1 0 0 0; }
+    #reactbox #reacthits { max-height: 12; }
     #actionbox #actions { max-height: 12; }
     #editsbox #versions { height: auto; max-height: 20; }
     #reactionsbox #reactors { height: auto; max-height: 20; }

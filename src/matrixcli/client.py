@@ -91,6 +91,15 @@ def _clean(text: str | None) -> str:
     return _UNSAFE_RE.sub("", text)
 
 
+def _reaction_key(key: str) -> str:
+    """Canonical form of a reaction emoji, applied on both the receive and
+    the send-side bookkeeping so they always agree. The emoji variation
+    selector is stripped because clients disagree on sending "👍" vs
+    "👍️", and a vote count split into two buckets over an invisible
+    codepoint miscounts the vote; the cap keeps a malicious key short."""
+    return _clean(key).replace("️", "")[:16]
+
+
 def _sas_emoji(sas) -> list[tuple[str, str]]:
     """The seven SAS emoji for a vodozemac-backed nio ``Sas``, as (glyph, name).
 
@@ -1231,10 +1240,7 @@ class MatrixSession:
         self, room_id: str, event_id: str, sender: str, target: str, key: str
     ) -> None:
         """Record one m.reaction into the per-message aggregates."""
-        # Strip the emoji variation selector: clients disagree on sending
-        # "👍" vs "👍️", and a vote count split into two buckets over an
-        # invisible codepoint miscounts the vote.
-        key = _clean(key).replace("️", "")[:16]
+        key = _reaction_key(key)
         if not (room_id and event_id and sender and target and key):
             return
         by_key = self.reactions.setdefault(room_id, {}).setdefault(target, {})
@@ -2576,6 +2582,74 @@ class MatrixSession:
             self.last_event_id[room_id] = resp.event_id
             return True, resp.event_id
         return False, getattr(resp, "message", "delete failed")
+
+    def my_reaction(self, room_id: str, target: str, key: str) -> str | None:
+        """Event id of our own still-standing reaction on this message with
+        this key, or None."""
+        key = _reaction_key(key)
+        me = self.cfg.user_id
+        for event_id, noted in self._reaction_events.items():
+            if noted == (room_id, target, key, me):
+                senders = (
+                    self.reactions.get(room_id, {}).get(target, {}).get(key)
+                )
+                if senders and me in senders:
+                    return event_id
+        return None
+
+    async def toggle_reaction(
+        self, room_id: str, target: str, key: str
+    ) -> tuple[bool, str, bool]:
+        """React to a message with ``key``, or take the reaction back if we
+        already sent that exact one (removal is a redaction of our own
+        m.reaction event). Returns (ok, event id or error, added), added
+        False when this call removed instead."""
+        existing = self.my_reaction(room_id, target, key)
+        if existing:
+            try:
+                resp = await self.client.room_redact(room_id, existing)
+            except Exception as exc:
+                return False, str(exc), False
+            if hasattr(resp, "event_id") and resp.event_id:
+                # Subtract locally right away, exactly as _on_redaction
+                # would; popping the note makes the later sync echo a no-op.
+                noted = self._reaction_events.pop(existing, None)
+                if noted is not None:
+                    _room, tgt, k, sender = noted
+                    senders = (
+                        self.reactions.get(room_id, {}).get(tgt, {}).get(k)
+                    )
+                    if senders is not None:
+                        senders.discard(sender)
+                self.last_event_id[room_id] = resp.event_id
+                return True, resp.event_id, False
+            return False, getattr(resp, "message", "removal failed"), False
+        self._ensure_room(room_id)
+        content = {
+            "m.relates_to": {
+                "rel_type": "m.annotation",
+                "event_id": target,
+                "key": key,
+            }
+        }
+        try:
+            resp = await self.client.room_send(
+                room_id,
+                message_type="m.reaction",
+                content=content,
+                ignore_unverified_devices=self.cfg.allow_unverified,
+            )
+        except Exception as exc:
+            return False, str(exc), True
+        if hasattr(resp, "event_id") and resp.event_id:
+            # Note it right away so the badge shows on the very next redraw;
+            # the sync echo lands on the same event id and merges cleanly.
+            self._note_reaction(
+                room_id, resp.event_id, self.cfg.user_id, target, key
+            )
+            self.last_event_id[room_id] = resp.event_id
+            return True, resp.event_id, True
+        return False, getattr(resp, "message", "reaction failed"), True
 
     async def download_media(self, message: Message, directory) -> tuple[bool, str]:
         """Download an uploaded file into ``directory`` (a Path), decrypting
