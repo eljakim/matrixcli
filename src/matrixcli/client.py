@@ -387,6 +387,22 @@ class MatrixSession:
         # cached sender names were re-resolved; the app points this at the
         # open room screen so raw @user:server ids repaint as display names.
         self.on_members_loaded = None
+        # user id -> display name from a /profile fetch, for DM titles when
+        # the member event never arrived this session (lazy-loaded resume
+        # syncs only deliver members who sent one of the timeline events).
+        # "" is cached for users whose profile fetch failed, so a missing
+        # name is not refetched on every dashboard rebuild.
+        self.profile_names: dict[str, str] = {}
+        # In-flight profile fetches by user id (see _fetch_profile). Like
+        # _member_fetches, holding the Task keeps it from being GC'd.
+        self._profile_fetches: dict[str, asyncio.Task] = {}
+        # m.room.name state fetches by room id (see _fetch_room_name). An
+        # entry stays after completion: one fetch per room per session.
+        self._name_fetches: dict[str, asyncio.Task] = {}
+        # Called after a background name fetch of any kind lands (a peer's
+        # profile, a room's member list, a room's m.room.name); the app
+        # points this at the dashboard refresh so stale titles repaint.
+        self.on_names_loaded = None
         # room id -> target event id -> reaction key -> senders. Sets of
         # senders, not counts: history refetches and redelivered syncs would
         # double-count, and removing a reaction must subtract exactly one.
@@ -1412,18 +1428,48 @@ class MatrixSession:
         room_id = room.room_id
         is_space = room.room_type == "m.space"
         person = None if is_space else self.direct_by_room.get(room_id)
-        if person is None and not is_space:
+        if (
+            person is None
+            and not is_space
+            and not (
+                getattr(room, "name", None) or getattr(room, "canonical_alias", None)
+            )
+        ):
             # Fallback for chats the other side never flagged in m.direct: any
-            # two-member room is treated as a DM, with the non-self member as the
-            # person. member_count can lag on first sync, so fall back to the
-            # users map as well.
+            # two-member room is treated as a DM, with the non-self member as
+            # the person. Never for rooms with a real name or alias; those are
+            # group rooms whatever their member map looks like. member_count
+            # can lag on first sync, so fall back to the users map as well,
+            # BUT under a lazy-loaded resume sync that map holds only the
+            # timeline senders, so a big room where exactly one other person
+            # spoke looks two-member here. With members unsynced, a snapshot
+            # that recorded the room as not-a-DM wins, and the full member
+            # list is fetched in the background to settle it either way.
             others = [uid for uid in room.users if uid != self.cfg.user_id]
             member_count = room.member_count or len(room.users)
             if member_count == 2 and len(others) == 1:
-                person = others[0]
+                if room.members_synced:
+                    person = others[0]
+                else:
+                    self._fetch_members(room_id)
+                    snap = self.state.get("room_meta", {}).get(room_id)
+                    snap_says_group = (
+                        isinstance(snap, dict)
+                        and not snap.get("person")
+                        and bool(snap.get("title"))
+                    )
+                    if not snap_says_group:
+                        person = others[0]
         is_direct = person is not None
         if is_direct:
-            title = (room.user_name(person) or person) if person else room.display_name
+            # user_name() resolves only members seen this session; a DM whose
+            # peer sent nothing since the resume token stays unresolved, so
+            # fall back to a cached /profile name before the bare user id.
+            title = (
+                (room.user_name(person) or self.profile_names.get(person) or person)
+                if person
+                else room.display_name
+            )
         else:
             title = room.display_name
         # notification_count already includes highlights (mentions); adding
@@ -1483,10 +1529,44 @@ class MatrixSession:
                     and not snap_title.startswith("!")
                 ):
                     e = replace(e, title=snap_title)
+                # The DM counterpart of the rescue above: a peer who sent
+                # none of this session's timeline events has no member event
+                # under lazy loading, so the title degrades to the bare
+                # @user:server id. A real name from an earlier session
+                # outranks that, and keeping it here also keeps the refresh
+                # below from overwriting the snapshot with the raw id.
+                if (
+                    e.person
+                    and e.title == e.person
+                    and snap_title
+                    and not snap_title.startswith(("!", "@"))
+                ):
+                    e = replace(e, title=snap_title)
                 if snap.get("is_space") and not e.is_space:
                     e = replace(e, is_space=True)
                 if snap.get("is_favourite") and not (room.tags or {}):
                     e = replace(e, is_favourite=True)
+            if e.person and e.title == e.person:
+                # Still unresolved (no member event, no usable snapshot):
+                # fetch the profile in the background; the repaint it
+                # triggers rebuilds the entry with the fetched name.
+                self._fetch_profile(e.person)
+            if (
+                not e.is_space
+                and self.direct_by_room.get(e.room_id) is None
+                and (e.person is None or not room.members_synced)
+                and not (
+                    getattr(room, "name", None)
+                    or getattr(room, "canonical_alias", None)
+                )
+            ):
+                # A live room with no name state this session: its title
+                # rests on the snapshot (which a session that misread the
+                # room may have poisoned) or on nio's heroes-based group
+                # name. Fetch m.room.name once to settle it from the server;
+                # confirmed DMs (m.direct, or two-member with full members)
+                # are skipped, they have no room name to find.
+                self._fetch_room_name(e.room_id)
             entries.append(e)
         live = {e.room_id for e in entries}
         changed = False
@@ -1507,13 +1587,21 @@ class MatrixSession:
         for rid, m in meta.items():
             if rid in live or not isinstance(m, dict):
                 continue
+            person = m.get("person") or None
+            title = m.get("title") or rid
+            if person and title == person:
+                # A snapshot poisoned before the DM rescue above existed
+                # stores the raw @user:server id; repair it from the profile
+                # cache (the fetch also heals the persisted snapshot).
+                self._fetch_profile(person)
+                title = self.profile_names.get(person) or title
             entries.append(
                 Entry(
                     room_id=rid,
-                    title=m.get("title") or rid,
+                    title=title,
                     unread=int(m.get("unread") or 0),
-                    is_direct=bool(m.get("person")),
-                    person=m.get("person") or None,
+                    is_direct=bool(person),
+                    person=person,
                     last_ts=self.state["last_event_ts"].get(rid, 0),
                     is_space=bool(m.get("is_space")),
                     highlights=int(m.get("highlights") or 0),
@@ -2052,6 +2140,10 @@ class MatrixSession:
         repaint them."""
         if room_id in self._member_fetches:
             return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no event loop yet; a later caller retries
 
         async def fetch() -> None:
             try:
@@ -2073,8 +2165,98 @@ class MatrixSession:
                     changed = True
             if changed and self.on_members_loaded is not None:
                 self.on_members_loaded(room_id)
+            # The full member map also feeds the dashboard's DM detection
+            # (see _entry), so a home repaint is due even when no cached
+            # timeline names changed.
+            if self.on_names_loaded is not None:
+                self.on_names_loaded()
 
-        self._member_fetches[room_id] = asyncio.ensure_future(fetch())
+        self._member_fetches[room_id] = loop.create_task(fetch())
+
+    def _fetch_profile(self, user_id: str) -> None:
+        """Fetch one user's display name via /profile without blocking the
+        caller. Reached from dashboard builds for DM peers whose member event
+        never arrived this session (see _entry). When it lands, any snapshot
+        title still holding the bare user id is healed so future launches
+        start with the real name, and on_names_loaded repaints the
+        dashboard."""
+        if user_id in self.profile_names or user_id in self._profile_fetches:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no event loop yet; the next dashboard build retries
+
+        async def fetch() -> None:
+            try:
+                resp = await self.client.get_displayname(user_id)
+            except Exception:
+                return  # transport error: leave uncached so a rebuild retries
+            finally:
+                self._profile_fetches.pop(user_id, None)
+            # An error *response* (unknown user, disabled profiles) is cached
+            # as "" so the fetch is not repeated on every dashboard rebuild.
+            name = _clean(getattr(resp, "displayname", None) or "")
+            self.profile_names[user_id] = name
+            if not name:
+                return
+            changed = False
+            for m in self.state.get("room_meta", {}).values():
+                if isinstance(m, dict) and m.get("person") == user_id and m.get("title") == user_id:
+                    m["title"] = name
+                    changed = True
+            if changed:
+                self._persist_recency()
+            if self.on_names_loaded is not None:
+                self.on_names_loaded()
+
+        self._profile_fetches[user_id] = loop.create_task(fetch())
+
+    def _fetch_room_name(self, room_id: str) -> None:
+        """Fetch a room's m.room.name state without blocking the caller.
+        Reached from dashboard builds for live rooms that came up through a
+        resumed sync with no name state (see _all_entries). On success the
+        name is grafted onto the nio room (so every later title computation
+        sees it), the room_meta snapshot is healed so future launches start
+        right, and on_names_loaded repaints the dashboard. The task entry is
+        kept after completion: one fetch per room per session, a room found
+        genuinely unnamed (404) included."""
+        if room_id in self._name_fetches:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no event loop yet; the next dashboard build retries
+
+        async def fetch() -> None:
+            try:
+                resp = await self.client.room_get_state_event(
+                    room_id, "m.room.name"
+                )
+            except Exception:
+                # Transport error: drop the guard so a later rebuild retries.
+                self._name_fetches.pop(room_id, None)
+                return
+            content = getattr(resp, "content", None)
+            name = _clean((content or {}).get("name") or "")
+            if not name:
+                return  # genuinely unnamed (or error response); nothing to fix
+            room = self.client.rooms.get(room_id)
+            if room is not None:
+                room.name = name
+            meta = self.state.get("room_meta", {}).get(room_id)
+            if isinstance(meta, dict) and (
+                meta.get("title") != name or meta.get("person")
+            ):
+                # A named room is a group room; clear any person a session
+                # with a lazily-loaded member map misdetected onto it.
+                meta["title"] = name
+                meta["person"] = ""
+                self._persist_recency()
+            if self.on_names_loaded is not None:
+                self.on_names_loaded()
+
+        self._name_fetches[room_id] = loop.create_task(fetch())
 
     def reset_pagination(self, room_id: str) -> None:
         """Forget the back-pagination position for a room. Called when a room

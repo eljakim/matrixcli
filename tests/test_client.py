@@ -1678,6 +1678,162 @@ class TestRoomMetaSnapshot:
         assert e.title == "new name"
         assert session.state["room_meta"]["!d:hs"]["title"] == "new name"
 
+    def test_dm_mxid_title_rescued_from_snapshot_without_poisoning_it(
+        self, session, fake_room
+    ):
+        # A DM whose peer sent nothing since the resume token has no member
+        # event under lazy loading, so the live title degrades to the bare
+        # user id. The snapshot's real name must win, on screen and in the
+        # snapshot refresh.
+        session.state["room_meta"] = {
+            "!dm:hs": {"title": "Alice Liddell", "person": ALICE}
+        }
+        room = fake_room("!dm:hs", users={ME: {}, ALICE: {}}, names={ALICE: None})
+        session.client.rooms["!dm:hs"] = room
+        dash = session.dashboard()
+        e = next(x for x in dash["dms"] if x.room_id == "!dm:hs")
+        assert e.title == "Alice Liddell"
+        assert session.state["room_meta"]["!dm:hs"]["title"] == "Alice Liddell"
+
+    def test_dm_title_resolves_from_profile_cache(self, session, fake_room):
+        room = fake_room("!dm:hs", users={ME: {}, ALICE: {}}, names={ALICE: None})
+        session.profile_names[ALICE] = "Alice Liddell"
+        e = session._entry(room)
+        assert e.title == "Alice Liddell"
+
+    def test_poisoned_snapshot_dm_title_repaired_from_profile_cache(self, session):
+        # Snapshots written before the DM rescue existed can hold the bare
+        # user id as the title; the profile cache repairs those too.
+        session.state["room_meta"] = {"!dm:hs": {"title": ALICE, "person": ALICE}}
+        session.profile_names[ALICE] = "Alice Liddell"
+        dash = session.dashboard()
+        e = next(x for x in dash["dms"] if x.room_id == "!dm:hs")
+        assert e.title == "Alice Liddell"
+
+    def test_profile_fetch_heals_snapshot_and_repaints(self, session):
+        session.state["room_meta"] = {"!dm:hs": {"title": ALICE, "person": ALICE}}
+        repaints = []
+        session.on_names_loaded = lambda: repaints.append(True)
+
+        async def get_displayname(user_id=None):
+            return SimpleNamespace(displayname="Alice Liddell")
+
+        session.client.get_displayname = get_displayname
+
+        async def run():
+            session._fetch_profile(ALICE)
+            await asyncio.gather(*session._profile_fetches.values())
+
+        asyncio.run(run())
+        assert session.profile_names[ALICE] == "Alice Liddell"
+        assert session.state["room_meta"]["!dm:hs"]["title"] == "Alice Liddell"
+        assert repaints == [True]
+
+    def test_named_room_never_becomes_dm_via_fallback(self, session, fake_room):
+        # A big room seen through a lazy resume sync can hold exactly two
+        # users (self + the one member who spoke); a real room name means it
+        # is a group room regardless.
+        room = fake_room("!ga:hs", users={ME: {}, ALICE: {}})
+        room.name = "ioi.ga"
+        e = session._entry(room)
+        assert not e.is_direct and e.person is None
+
+    def test_snapshot_group_record_blocks_dm_misdetection(
+        self, session, fake_room
+    ):
+        # Same lazy two-member illusion, but the room has no name state this
+        # session. A snapshot that recorded the room as not-a-DM outranks
+        # the heuristic while the member map is incomplete, and the real
+        # title comes back from the snapshot rescue.
+        session.state["room_meta"] = {"!ga:hs": {"title": "ioi.ga", "person": ""}}
+        room = fake_room(
+            "!ga:hs",
+            display_name="PHL-TL-Cisco Ortega",
+            users={ME: {}, ALICE: {}},
+            names={ALICE: "PHL-TL-Cisco Ortega"},
+        )
+        room.named_room_name = lambda: None
+        room.members_synced = False
+        session.client.rooms["!ga:hs"] = room
+        dash = session.dashboard()
+        e = next(x for x in dash["all"] if x.room_id == "!ga:hs")
+        assert not e.is_direct and e.person is None
+        assert e.title == "ioi.ga"
+        assert session.state["room_meta"]["!ga:hs"]["person"] == ""
+        assert session.state["room_meta"]["!ga:hs"]["title"] == "ioi.ga"
+
+    def test_synced_two_member_room_still_becomes_dm(self, session, fake_room):
+        # With the full member list fetched, two members really is a DM,
+        # whatever a stale snapshot says.
+        session.state["room_meta"] = {"!dm:hs": {"title": "old group", "person": ""}}
+        room = fake_room("!dm:hs", users={ME: {}, ALICE: {}}, names={ALICE: "Alice"})
+        e = session._entry(room)
+        assert e.is_direct and e.person == ALICE and e.title == "Alice"
+
+    def test_room_name_fetch_heals_poisoned_snapshot(self, session, fake_room):
+        # A session that misread the lazy two-member illusion as a DM wrote
+        # the peer's name (and possibly the peer) into the snapshot; the
+        # m.room.name fetch repairs the room, the snapshot, and repaints.
+        session.state["room_meta"] = {
+            "!ga:hs": {"title": "PHL-TL-Cisco Ortega", "person": ALICE}
+        }
+        room = fake_room("!ga:hs", users={ME: {}, ALICE: {}})
+        session.client.rooms["!ga:hs"] = room
+        repaints = []
+        session.on_names_loaded = lambda: repaints.append(True)
+
+        async def room_get_state_event(room_id, event_type, state_key=""):
+            return SimpleNamespace(content={"name": "ioi.ga"})
+
+        session.client.room_get_state_event = room_get_state_event
+
+        async def run():
+            session._fetch_room_name("!ga:hs")
+            await asyncio.gather(*session._name_fetches.values())
+
+        asyncio.run(run())
+        assert room.name == "ioi.ga"
+        assert session.state["room_meta"]["!ga:hs"]["title"] == "ioi.ga"
+        assert session.state["room_meta"]["!ga:hs"]["person"] == ""
+        assert repaints == [True]
+
+    def test_room_name_fetch_runs_once_per_room(self, session):
+        calls = []
+
+        async def room_get_state_event(room_id, event_type, state_key=""):
+            calls.append(room_id)
+            return SimpleNamespace()
+
+        session.client.room_get_state_event = room_get_state_event
+
+        async def run():
+            session._fetch_room_name("!unnamed:hs")
+            await asyncio.gather(*session._name_fetches.values())
+            session._fetch_room_name("!unnamed:hs")
+            await asyncio.gather(*session._name_fetches.values())
+
+        asyncio.run(run())
+        assert calls == ["!unnamed:hs"]
+
+    def test_failed_profile_fetch_is_cached_and_not_retried(self, session):
+        calls = []
+
+        async def get_displayname(user_id=None):
+            calls.append(user_id)
+            return SimpleNamespace()
+
+        session.client.get_displayname = get_displayname
+
+        async def run():
+            session._fetch_profile(ALICE)
+            await asyncio.gather(*session._profile_fetches.values())
+            session._fetch_profile(ALICE)
+            await asyncio.gather(*session._profile_fetches.values())
+
+        asyncio.run(run())
+        assert calls == [ALICE]
+        assert session.profile_names[ALICE] == ""
+
     def test_left_room_is_dropped_from_the_snapshot(self, session):
         session.state["room_meta"] = {"!gone:hs": {"title": "Left"}}
         response = SimpleNamespace(

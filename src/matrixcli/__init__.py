@@ -1,3 +1,3 @@
 """matrixcli: a terminal Matrix client with an unread-first home dashboard."""
 
-__version__ = "2.2"
+__version__ = "2.3"

@@ -2826,6 +2826,9 @@ class MatrixApp(App):
         # Repaint the open room when its background member-list fetch lands
         # and raw @user:server ids can resolve to display names.
         self.session.on_members_loaded = self._on_members_loaded
+        # Likewise repaint the dashboard when a background name fetch lands
+        # (a DM peer's profile, a room's member list, a room's m.room.name).
+        self.session.on_names_loaded = self.action_refresh_home
         self.fatal: str | None = None
         # Connection health for the footer's ConnStatus: monotonic time of the
         # last successful sync (None until the first one lands) and whether
