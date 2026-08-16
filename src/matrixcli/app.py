@@ -373,6 +373,10 @@ class RoomScreen(Screen):
         # Event id of the first unread message, chosen once from the opening
         # snapshot (see on_mount); the divider is anchored to it thereafter.
         self._first_unread_event: str | None = None
+        # False until _finish_mount's full history fetch has run once;
+        # refresh_messages stays a no-op before that (the opening load ends by
+        # syncing _last_seen_event itself, so nothing is lost by waiting).
+        self._loaded = False
         self._composing = False  # True while an "n" new-message editor is open
         self._editing = None  # own Message being rewritten with "e", or None
         self._last_seen_event: str | None = None  # latest event id we rendered
@@ -515,44 +519,64 @@ class RoomScreen(Screen):
             self.messages = quick
             self.selected = len(quick) - 1
             await self._redraw()
-        messages = await self._load_messages()
-        if not self.is_attached:
-            return  # backed out of the room while the fetch was in flight
-        # The quick paint made the screen interactive during the fetch; if
-        # the user moved off the tail meanwhile, keep their place (by event
-        # id, since the full window may have inserted rows above it).
-        follow = not self.messages or self.selected >= len(self.messages) - 1
-        anchor = None if follow else self.messages[self.selected].event_id
-        self.messages = messages
-        if follow:
-            self.selected = max(0, len(messages) - 1)
-        else:
-            pos = next(
-                (i for i, m in enumerate(messages) if m.event_id == anchor),
-                None,
+        # The full fetch goes to the network; on this screen's message pump it
+        # would block every key bound here (q, escape, :) until it returned,
+        # and Textual's shutdown waits on this pump, so quitting would hang
+        # too. In a worker the screen stays interactive from the first paint.
+        self.run_worker(self._finish_mount(), group="initial_load", exclusive=True)
+
+    async def _finish_mount(self) -> None:
+        """The slow half of on_mount, run as a worker: the full history fetch,
+        the unread divider (whose count fallback needs the complete opening
+        snapshot), and the opening read receipt."""
+        try:
+            messages = await self._load_messages()
+            if not self.is_attached:
+                return  # backed out of the room while the fetch was in flight
+            # The quick paint made the screen interactive during the fetch; if
+            # the user moved off the tail meanwhile, keep their place (by event
+            # id, since the full window may have inserted rows above it).
+            follow = (
+                not self.messages or self.selected >= len(self.messages) - 1
             )
-            self.selected = (
-                pos
-                if pos is not None
-                else min(self.selected, max(0, len(messages) - 1))
+            anchor = None if follow else self.messages[self.selected].event_id
+            self.messages = messages
+            if follow:
+                self.selected = max(0, len(messages) - 1)
+            else:
+                pos = next(
+                    (i for i, m in enumerate(messages) if m.event_id == anchor),
+                    None,
+                )
+                self.selected = (
+                    pos
+                    if pos is not None
+                    else min(self.selected, max(0, len(messages) - 1))
+                )
+            # Anchor the "new" divider to an event id now: the count fallback
+            # in _first_unread_index is only meaningful against the opening
+            # snapshot, and recomputing it as live messages grow the list
+            # would drift the divider onto messages that arrived while you
+            # were reading.
+            idx = self._first_unread_index()
+            self._first_unread_event = (
+                self.messages[idx].event_id if idx is not None else None
             )
-        # Anchor the "new" divider to an event id now: the count fallback in
-        # _first_unread_index is only meaningful against the opening snapshot,
-        # and recomputing it as live messages grow the list would drift the
-        # divider onto messages that arrived while you were reading.
-        idx = self._first_unread_index()
-        self._first_unread_event = (
-            self.messages[idx].event_id if idx is not None else None
-        )
-        if not self.messages:
-            # Auto-open the composer in an empty room as real state, not an
-            # unconditional mount, so Escape can cancel it and leave the room.
-            self._composing = True
-        self._last_seen_event = self.app.session.last_event_id.get(
-            self.entry.room_id
-        )
-        await self._redraw(keep_scroll=not follow)
-        await self.app.session.mark_read(self.entry.room_id)
+            if not self.messages:
+                # Auto-open the composer in an empty room as real state, not
+                # an unconditional mount, so Escape can cancel it and leave
+                # the room.
+                self._composing = True
+            self._last_seen_event = self.app.session.last_event_id.get(
+                self.entry.room_id
+            )
+            await self._redraw(keep_scroll=not follow)
+            await self.app.session.mark_read(self.entry.room_id)
+        finally:
+            # Even on a failed or superseded load, hand live updates over to
+            # refresh_messages; its next run reloads everything this one
+            # missed (the guard below keeps the two from interleaving).
+            self._loaded = True
 
     async def refresh_names(self) -> None:
         """Called by the app when the background member fetch for this room
@@ -577,19 +601,24 @@ class RoomScreen(Screen):
         the room received events since we last drew, follow the tail if the
         selection was on it, and mark the new messages read (we are looking at
         the room, after all)."""
-        # The sync loop schedules this with call_later; by the time it runs
-        # (or resumes from the history await below) the user may have popped
-        # the screen, whose widgets are then gone.
-        if not self.is_attached:
+        # The sync loop runs this as a worker; by the time it runs (or
+        # resumes from the history await below) the user may have popped the
+        # screen, whose widgets are then gone. Before the opening load has
+        # finished it would also race _finish_mount, which picks up anything
+        # that arrives meanwhile itself.
+        if not self.is_attached or not self._loaded:
             return
         latest = self.app.session.last_event_id.get(self.entry.room_id)
         if not latest or latest == self._last_seen_event:
             return
-        self._last_seen_event = latest
         prev_counts = self.thread_counts
         messages = await self._load_messages()
         if not self.is_attached:
             return
+        # Only now mark the batch seen: as an exclusive worker this reload can
+        # be cancelled mid-await by the next sync's, and marking before the
+        # load would make that next run skip the batch entirely.
+        self._last_seen_event = latest
         # A new thread reply changes only a badge count, not the main list.
         if (
             self._signature(messages) != self._signature(self.messages)
@@ -1818,7 +1847,7 @@ class ThreadScreen(RoomScreen):
         # for the fetch when the local caches show evidence the thread
         # changed; a quiet tick still advances the seen marker and the read
         # receipt.
-        if not self.is_attached:
+        if not self.is_attached or not self._loaded:
             return
         latest = self.app.session.last_event_id.get(self.entry.room_id)
         if not latest or latest == self._last_seen_event:
@@ -2804,27 +2833,40 @@ class HomeScreen(Screen):
             return
         entry = event.item.entry
         if entry.is_invite:
-            ok, msg = await self.app.session.accept_invite(entry.room_id)
-            self.app.notify(
-                f"{entry.title}: {msg}",
-                severity="information" if ok else "error",
-                timeout=6,
-                markup=False,
-            )
-            if ok:
-                # The joined room arrives with the next sync; redraw now so
-                # the invite disappears immediately.
-                await self.refresh_data()
+            # In a worker, not on this pump: the join is a network round trip,
+            # and awaiting it here froze the whole dashboard (q included)
+            # whenever the connection was down.
+            async def accept() -> None:
+                ok, msg = await self.app.session.accept_invite(entry.room_id)
+                self.app.notify(
+                    f"{entry.title}: {msg}",
+                    severity="information" if ok else "error",
+                    timeout=6,
+                    markup=False,
+                )
+                if ok and self.is_attached:
+                    # The joined room arrives with the next sync; redraw now
+                    # so the invite disappears immediately.
+                    await self.refresh_data()
+
+            self.run_worker(accept())
             return
         if entry.is_space:
             # Selecting a space loads its rooms into the column below. Refetch
             # its children first so newly added rooms show up without a
-            # restart.
+            # restart; in a worker so its 15s network timeout cannot stall the
+            # dashboard's keys.
             self.app.session.state["selected_space"] = entry.room_id
             self.app.session.cfg.save_state(self.app.session.state)
-            await self.app.session.refresh_space_children(entry.room_id)
-            await self.refresh_data()
-            self.query_one("#space_rooms", ListView).focus()
+
+            async def load_space() -> None:
+                await self.app.session.refresh_space_children(entry.room_id)
+                if not self.is_attached:
+                    return
+                await self.refresh_data()
+                self.query_one("#space_rooms", ListView).focus()
+
+            self.run_worker(load_space())
         else:
             self.app.open_room(entry)
 
@@ -3049,7 +3091,15 @@ class MatrixApp(App):
         loading = self.screen
         host = self.cfg.homeserver.replace("https://", "").replace("http://", "")
         loading.set_status(f"connecting to {host}")
-        ok, message = await self.session.connect(progress=loading.set_status)
+        try:
+            ok, message = await self.session.connect(progress=loading.set_status)
+        except Exception as exc:
+            # With max_timeouts set on the client, offline network calls raise
+            # instead of retrying forever inside nio; connect handles the ones
+            # it can name, and anything that escapes (a keys_upload raise, a
+            # transport error from the retry login) should end in the clean
+            # fatal-message exit, not a worker traceback over the terminal.
+            ok, message = False, f"could not connect: {exc}"
         if not ok:
             self.fatal = message
             self.exit()
@@ -3092,7 +3142,14 @@ class MatrixApp(App):
         timeout = 0
         while True:
             try:
-                resp = await self.session.client.sync(timeout=timeout, full_state=False)
+                # The wait_for is the only bound on a half-open connection
+                # (network dropped without a TCP reset): timeout=0 makes nio
+                # pass NO HTTP timeout down to aiohttp, and even the long-poll
+                # request has no read timeout that covers a dead socket.
+                resp = await asyncio.wait_for(
+                    self.session.client.sync(timeout=timeout, full_state=False),
+                    timeout=30 if timeout == 0 else timeout / 1000 + 30,
+                )
             except Exception:
                 # nio normally returns error *responses*, but event callbacks
                 # run inside sync() and an unexpected raise from one (or from
@@ -3116,7 +3173,16 @@ class MatrixApp(App):
                 self.action_refresh_home()
                 for screen in self.screen_stack:
                     if isinstance(screen, RoomScreen):
-                        self.call_later(screen.refresh_messages)
+                        # A worker, NOT call_later: refresh_messages awaits the
+                        # network, and call_later would run it on the App's own
+                        # message pump, where a stalled request blocks every
+                        # key event in the program (even ctrl+q). Exclusive per
+                        # screen so a slow reload is superseded, not stacked.
+                        screen.run_worker(
+                            screen.refresh_messages(),
+                            group="refresh_messages",
+                            exclusive=True,
+                        )
             elif getattr(resp, "status_code", None) == "M_UNKNOWN_TOKEN":
                 # The server revoked our token (signed out elsewhere). Retrying
                 # can never succeed; drop the cached token and exit so the next
@@ -3171,7 +3237,13 @@ class MatrixApp(App):
                 self.call_later(screen.refresh_data)
             elif isinstance(screen, RoomScreen):
                 screen._last_seen_event = None
-                self.call_later(screen.refresh_messages)
+                # Same worker discipline as sync_loop: on the App pump this
+                # await froze the whole program while the network was down.
+                screen.run_worker(
+                    screen.refresh_messages(),
+                    group="refresh_messages",
+                    exclusive=True,
+                )
         self.sync_loop()
 
     def action_refresh_home(self) -> None:

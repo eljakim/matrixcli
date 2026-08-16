@@ -440,6 +440,15 @@ class MatrixSession:
         client_config = AsyncClientConfig(
             store_sync_tokens=True,
             encryption_enabled=True,
+            # nio's default max_timeouts=None retries a failed request FOREVER
+            # (backoff capped at 60s), so with the network down every call
+            # (sync, room_messages, room_send, join, read markers, key
+            # uploads...) neither returns nor raises, and every error handler
+            # in this file is unreachable. Cap the retries and the per-request
+            # time so an offline failure surfaces as an exception the UI can
+            # recover from, instead of freezing whatever awaited it.
+            request_timeout=30,
+            max_timeouts=2,
             # Encrypt the on-disk Olm/Megolm store with a per-account random key
             # from the Keychain instead of nio's hardcoded default.
             pickle_key=self.cfg.get_or_create_store_key(),
@@ -531,7 +540,17 @@ class MatrixSession:
                 store_reset = True
             else:
                 step("checking session with server")
-                whoami = await self.client.whoami()
+                try:
+                    whoami = await self.client.whoami()
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                    # With max_timeouts set, a dead network raises here instead
+                    # of retrying forever inside nio. Same policy as the
+                    # transient-error branch below: keep the token, fail launch.
+                    return False, (
+                        "could not reach the server "
+                        f"({type(exc).__name__}).\n"
+                        "The cached token was kept; try again in a moment."
+                    )
                 # Errors come back as WhoamiError, which has no user_id attribute.
                 if getattr(whoami, "user_id", None):
                     if whoami.user_id != self.cfg.user_id:
@@ -743,11 +762,19 @@ class MatrixSession:
         resp = None
         for attempt in range(3):
             try:
-                resp = await self.client.sync(
-                    timeout=0 if resume else 30000,
-                    full_state=not resume,
-                    sync_filter=sync_filter,
-                    set_presence="online",
+                # timeout=0 (and full_state=True) make nio pass literally no
+                # HTTP timeout down to aiohttp, so on a half-open connection
+                # this request would pend until TCP keepalive gives up (hours).
+                # The wait_for is the only real bound; generous on the big
+                # first-run sync, tight on the instant resume sync.
+                resp = await asyncio.wait_for(
+                    self.client.sync(
+                        timeout=0 if resume else 30000,
+                        full_state=not resume,
+                        sync_filter=sync_filter,
+                        set_presence="online",
+                    ),
+                    timeout=60 if resume else 600,
                 )
             except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                 resp = None
@@ -1135,7 +1162,14 @@ class MatrixSession:
         self.client.add_to_device_callback(on_cancel, (KeyVerificationCancel,))
 
         while "result" not in done:
-            resp = await self.client.sync(timeout=10000)
+            try:
+                resp = await self.client.sync(timeout=10000)
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                # Offline raises (max_timeouts) instead of retrying forever
+                # inside nio; keep polling rather than dumping a traceback
+                # over the interactive verification.
+                await asyncio.sleep(2)
+                continue
             for ev in getattr(resp, "to_device_events", []) or []:
                 _verify_log.debug(
                     "SYNC to_device %s from %s: %s",
@@ -1316,7 +1350,10 @@ class MatrixSession:
         headers = {"Authorization": f"Bearer {self.client.access_token}"}
         self.direct_by_room = {}
         try:
-            async with aiohttp.ClientSession() as session:
+            # Bounded: aiohttp's default total timeout is 5 minutes, far too
+            # long for something awaited during startup.
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url, headers=headers, allow_redirects=False) as r:
                     if r.status != 200:
                         return
@@ -1764,7 +1801,10 @@ class MatrixSession:
         """Join a room we were invited to. The room moves from invited_rooms
         to rooms through the next sync; the invite entry is dropped locally
         right away so the dashboard reflects the acceptance immediately."""
-        resp = await self.client.join(room_id)
+        try:
+            resp = await self.client.join(room_id)
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+            return False, f"could not join: {type(exc).__name__}"
         if isinstance(resp, JoinError):
             return False, f"could not join: {resp.message}"
         self.client.invited_rooms.pop(room_id, None)
@@ -1781,7 +1821,8 @@ class MatrixSession:
         )
         headers = {"Authorization": f"Bearer {self.client.access_token}"}
         try:
-            async with aiohttp.ClientSession() as session:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 if favourite:
                     async with session.put(
                         url, headers=headers, json={"order": 0.5}, allow_redirects=False
@@ -2058,13 +2099,18 @@ class MatrixSession:
         # walked (the cache would not keep more anyway). The common quiet
         # room still costs exactly one round trip.
         for _ in range(max(1, TIMELINE_CAP // limit)):
-            resp = await self.client.room_messages(
-                room_id,
-                start=start,
-                direction=MessageDirection.back,
-                limit=limit,
-            )
-            if isinstance(resp, RoomMessagesError):
+            try:
+                resp = await self.client.room_messages(
+                    room_id,
+                    start=start,
+                    direction=MessageDirection.back,
+                    limit=limit,
+                )
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                # Offline raises (max_timeouts) rather than retrying forever
+                # inside nio; degrade exactly like an error response.
+                resp = None
+            if resp is None or isinstance(resp, RoomMessagesError):
                 if deepest is None:
                     return window(cached)
                 break  # keep the windows that did arrive
@@ -2285,12 +2331,18 @@ class MatrixSession:
             return []
         room = self.client.rooms.get(room_id)
         start = self.pagination_tokens.get(room_id) or self.client.next_batch or ""
-        resp = await self.client.room_messages(
-            room_id,
-            start=start,
-            direction=MessageDirection.back,
-            limit=limit,
-        )
+        try:
+            resp = await self.client.room_messages(
+                room_id,
+                start=start,
+                direction=MessageDirection.back,
+                limit=limit,
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            # A dead network raises (max_timeouts); same contract as an error
+            # response, and distinct from [] so it never reads as "beginning
+            # of history".
+            return None
         if isinstance(resp, RoomMessagesError):
             return None
         end = getattr(resp, "end", None)
@@ -2322,7 +2374,8 @@ class MatrixSession:
         headers = {"Authorization": f"Bearer {self.client.access_token}"}
         chunk: list = []
         try:
-            async with aiohttp.ClientSession() as http:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as http:
                 async with http.get(url, headers=headers, allow_redirects=False) as r:
                     if r.status == 200:
                         data = await r.json()
@@ -2662,7 +2715,15 @@ class MatrixSession:
         # over the cap (it is attacker-controlled, so it is only an early-out).
         if message.media_size and message.media_size > MAX_DOWNLOAD_BYTES:
             return False, f"file too large ({message.media_size} bytes)"
-        resp = await self.client.download(mxc=message.media_url)
+        try:
+            # nio's download() documents that it ignores request_timeout and
+            # passes 0 (no HTTP timeout) to aiohttp, so this wait_for is the
+            # only bound; generous because media can be large.
+            resp = await asyncio.wait_for(
+                self.client.download(mxc=message.media_url), timeout=120
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+            return False, f"download failed: {type(exc).__name__}"
         body = getattr(resp, "body", None)
         if not isinstance(body, bytes):
             detail = getattr(resp, "message", "") or getattr(

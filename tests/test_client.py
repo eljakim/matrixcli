@@ -1462,7 +1462,9 @@ class TestLoadEdits:
 class TestRefreshDirectMap:
     def run(self, session, payload, monkeypatch, status=200):
         fake = TestRefreshSpaceChildren.FakeHttp(payload, status=status)
-        monkeypatch.setattr("matrixcli.client.aiohttp.ClientSession", lambda: fake)
+        monkeypatch.setattr(
+            "matrixcli.client.aiohttp.ClientSession", lambda **kw: fake
+        )
         asyncio.run(session._refresh_direct_map())
 
     def test_maps_rooms_to_users(self, session, monkeypatch):
