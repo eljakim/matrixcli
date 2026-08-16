@@ -1,10 +1,11 @@
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 
 import aiohttp
 from nio.events.room_events import RoomMessageText
 
-from matrixcli.client import Message, fold_edits
+from matrixcli.client import MatrixSession, Message, fold_edits
 
 ME = "@me:example.org"
 ALICE = "@alice:example.org"
@@ -2334,6 +2335,29 @@ class TestConnect:
         assert not login_calls, "must not mint a new device via password login"
         assert "kept" in msg
 
+    def test_offline_whoami_starts_from_cache(self, session, monkeypatch):
+        cleared, saved = self._prep(
+            session, monkeypatch, SimpleNamespace(user_id=ME), password="hunter2"
+        )
+
+        async def dead_network():
+            raise aiohttp.ClientError("no route to host")
+
+        monkeypatch.setattr(session.client, "whoami", dead_network)
+        login_calls = []
+
+        async def fake_login(*args, **kwargs):
+            login_calls.append(True)
+
+        monkeypatch.setattr(session.client, "login", fake_login)
+        ok, msg = asyncio.run(session.connect())
+        # A dead network is not a fatal launch error: the token, crypto
+        # store, and message cache are enough to read everything offline.
+        assert ok
+        assert not cleared, "the cached token must survive an offline launch"
+        assert not login_calls, "must not mint a new device via password login"
+        assert "offline" in msg
+
     def test_rejected_token_clears_and_relogins(self, session, monkeypatch):
         whoami = SimpleNamespace(status_code="M_UNKNOWN_TOKEN", message="bad token")
         cleared, saved = self._prep(session, monkeypatch, whoami, password="hunter2")
@@ -2838,3 +2862,408 @@ class TestToggleReaction:
         assert (ok, added) == (True, True)
         assert calls["redacted"] == []
         assert session.reaction_summary("!a:hs", "$msg") == [("👍", 2)]
+
+
+class TestTimelineCachePersistence:
+    """The encrypted on-disk timeline cache: what a restart gets back."""
+
+    def seed(self, session):
+        session.timelines["!a:hs"].extend(
+            [
+                Message(
+                    sender=ALICE,
+                    sender_name="Alice",
+                    body="hello",
+                    ts=1000,
+                    event_id="$1",
+                ),
+                Message(
+                    sender=ME,
+                    sender_name="Me",
+                    body="a picture",
+                    ts=2000,
+                    event_id="$2",
+                    media_url="mxc://hs/xyz",
+                    media_name="pic.png",
+                    media_crypt={"key": "k", "iv": "i", "sha256": "h"},
+                ),
+            ]
+        )
+        session.reactions["!a:hs"] = {"$1": {"👍": {ALICE, BOB}}}
+        session._reaction_events["$r1"] = ("!a:hs", "$1", "👍", ALICE)
+        session.last_event_id["!a:hs"] = "$2"
+        session.client.next_batch = "tok"
+
+    def restored(self, cfg, resume=True, token="tok"):
+        fresh = MatrixSession(cfg)
+        fresh.client.loaded_sync_token = token
+        fresh._restore_timelines(resume)
+        return fresh
+
+    def test_roundtrip_across_sessions(self, cfg, session):
+        self.seed(session)
+        session._save_timelines()
+        fresh = self.restored(cfg)
+        assert list(fresh.timelines["!a:hs"]) == list(session.timelines["!a:hs"])
+        assert fresh.reactions == {"!a:hs": {"$1": {"👍": {ALICE, BOB}}}}
+        assert fresh._reaction_events["$r1"] == ("!a:hs", "$1", "👍", ALICE)
+        assert fresh.last_event_id["!a:hs"] == "$2"
+        # Token matched: the cache is gapless, rooms may serve without a fetch.
+        assert fresh.gap_gen == {}
+
+    def test_pending_local_echoes_are_not_persisted(self, cfg, session):
+        self.seed(session)
+        session.timelines["!a:hs"].append(
+            Message(sender=ME, sender_name="Me", body="unsent", ts=3000, pending=True)
+        )
+        session._save_timelines()
+        fresh = self.restored(cfg)
+        assert [m.event_id for m in fresh.timelines["!a:hs"]] == ["$1", "$2"]
+
+    def test_token_mismatch_marks_every_seeded_room_gapped(self, cfg, session):
+        self.seed(session)
+        session._save_timelines()
+        fresh = self.restored(cfg, token="newer-tok")
+        # Content is still seeded (decrypted bodies survive the next merge)...
+        assert len(fresh.timelines["!a:hs"]) == 2
+        # ...but the first open must refetch: events may hide in the gap.
+        assert fresh.gap_gen == {"!a:hs": 1}
+
+    def test_non_resume_launch_marks_rooms_gapped(self, cfg, session):
+        self.seed(session)
+        session._save_timelines()
+        fresh = self.restored(cfg, resume=False)
+        assert fresh.gap_gen == {"!a:hs": 1}
+
+    def test_cache_of_another_account_is_ignored(self, cfg, session):
+        cfg.save_timeline_cache(
+            {
+                "user_id": "@other:example.org",
+                "next_batch": "tok",
+                "timelines": {"!a:hs": [{"sender": ALICE, "sender_name": "Alice", "body": "x", "ts": 1}]},
+            }
+        )
+        fresh = self.restored(cfg)
+        assert not fresh.timelines
+
+    def test_unknown_message_fields_are_dropped_not_fatal(self, cfg, session):
+        cfg.save_timeline_cache(
+            {
+                "user_id": ME,
+                "next_batch": "tok",
+                "timelines": {
+                    "!a:hs": [
+                        {
+                            "sender": ALICE,
+                            "sender_name": "Alice",
+                            "body": "old cache",
+                            "ts": 1,
+                            "field_from_the_future": True,
+                        }
+                    ]
+                },
+            }
+        )
+        fresh = self.restored(cfg)
+        assert [m.body for m in fresh.timelines["!a:hs"]] == ["old cache"]
+
+    def test_import_keys_clears_the_disk_cache(self, cfg, session, monkeypatch):
+        self.seed(session)
+        session._save_timelines()
+        assert cfg._timeline_cache_path.exists()
+
+        async def fake_import(infile, passphrase):
+            return None
+
+        monkeypatch.setattr(session.client, "import_keys", fake_import)
+        asyncio.run(session.import_keys("keys.txt", "pass"))
+        assert not session.timelines
+        assert not cfg._timeline_cache_path.exists()
+
+    def test_close_flushes_a_dirty_cache(self, cfg, session, monkeypatch):
+        self.seed(session)
+        session._cache_dirty = True
+
+        async def fake_close():
+            return None
+
+        monkeypatch.setattr(session.client, "close", fake_close)
+        asyncio.run(session.close())
+        assert cfg.load_timeline_cache()["last_event_id"] == {"!a:hs": "$2"}
+
+
+class TestBackfillArchive:
+    """The background full-history download and the archive it fills."""
+
+    def msg(self, event_id, ts, body="m"):
+        return Message(
+            sender=ALICE, sender_name="Alice", body=body, ts=ts, event_id=event_id
+        )
+
+    def wire_pages(self, session, fake_room, pages):
+        """Serve /messages responses from a fixed list of (events, end)."""
+        session.client.rooms["!a:hs"] = fake_room("!a:hs")
+        calls = []
+
+        async def fake_room_messages(room_id, start, direction, limit):
+            calls.append(start)
+            events, end = pages[len(calls) - 1]
+            return SimpleNamespace(chunk=list(events), end=end)
+
+        session.client.room_messages = fake_room_messages
+        return calls
+
+    def test_full_download_reaches_beginning(self, session, fake_room):
+        self.wire_pages(
+            session,
+            fake_room,
+            [
+                ([text_event("$3", ALICE, 3000, "c"), text_event("$2", ALICE, 2000, "b")], "t1"),
+                ([text_event("$1", ALICE, 1000, "a")], None),
+            ],
+        )
+        asyncio.run(session._backfill("!a:hs"))
+        assert set(session.archives["!a:hs"]) == {"$1", "$2", "$3"}
+        assert "!a:hs" in session.archive_done
+        assert "!a:hs" not in session.archive_stale
+        assert session._cache_dirty
+
+    def test_resumes_from_persisted_token(self, session, fake_room):
+        session.archives["!a:hs"] = {"$9": self.msg("$9", 9000)}
+        session.archive_tokens["!a:hs"] = "deep"
+        calls = self.wire_pages(
+            session, fake_room, [([text_event("$1", ALICE, 1000, "a")], None)]
+        )
+        asyncio.run(session._backfill("!a:hs"))
+        assert calls == ["deep"]
+        assert set(session.archives["!a:hs"]) == {"$1", "$9"}
+
+    def test_recover_walk_stops_at_archived_territory(self, session, fake_room):
+        session.archives["!a:hs"] = {
+            "$1": self.msg("$1", 1000),
+            "$2": self.msg("$2", 2000),
+        }
+        session.archive_done.add("!a:hs")
+        session.archive_stale.add("!a:hs")
+        calls = self.wire_pages(
+            session,
+            fake_room,
+            [
+                ([text_event("$5", ALICE, 5000, "e"), text_event("$4", ALICE, 4000, "d")], "t1"),
+                ([text_event("$2", ALICE, 2000, "b"), text_event("$1", ALICE, 1000, "a")], "t2"),
+                ([], None),  # must never be reached
+            ],
+        )
+        asyncio.run(session._backfill("!a:hs"))
+        # The hole ($4, $5) is filled; the walk stopped at known territory
+        # instead of re-fetching the whole room.
+        assert len(calls) == 2
+        assert set(session.archives["!a:hs"]) == {"$1", "$2", "$4", "$5"}
+        assert "!a:hs" in session.archive_done
+        assert "!a:hs" not in session.archive_stale
+
+    def test_load_older_serves_archive_without_network(self, session):
+        session.archives["!a:hs"] = {
+            f"${i}": self.msg(f"${i}", i * 1000) for i in range(1, 6)
+        }
+        session.archive_done.add("!a:hs")
+
+        async def no_network(*a, **kw):
+            raise AssertionError("archive-served pagination must not fetch")
+
+        session.client.room_messages = no_network
+        session.reset_pagination("!a:hs")
+        assert [m.event_id for m in asyncio.run(session.load_older("!a:hs", limit=2))] == ["$4", "$5"]
+        assert [m.event_id for m in asyncio.run(session.load_older("!a:hs", limit=2))] == ["$2", "$3"]
+        assert [m.event_id for m in asyncio.run(session.load_older("!a:hs", limit=2))] == ["$1"]
+        assert asyncio.run(session.load_older("!a:hs", limit=2)) == []
+        assert session.pagination_done["!a:hs"]
+
+    def test_load_older_partial_archive_continues_from_its_token(self, session, fake_room):
+        session.archives["!a:hs"] = {
+            "$2": self.msg("$2", 2000),
+            "$3": self.msg("$3", 3000),
+        }
+        session.archive_tokens["!a:hs"] = "deep"
+        calls = self.wire_pages(
+            session, fake_room, [([text_event("$1", ALICE, 1000, "a")], "deeper")]
+        )
+        session.reset_pagination("!a:hs")
+        served = asyncio.run(session.load_older("!a:hs", limit=5))
+        assert [m.event_id for m in served] == ["$2", "$3"]
+        older = asyncio.run(session.load_older("!a:hs", limit=5))
+        # The wire continuation starts exactly where the download stopped.
+        assert calls == ["deep"]
+        assert [m.event_id for m in older] == ["$1"]
+
+    def test_archive_roundtrips_and_mismatch_marks_stale(self, cfg, session):
+        session.archives["!a:hs"] = {"$1": self.msg("$1", 1000)}
+        session._archive_dirty.add("!a:hs")
+        session.archive_tokens["!a:hs"] = "deep"
+        session.archive_done.add("!a:hs")
+        session.client.next_batch = "tok"
+        session._save_timelines()
+        # The archive went to its own per-room file, not the main cache.
+        assert "archives" not in cfg.load_timeline_cache()
+        assert cfg._room_archive_path("!a:hs").exists()
+
+        fresh = MatrixSession(cfg)
+        fresh.client.loaded_sync_token = "tok"
+        fresh._restore_timelines(resume=True)
+        assert set(fresh.archives["!a:hs"]) == {"$1"}
+        assert fresh.archive_tokens["!a:hs"] == "deep"
+        assert "!a:hs" in fresh.archive_done
+        assert "!a:hs" not in fresh.archive_stale
+
+        stale = MatrixSession(cfg)
+        stale.client.loaded_sync_token = "other-tok"
+        stale._restore_timelines(resume=True)
+        assert "!a:hs" in stale.archive_stale
+
+    def test_gappy_sync_marks_an_archived_room_stale(self, session):
+        session.archives["!a:hs"] = {"$1": self.msg("$1", 1000)}
+        resp = SimpleNamespace(
+            rooms=SimpleNamespace(
+                join={
+                    "!a:hs": SimpleNamespace(
+                        timeline=SimpleNamespace(limited=True, events=[])
+                    )
+                },
+                leave={},
+            )
+        )
+        session._record_room_timestamps(resp)
+        assert "!a:hs" in session.archive_stale
+
+    def test_start_backfill_is_a_noop_when_archived(self, session):
+        async def main():
+            session.archive_done.add("!a:hs")
+            session.start_backfill("!a:hs")
+            return dict(session._backfill_tasks)
+
+        assert asyncio.run(main()) == {}
+
+    def test_window_edits_fold_into_the_archive_on_save(self, cfg, session):
+        session.archives["!a:hs"] = {"$1": self.msg("$1", 1000)}
+        session.timelines["!a:hs"].append(
+            replace(self.msg("$1", 1000), redacted_ts=5000, body="deleted text")
+        )
+        session._save_timelines()
+        # The archive's disk copy inherited the redaction mark AND the text.
+        saved = [
+            p for p in cfg.load_room_archives() if p["room_id"] == "!a:hs"
+        ][0]["messages"]
+        assert saved[0]["redacted_ts"] == 5000
+        assert saved[0]["body"] == "deleted text"
+
+
+class TestCachePolicy:
+    """The global and per-space switches governing what may touch disk."""
+
+    def msg(self, event_id, ts):
+        return Message(
+            sender=ALICE, sender_name="Alice", body="m", ts=ts, event_id=event_id
+        )
+
+    def test_global_off_disallows_everything(self, session):
+        session.cfg.cache_messages = False
+        assert not session.cache_allowed("!a:hs")
+
+    def test_space_opt_out_covers_its_rooms_and_itself(self, session):
+        session.space_children["!s:hs"] = {"!a:hs", "!b:hs"}
+        session.state["cache_spaces"] = {"!s:hs": False}
+        assert not session.cache_allowed("!a:hs")
+        assert not session.cache_allowed("!s:hs")
+        assert session.cache_allowed("!elsewhere:hs")
+
+    def test_any_opted_out_space_wins_for_multi_space_rooms(self, session):
+        session.space_children["!on:hs"] = {"!a:hs"}
+        session.space_children["!off:hs"] = {"!a:hs"}
+        session.state["cache_spaces"] = {"!off:hs": False}
+        assert not session.cache_allowed("!a:hs")
+
+    def test_toggle_off_purges_disk_and_on_removes_the_override(
+        self, cfg, session
+    ):
+        session.space_children["!s:hs"] = {"!a:hs"}
+        session.archives["!a:hs"] = {"$1": self.msg("$1", 1000)}
+        session._archive_dirty.add("!a:hs")
+        session.timelines["!a:hs"].append(self.msg("$1", 1000))
+        session._save_timelines()
+        assert cfg._room_archive_path("!a:hs").exists()
+
+        session.set_space_cache("!s:hs", False)
+        assert not cfg._room_archive_path("!a:hs").exists()
+        assert "!a:hs" not in cfg.load_timeline_cache()["timelines"]
+        # In memory nothing is lost: the session cache is not the disk cache.
+        assert len(session.timelines["!a:hs"]) == 1
+
+        session.set_space_cache("!s:hs", True)
+        assert session.state["cache_spaces"] == {}  # inherit, not True
+
+    def test_restore_skips_and_purges_disallowed_rooms(self, cfg, session):
+        session.space_children["!s:hs"] = {"!a:hs"}
+        session.archives["!a:hs"] = {"$1": self.msg("$1", 1000)}
+        session._archive_dirty.add("!a:hs")
+        session.timelines["!a:hs"].append(self.msg("$1", 1000))
+        session.client.next_batch = "tok"
+        session._save_timelines()
+
+        fresh = MatrixSession(cfg)
+        fresh.space_children["!s:hs"] = {"!a:hs"}
+        fresh.state["cache_spaces"] = {"!s:hs": False}
+        fresh.client.loaded_sync_token = "tok"
+        fresh._restore_timelines(resume=True)
+        assert "!a:hs" not in fresh.timelines
+        assert "!a:hs" not in fresh.archives
+        assert not cfg._room_archive_path("!a:hs").exists()
+
+    def test_global_off_never_writes_and_wipes_at_restore(self, cfg, session):
+        session.timelines["!a:hs"].append(self.msg("$1", 1000))
+        session._save_timelines()
+        assert cfg._timeline_cache_path.exists()
+
+        session.cfg.cache_messages = False
+        session._cache_dirty = True
+        session._save_timelines()  # must be a no-op now
+        session._restore_timelines(resume=True)  # wipes the leftovers
+        assert not cfg._timeline_cache_path.exists()
+        assert cfg.load_room_archives() == []
+
+    def test_backfill_refuses_disallowed_rooms(self, session):
+        async def main():
+            session.state["cache_spaces"] = {"!s:hs": False}
+            session.space_children["!s:hs"] = {"!a:hs"}
+            session.start_backfill("!a:hs")
+            return dict(session._backfill_tasks)
+
+        assert asyncio.run(main()) == {}
+
+    def test_v1_inline_archives_migrate_to_room_files(self, cfg, session):
+        cfg.save_timeline_cache(
+            {
+                "version": 1,
+                "user_id": ME,
+                "next_batch": "tok",
+                "archives": {
+                    "!a:hs": [
+                        {
+                            "sender": ALICE,
+                            "sender_name": "Alice",
+                            "body": "old",
+                            "ts": 1,
+                            "event_id": "$1",
+                        }
+                    ]
+                },
+                "archive_done": ["!a:hs"],
+            }
+        )
+        fresh = MatrixSession(cfg)
+        fresh.client.loaded_sync_token = "tok"
+        fresh._restore_timelines(resume=True)
+        assert set(fresh.archives["!a:hs"]) == {"$1"}
+        fresh._save_timelines()
+        saved = cfg.load_room_archives()
+        assert [p["room_id"] for p in saved] == ["!a:hs"]
+        assert "archives" not in cfg.load_timeline_cache()

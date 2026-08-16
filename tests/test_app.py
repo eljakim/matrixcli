@@ -868,6 +868,7 @@ class TestComposerPanel:
             last_event_id={},
             load_history=lambda room_id, limit=40, cached_only=False: _async(list(history)),
             mark_read=lambda room_id: _async(None),
+            start_backfill=lambda room_id: None,
             reset_pagination=lambda room_id: None,
             drafts={},
             reaction_summary=lambda room_id, event_id: [],
@@ -1186,6 +1187,7 @@ class TestSendResilience:
             last_event_id={},
             load_history=lambda room_id, limit=40, cached_only=False: _async([]),
             mark_read=lambda room_id: _async(None),
+            start_backfill=lambda room_id: None,
             reset_pagination=lambda room_id: None,
             drafts={},
             reaction_summary=lambda room_id, event_id: [],
@@ -1255,6 +1257,7 @@ class TestRoomFlows:
             last_event_id={},
             load_history=lambda room_id, limit=40, cached_only=False: _async(list(messages)),
             mark_read=lambda room_id: _async(None),
+            start_backfill=lambda room_id: None,
             reset_pagination=lambda room_id: None,
             drafts={},
             reaction_summary=lambda room_id, event_id: [],
@@ -1504,9 +1507,14 @@ class TestHomeKeys:
 
         data = self.dashboard(**kw)
         session = SimpleNamespace(
-            cfg=SimpleNamespace(user_id="@me:hs", save_state=lambda state: None),
+            cfg=SimpleNamespace(
+                user_id="@me:hs",
+                save_state=lambda state: None,
+                cache_messages=True,
+            ),
             state={},
             dashboard=lambda selected_space: data,
+            space_cache_enabled=lambda space_id: True,
         )
 
         class HomeApp(App):
@@ -1570,9 +1578,14 @@ class TestHomeKeys:
             make_entry(room_id="!f:hs", title="Fav1", is_favourite=True)
         ]
         session = SimpleNamespace(
-            cfg=SimpleNamespace(user_id="@me:hs", save_state=lambda state: None),
+            cfg=SimpleNamespace(
+                user_id="@me:hs",
+                save_state=lambda state: None,
+                cache_messages=True,
+            ),
             state={},
             dashboard=lambda selected_space: data,
+            space_cache_enabled=lambda space_id: True,
         )
 
         class HomeApp(App):
@@ -1630,3 +1643,153 @@ class TestHomeKeys:
             ("other_rooms", 0),
         ]
         assert self.walk("hjjjj")[-1] == ("space_rooms", 1)
+
+
+class TestBrowseHistory:
+    """g detaches into archived history at the first message; j at the bottom
+    walks forward; G reattaches to the live tail."""
+
+    def run(self, steps, archive_size=5, window_size=2, no_archive=False):
+        from textual.app import App
+        from matrixcli.app import MatrixApp
+
+        rows = [
+            Message(
+                sender="@a:hs", sender_name="A", body=f"old{i}", ts=1000 + i,
+                event_id=f"$a{i}",
+            )
+            for i in range(archive_size)
+        ]
+        # The live window is the newest slice of the same history.
+        history = rows[-window_size:]
+        archive = [] if no_archive else rows
+        session = SimpleNamespace(
+            cfg=SimpleNamespace(user_id="@me:hs"),
+            my_name="Me",
+            client=SimpleNamespace(rooms={}),
+            last_event_id={},
+            load_history=lambda room_id, limit=40, cached_only=False: _async(
+                list(history)
+            ),
+            mark_read=lambda room_id: _async(None),
+            start_backfill=lambda room_id: None,
+            reset_pagination=lambda room_id: None,
+            archive_rows=lambda room_id: list(archive),
+            archive_done={"!a:hs"},
+            drafts={},
+            reaction_summary=lambda room_id, event_id: [],
+        )
+
+        class RoomApp(App):
+            CSS = MatrixApp.CSS
+
+            def on_mount(self):
+                self.session = session
+                self.last_sync_at = None
+                self.sync_ok = True
+                return self.push_screen(RoomScreen(make_entry()))
+
+        async def go():
+            app = RoomApp()
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.pause()
+                return await steps(pilot, app.screen)
+
+        return asyncio.run(go())
+
+    def test_g_browses_from_the_first_archived_message(self):
+        async def steps(pilot, screen):
+            await pilot.press("g")
+            await pilot.pause()
+            return {
+                "selected": screen.selected,
+                "first": screen.messages[0].event_id,
+                "count": len(screen.messages),
+                "browsing": screen._browse is not None,
+            }
+
+        # All 5 archived rows fit in one BROWSE_CHUNK; the view starts at $a0.
+        assert self.run(steps) == {
+            "selected": 0,
+            "first": "$a0",
+            "count": 5,
+            "browsing": True,
+        }
+
+    def test_g_without_archive_jumps_to_first_loaded(self):
+        async def steps(pilot, screen):
+            await pilot.press("g")
+            await pilot.pause()
+            return {
+                "selected": screen.selected,
+                "browsing": screen._browse is not None,
+                "count": len(screen.messages),
+            }
+
+        # archive_rows returns []: plain jump within the loaded window.
+        assert self.run(steps, no_archive=True) == {
+            "selected": 0,
+            "browsing": False,
+            "count": 2,
+        }
+
+    def test_g_then_G_reattaches_to_the_live_tail(self):
+        async def steps(pilot, screen):
+            await pilot.press("g")
+            await pilot.pause()
+            browsing = screen._browse is not None
+            await pilot.press("G")
+            await pilot.pause()
+            return {
+                "was_browsing": browsing,
+                "browsing": screen._browse is not None,
+                "count": len(screen.messages),
+                "selected": screen.selected,
+                "last": screen.messages[-1].event_id,
+            }
+
+        # Back on the live window: 2 messages, tail selected.
+        assert self.run(steps) == {
+            "was_browsing": True,
+            "browsing": False,
+            "count": 2,
+            "selected": 1,
+            "last": "$a4",
+        }
+
+    def test_j_at_the_bottom_extends_then_reattaches(self):
+        async def steps(pilot, screen):
+            await pilot.press("g")
+            await pilot.pause()
+            counts = [len(screen.messages)]
+            # Walk to the bottom of the first chunk, then one more j.
+            screen.selected = len(screen.messages) - 1
+            await pilot.press("j")
+            await pilot.pause()
+            counts.append(len(screen.messages))
+            return {
+                "counts": counts,
+                "browsing": screen._browse is not None,
+                "selected": screen.selected,
+            }
+
+        # 250 archived rows: g shows the first 200, j at the bottom pulls the
+        # remaining 50 and steps onto the first of them.
+        out = self.run(steps, archive_size=250, window_size=2)
+        assert out["counts"] == [200, 250]
+        assert out["browsing"] is True
+        assert out["selected"] == 200
+
+    def test_refresh_is_ignored_while_browsing(self):
+        async def steps(pilot, screen):
+            await pilot.press("g")
+            await pilot.pause()
+            screen.app.session.last_event_id["!a:hs"] = "$new"
+            await screen.refresh_messages()
+            return {
+                "count": len(screen.messages),
+                "browsing": screen._browse is not None,
+            }
+
+        # Still the 5 archived rows: the live reload did not clobber the view.
+        assert self.run(steps) == {"count": 5, "browsing": True}

@@ -10,11 +10,19 @@ Three kinds of persistence live here:
   device id so later launches never need the password again.
 * ``state.json`` (non-secret): per-room "last event seen" and "last opened"
   timestamps, used to rank the home screen's Recent, Favourites, and DMs.
+* ``store/timelines.cache`` and ``store/archive/<sha256(room id)>.cache``
+  (secret): the per-room message windows plus one full-history archive file
+  per room, so a restart paints rooms without refetching them. Message bodies
+  include decrypted E2EE plaintext, so every file is AES-GCM encrypted with a
+  key derived from the same Keychain store key that protects nio's crypto
+  store. ``[cache] messages = false`` disables all of it; individual spaces
+  opt out via ``cache_spaces`` in state.json (the "c" key on a space).
 """
 
 from __future__ import annotations
 
 import configparser
+import hashlib
 import json
 import os
 import secrets
@@ -22,6 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import keyring
+from Crypto.Cipher import AES
 
 CONFIG_TEMPLATE = """\
 [matrix]
@@ -44,6 +53,13 @@ service = matrix-cli
 ; "~" is expanded. Defaults are under ~/.local/share/matrixcli/ when blank.
 store_path =
 state_path =
+
+[cache]
+; Persist message history (including decrypted E2EE text, AES-encrypted at
+; rest) so a restart paints rooms without refetching them. Set false to keep
+; messages in memory only; any existing cache is deleted on the next launch.
+; Individual spaces can also be excluded in-app ("c" on a space).
+messages = true
 """
 
 
@@ -74,6 +90,10 @@ class Config:
     # in [matrix] to refuse (a device silently added to a recipient can no
     # longer receive your plaintext).
     allow_unverified: bool = True
+    # Master switch for the encrypted on-disk message cache ([cache] messages).
+    # False keeps history in memory only and wipes any existing cache files at
+    # startup. Per-space opt-outs live in state.json ("cache_spaces"), not here.
+    cache_messages: bool = True
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Config":
@@ -119,6 +139,13 @@ class Config:
             allow_unverified = m.getboolean("allow_unverified", fallback=True)
         except ValueError:
             allow_unverified = True
+        cache = parser["cache"] if parser.has_section("cache") else None
+        try:
+            cache_messages = (
+                cache.getboolean("messages", fallback=True) if cache else True
+            )
+        except ValueError:
+            cache_messages = True
 
         return cls(
             homeserver=m.get("homeserver", "").strip(),
@@ -130,6 +157,7 @@ class Config:
             state_path=state_path,
             config_path=path,
             allow_unverified=allow_unverified,
+            cache_messages=cache_messages,
         )
 
     # --- Keychain: password (user-provided) and token cache (we write it) ---
@@ -191,7 +219,13 @@ class Config:
         # Callers index these directly; guarantee well-typed dicts even if
         # state.json predates a key or was edited by hand (a null or list
         # value would crash the first .get on it).
-        for key in ("last_event_ts", "last_opened_ts", "room_meta", "space_children"):
+        for key in (
+            "last_event_ts",
+            "last_opened_ts",
+            "room_meta",
+            "space_children",
+            "cache_spaces",
+        ):
             if not isinstance(state.get(key), dict):
                 state[key] = {}
         return state
@@ -200,3 +234,109 @@ class Config:
         tmp = self.state_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(state))
         tmp.replace(self.state_path)
+
+    # --- Encrypted timeline cache (decrypted message windows at rest) ---
+
+    @property
+    def _timeline_cache_path(self) -> Path:
+        # Lives in the store directory: created 0o700, and _reset_store wipes
+        # its files, which is exactly right for a cache of decrypted content.
+        return self.store_path / "timelines.cache"
+
+    def _timeline_cache_aes_key(self) -> bytes:
+        # Derived (domain-separated) from the Keychain store key rather than
+        # stored anywhere itself; cached on the instance so every debounced
+        # save does not round-trip the Keychain.
+        key = getattr(self, "_timeline_key", None)
+        if key is None:
+            secret = "matrixcli-timeline-cache\0" + self.get_or_create_store_key()
+            key = hashlib.sha256(secret.encode()).digest()
+            self._timeline_key = key
+        return key
+
+    def _read_encrypted(self, path: Path) -> dict | None:
+        """The decrypted payload of one cache file, or None for missing,
+        corrupt, or foreign files (a failed GCM tag also lands here: wrong
+        key or tampering)."""
+        try:
+            blob = path.read_bytes()
+        except OSError:
+            return None
+        if len(blob) < 33 or blob[:1] != b"\x01":  # version byte + nonce + tag
+            return None
+        nonce, tag, ciphertext = blob[1:17], blob[17:33], blob[33:]
+        try:
+            cipher = AES.new(self._timeline_cache_aes_key(), AES.MODE_GCM, nonce=nonce)
+            payload = json.loads(cipher.decrypt_and_verify(ciphertext, tag))
+        except (ValueError, KeyError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _write_encrypted(self, path: Path, payload: dict) -> None:
+        nonce = secrets.token_bytes(16)
+        cipher = AES.new(self._timeline_cache_aes_key(), AES.MODE_GCM, nonce=nonce)
+        ciphertext, tag = cipher.encrypt_and_digest(json.dumps(payload).encode())
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_bytes(b"\x01" + nonce + tag + ciphertext)
+        tmp.replace(path)
+
+    def load_timeline_cache(self) -> dict | None:
+        return self._read_encrypted(self._timeline_cache_path)
+
+    def save_timeline_cache(self, payload: dict) -> None:
+        self._write_encrypted(self._timeline_cache_path, payload)
+
+    # Full-history archives get one file per room so a save only rewrites the
+    # rooms that changed (the main cache stays small and is rewritten whole).
+    # Filenames are sha256(room id): stable, filesystem-safe, and the listing
+    # of a stolen directory leaks no room ids.
+
+    @property
+    def _archive_dir(self) -> Path:
+        return self.store_path / "archive"
+
+    def _room_archive_path(self, room_id: str) -> Path:
+        name = hashlib.sha256(room_id.encode()).hexdigest() + ".cache"
+        return self._archive_dir / name
+
+    def save_room_archive(self, room_id: str, payload: dict) -> None:
+        self._archive_dir.mkdir(mode=0o700, exist_ok=True)
+        self._write_encrypted(self._room_archive_path(room_id), payload)
+
+    def load_room_archives(self) -> list[dict]:
+        """Every readable per-room archive payload. Unreadable files are
+        skipped, not deleted: the room simply re-downloads, and a foreign
+        (other-account) file is not ours to destroy."""
+        try:
+            paths = sorted(self._archive_dir.glob("*.cache"))
+        except OSError:
+            return []
+        out = []
+        for path in paths:
+            payload = self._read_encrypted(path)
+            if payload is not None:
+                out.append(payload)
+        return out
+
+    def clear_room_archive(self, room_id: str) -> None:
+        try:
+            self._room_archive_path(room_id).unlink()
+        except OSError:
+            pass
+
+    def clear_timeline_cache(self) -> None:
+        """Delete the whole message cache: the main file and every per-room
+        archive (used by --import-keys and by `[cache] messages = false`)."""
+        try:
+            self._timeline_cache_path.unlink()
+        except OSError:
+            pass
+        try:
+            paths = list(self._archive_dir.glob("*.cache*"))
+        except OSError:
+            paths = []
+        for path in paths:
+            try:
+                path.unlink()
+            except OSError:
+                pass

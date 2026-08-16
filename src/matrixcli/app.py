@@ -309,6 +309,12 @@ class RoomScreen(Screen):
         ("k", "up", "Up"),
         Binding("down", "down", "Down", show=False),
         Binding("up", "up", "Up", show=False),
+        # Vim's g/G: g browses the room's archived history from its very
+        # first message (detaching from the live tail; j at the bottom walks
+        # forward), or falls back to the first loaded message when nothing
+        # is archived; G jumps to the newest message and reattaches.
+        Binding("g", "first_message", "First", show=False),
+        Binding("G", "last_message", "Last", show=False),
         # Gated by check_action to the messages they can actually act on, so
         # the footer only offers them when there is a thread to unfold/fold.
         ("l", "expand", "Unfold thread"),
@@ -366,6 +372,13 @@ class RoomScreen(Screen):
         self.older: list = []  # back-paginated messages, kept across refreshes
         self._paginating = False  # guard against overlapping fetches
         self._at_beginning = False  # history start reached and announced
+        # Browse mode ("g"): a snapshot of the room's archived history while
+        # the view is detached from the live tail and walking it from the
+        # very first message; None when following the tail as usual. The
+        # counter is how many snapshot rows are in the view so far ("j" at
+        # the bottom extends it; "G" or walking past the end reattaches).
+        self._browse: list | None = None
+        self._browse_upto = 0
         # The room's fully-read marker as it was when this screen opened;
         # everything after it renders below a "new" divider, and "u" jumps
         # there. Frozen at open so live arrivals stay marked until you leave.
@@ -412,16 +425,23 @@ class RoomScreen(Screen):
         a single thread instead. cached_only skips the network and serves
         whatever the timeline cache already holds; on_mount uses it to paint
         instantly before the (slow) full fetch."""
-        messages = await self.app.session.load_history(
-            self.entry.room_id, cached_only=cached_only
-        )
-        if self.older:
-            # Scrolled-back history lives on the screen (the session cache
-            # only keeps a recent window); splice it back in on every reload.
-            merged = {m.event_id: m for m in self.older}
-            for m in messages:
-                merged[m.event_id] = m
-            messages = sorted(merged.values(), key=lambda m: m.ts)
+        if self._browse is not None:
+            # Browse mode: the view is exactly the archive rows loaded so far
+            # (kept in self.older) with the live window deliberately absent;
+            # everything below (edit folding, thread collapse) still applies.
+            messages = list(self.older)
+        else:
+            messages = await self.app.session.load_history(
+                self.entry.room_id, cached_only=cached_only
+            )
+            if self.older:
+                # Scrolled-back history lives on the screen (the session cache
+                # only keeps a recent window); splice it back in on every
+                # reload.
+                merged = {m.event_id: m for m in self.older}
+                for m in messages:
+                    merged[m.event_id] = m
+                messages = sorted(merged.values(), key=lambda m: m.ts)
         # After the splice, so an edit found by back-pagination still folds
         # into a target from the live window (and vice versa).
         messages = fold_edits(messages)
@@ -572,6 +592,12 @@ class RoomScreen(Screen):
             )
             await self._redraw(keep_scroll=not follow)
             await self.app.session.mark_read(self.entry.room_id)
+            # After the visible window is up: download the room's ENTIRE
+            # history in the background, so everything from the first message
+            # on survives locally (deletions and edit versions included).
+            # No-op when the room is already archived or downloading; a
+            # ThreadScreen mount kicks the same room, equally a no-op.
+            self.app.session.start_backfill(self.entry.room_id)
         finally:
             # Even on a failed or superseded load, hand live updates over to
             # refresh_messages; its next run reloads everything this one
@@ -607,6 +633,11 @@ class RoomScreen(Screen):
         # finished it would also race _finish_mount, which picks up anything
         # that arrives meanwhile itself.
         if not self.is_attached or not self._loaded:
+            return
+        # Browsing history from the top: a reload would clobber the detached
+        # view with the live tail. _last_seen_event stays untouched, so the
+        # first refresh after leaving browse mode catches everything up.
+        if self._browse is not None:
             return
         latest = self.app.session.last_event_id.get(self.entry.room_id)
         if not latest or latest == self._last_seen_event:
@@ -917,9 +948,18 @@ class RoomScreen(Screen):
         self.run_worker(self._redraw())
 
     def action_down(self) -> None:
-        if self.messages:
-            self.selected = min(self.selected + 1, len(self.messages) - 1)
-            self._highlight()
+        if not self.messages:
+            return
+        if self._browse is not None and self.selected >= len(self.messages) - 1:
+            # Bottom of the browse view: pull the next chunk of archived
+            # history into it, or reattach to the live tail once the
+            # snapshot is walked dry.
+            self.run_worker(
+                self._extend_browse(), group="browse", exclusive=True
+            )
+            return
+        self.selected = min(self.selected + 1, len(self.messages) - 1)
+        self._highlight()
 
     def action_up(self) -> None:
         if not self.messages:
@@ -929,6 +969,101 @@ class RoomScreen(Screen):
             return
         self.selected -= 1
         self._highlight()
+
+    # How much archived history "g" loads at once, and each "j" at the bottom
+    # of the browse view adds. Widgets are not virtualized, so the chunk is
+    # what keeps a 20k-message room from mounting 20k widgets in one go.
+    BROWSE_CHUNK = 200
+
+    def action_first_message(self) -> None:
+        """g: jump to the room's first message. With archived history this
+        detaches from the live tail and browses the archive from the very
+        beginning; without any (download not started, caching off, thread
+        view) it falls back to the first loaded message."""
+        if self._browse is None:
+            rows = self.app.session.archive_rows(self.entry.room_id)
+            if rows:
+                self._browse = rows
+                self._browse_upto = min(len(rows), self.BROWSE_CHUNK)
+                self.older = rows[: self._browse_upto]
+                if self.entry.room_id not in self.app.session.archive_done:
+                    self.app.notify(
+                        "History is still downloading; starting at the "
+                        "oldest message fetched so far.",
+                        timeout=4,
+                    )
+                self.run_worker(
+                    self._apply_browse(0), group="browse", exclusive=True
+                )
+                return
+        if self.messages:
+            self.selected = 0
+            self._highlight()
+
+    def action_last_message(self) -> None:
+        """G: the newest message. From browse mode this reattaches to the
+        live tail; otherwise it just jumps there."""
+        if self._browse is not None:
+            self.run_worker(self._exit_browse(), group="browse", exclusive=True)
+            return
+        if self.messages:
+            self.selected = len(self.messages) - 1
+            self._highlight()
+
+    async def _apply_browse(self, select: int) -> None:
+        messages = await self._load_messages()
+        if not self.is_attached:
+            return
+        self.messages = messages
+        self.selected = max(0, min(select, len(messages) - 1))
+        await self._redraw()
+
+    async def _extend_browse(self) -> None:
+        if self._browse is None:
+            return
+        if self._browse_upto >= len(self._browse):
+            await self._exit_browse()
+            return
+        # Keep the selection anchored by event id: the rebuild refolds edits,
+        # so indices can shift even though rows were only appended.
+        anchor = (
+            self.messages[self.selected].event_id
+            if self.selected < len(self.messages)
+            else None
+        )
+        self._browse_upto = min(
+            len(self._browse), self._browse_upto + self.BROWSE_CHUNK
+        )
+        self.older = self._browse[: self._browse_upto]
+        messages = await self._load_messages()
+        if not self.is_attached:
+            return
+        self.messages = messages
+        pos = next(
+            (i for i, m in enumerate(messages) if m.event_id == anchor),
+            None,
+        )
+        # The pressed "j" still means "one step down" from where we were.
+        self.selected = min(
+            (pos + 1) if pos is not None else len(messages) - 1,
+            len(messages) - 1,
+        )
+        await self._redraw(keep_scroll=True)
+        self._highlight()
+
+    async def _exit_browse(self) -> None:
+        self._browse = None
+        self._browse_upto = 0
+        self.older = []
+        messages = await self._load_messages()
+        if not self.is_attached:
+            return
+        self.messages = messages
+        self.selected = max(0, len(messages) - 1)
+        await self._redraw()
+        # _last_seen_event was frozen while browsing; let the next sync tick
+        # (or this explicit refresh) catch the view up with what arrived.
+        await self.refresh_messages()
 
     def _reset_history_position(self) -> None:
         """Called once on mount. The messages a previous visit back-paginated
@@ -946,6 +1081,8 @@ class RoomScreen(Screen):
         thread is already loaded whole via /relations)."""
         if self._paginating or self._at_beginning:
             return
+        if self._browse is not None:
+            return  # the view already starts at the room's first message
         self._paginating = True
 
         async def fetch() -> None:
@@ -1184,6 +1321,11 @@ class RoomScreen(Screen):
             )
             self.threaded = not self.threaded
             self.refresh_bindings()  # footer flips between the view labels
+            # Remember the choice across rooms and restarts (state.json);
+            # rooms already open keep their own view until reopened.
+            session = self.app.session
+            session.state["threaded_view"] = self.threaded
+            session.cfg.save_state(session.state)
             messages = await self._load_messages()
             if not self.is_attached:
                 return
@@ -1806,6 +1948,14 @@ class ThreadScreen(RoomScreen):
         super().__init__(entry)
         self.root = root
         self._thread_seen: tuple | None = None  # see refresh_messages
+
+    def action_first_message(self) -> None:
+        # A thread is already loaded whole via /relations; "g" is a plain
+        # jump to its root, never the room-archive browse the base class
+        # would enter (that belongs to the room screen underneath).
+        if self.messages:
+            self.selected = 0
+            self._highlight()
 
     async def on_mount(self) -> None:
         # Open with the composer ready: a thread is usually opened to reply.
@@ -2521,6 +2671,13 @@ class HomeScreen(Screen):
         # (spaces, invites, empty placeholders).
         Binding("f", "favourite_add", "Favourite"),
         Binding("f", "favourite_remove", "Unfavourite"),
+        # Two labels for one key, like "f" above but reading as state (the
+        # t/c/~ pattern in rooms): shown only on a highlighted space, the
+        # enabled one names whether that space's rooms are cached to disk,
+        # and pressing "c" flips it. Hidden entirely when [cache] messages is
+        # off in config.ini: the per-space toggle would do nothing.
+        Binding("c", "cache_off", "Cache: on"),
+        Binding("c", "cache_on", "Cache: off"),
         ("q", "app.quit", "Quit"),
     ]
 
@@ -2758,7 +2915,34 @@ class HomeScreen(Screen):
                 return False
             wants_remove = action == "favourite_remove"
             return entry.is_favourite == wants_remove
+        if action in ("cache_on", "cache_off"):
+            session = self.app.session
+            if not session.cfg.cache_messages:
+                return False
+            entry = self._selected_entry()
+            if entry is None or not entry.is_space:
+                return False
+            enabled = session.space_cache_enabled(entry.room_id)
+            # "cache_off" is the action that turns it off, so it is the one
+            # offered (labelled "Cache: on") while caching is enabled.
+            return enabled == (action == "cache_off")
         return True
+
+    def action_cache_on(self) -> None:
+        self._toggle_cache()
+
+    def action_cache_off(self) -> None:
+        self._toggle_cache()
+
+    def _toggle_cache(self) -> None:
+        entry = self._selected_entry()
+        if entry is None or not entry.is_space:
+            return
+        session = self.app.session
+        session.set_space_cache(
+            entry.room_id, not session.space_cache_enabled(entry.room_id)
+        )
+        self.refresh_bindings()  # flip the footer label with the state
 
     def action_open_selected(self) -> None:
         # The priority Enter binding bypasses the focused ListView's own
@@ -3162,6 +3346,15 @@ class MatrixApp(App):
             if isinstance(resp, SyncResponse):
                 self.sync_ok = True
                 self.last_sync_at = time.monotonic()
+                # An offline launch skips connect()'s startup keys_upload
+                # (the network was down); top up one-time keys on the first
+                # successful sync instead, or new senders could not open olm
+                # channels to this device for the whole session.
+                if self.session.client.should_upload_keys:
+                    try:
+                        await self.session.client.keys_upload()
+                    except Exception:
+                        pass  # the next sync tick retries
                 self.session._record_room_timestamps(resp)
                 # Rooms added to (or removed from) a space arrive as
                 # m.space.child state, but the child map behind the Rooms
@@ -3218,7 +3411,13 @@ class MatrixApp(App):
 
             self.run_worker(select_space())
             return
-        self.push_screen(RoomScreen(entry))
+        screen = RoomScreen(entry)
+        # Rooms open in the view mode the last "t" toggle left behind, across
+        # restarts (state.json). Set here rather than in RoomScreen.__init__
+        # so ThreadScreen, which inherits it, always starts unthreaded (its
+        # replies would otherwise all render with the thread-reply indent).
+        screen.threaded = bool(self.session.state.get("threaded_view"))
+        self.push_screen(screen)
 
     def action_search(self) -> None:
         self.push_screen(SearchScreen())

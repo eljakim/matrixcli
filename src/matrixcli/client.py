@@ -19,7 +19,7 @@ import re
 import time
 import unicodedata
 from collections import defaultdict, deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from urllib.parse import quote
 
@@ -429,6 +429,36 @@ class MatrixSession:
         # opens there. In-memory only: an Escape slip should not cost a
         # paragraph, but drafts are not worth persisting to disk.
         self.drafts: dict[str, str] = {}
+        # Encrypted on-disk mirror of timelines/reactions (see
+        # _restore_timelines): dirty when the in-memory copy has moved past
+        # the file, saved debounced from the sync path and finally on close.
+        self._cache_dirty = False
+        self._cache_saved_at = 0.0
+        self._cache_saving = False  # a threaded write is in flight
+        self._cache_save_task: asyncio.Task | None = None
+        # Full-history archives: every message a room ever had, downloaded in
+        # the background while the room is (or was) open, event id -> Message,
+        # never evicted (unlike the TIMELINE_CAP'd live window). The token is
+        # the deepest /messages position reached so an unfinished download
+        # resumes there; "done" rooms reached the beginning of history;
+        # "stale" rooms may have a hole at the NEW end (a gappy sync or a
+        # restart from a mismatched token happened after they were archived),
+        # which the next backfill re-covers from the head.
+        self.archives: dict[str, dict[str, Message]] = {}
+        self.archive_tokens: dict[str, str] = {}
+        self.archive_done: set[str] = set()
+        self.archive_stale: set[str] = set()
+        # Rooms whose archive moved past its on-disk file (one encrypted file
+        # per room, see Config.save_room_archive); only these are rewritten
+        # on a save, so a quiet save never re-serializes every big room.
+        self._archive_dirty: set[str] = set()
+        # How many archive rows load_older has served this visit, per room,
+        # counted from the newest end; reset when the room screen reopens.
+        self._archive_served: dict[str, int] = {}
+        # One download at a time across all rooms: archiving is a background
+        # nicety and must never compete with itself for a loaded homeserver.
+        self._backfill_gate = asyncio.Semaphore(1)
+        self._backfill_tasks: dict[str, asyncio.Task] = {}
 
         token = cfg.load_token()
         self._new_client(token["device_id"] if token else None)
@@ -543,14 +573,21 @@ class MatrixSession:
                 try:
                     whoami = await self.client.whoami()
                 except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                    # With max_timeouts set, a dead network raises here instead
-                    # of retrying forever inside nio. Same policy as the
-                    # transient-error branch below: keep the token, fail launch.
-                    return False, (
-                        "could not reach the server "
-                        f"({type(exc).__name__}).\n"
-                        "The cached token was kept; try again in a moment."
+                    # A dead network (max_timeouts makes nio raise instead of
+                    # retrying forever inside itself) must not kill the
+                    # launch: the token, crypto store, and message cache on
+                    # disk are enough to read everything. The validation this
+                    # skips happens implicitly once connectivity returns: the
+                    # sync loop maps a revoked token to M_UNKNOWN_TOKEN and
+                    # exits cleanly, and it also runs the keys_upload that is
+                    # deliberately not attempted here (it would just raise
+                    # again). initial_sync's own retries then fail fast and
+                    # fall through to the cached dashboard.
+                    step(
+                        "server unreachable "
+                        f"({type(exc).__name__}); starting offline from cache"
                     )
+                    return True, "offline: started from the local cache"
                 # Errors come back as WhoamiError, which has no user_id attribute.
                 if getattr(whoami, "user_id", None):
                     if whoami.user_id != self.cfg.user_id:
@@ -677,6 +714,12 @@ class MatrixSession:
             for child in store.glob("*"):
                 if child.is_file():
                     child.unlink()
+                elif child.is_dir():
+                    # The archive/ subdirectory: its files were encrypted
+                    # with the same pickle key and are equally unreadable.
+                    for sub in child.glob("*"):
+                        if sub.is_file():
+                            sub.unlink()
         except OSError:
             pass
         self._new_client()
@@ -693,6 +736,320 @@ class MatrixSession:
         re-decrypts with the new keys."""
         await self.client.import_keys(infile, passphrase)
         self.timelines.clear()
+        # The on-disk mirror and the archives hold the same placeholders;
+        # drop them too, or the next launch would seed them right back before
+        # any re-decryption. Rooms simply re-download on their next open.
+        self.archives.clear()
+        self.archive_tokens.clear()
+        self.archive_done.clear()
+        self.archive_stale.clear()
+        self._archive_dirty.clear()
+        self.cfg.clear_timeline_cache()
+        self._cache_dirty = False
+
+    def cache_allowed(self, room_id: str) -> bool:
+        """Whether this room's messages may be persisted to disk. Global
+        switch first ([cache] messages in config.ini); then any space the
+        room belongs to that was toggled off in-app wins over everything
+        (privacy-first for rooms in several spaces). Spaceless rooms and DMs
+        follow the global switch alone."""
+        if not self.cfg.cache_messages:
+            return False
+        overrides = self.state.get("cache_spaces") or {}
+        for space_id, allowed in overrides.items():
+            if allowed is False and (
+                room_id == space_id
+                or room_id in self.space_children.get(space_id, ())
+            ):
+                return False
+        return True
+
+    def space_cache_enabled(self, space_id: str) -> bool:
+        return (self.state.get("cache_spaces") or {}).get(space_id) is not False
+
+    def set_space_cache(self, space_id: str, enabled: bool) -> None:
+        """Flip a space's caching override. Enabled means "inherit the global
+        default", so the entry is removed rather than stored as True and
+        state.json only carries actual opt-outs. Turning a space off purges
+        its rooms from disk immediately: "off" must mean the decrypted text
+        has left the disk, not that it lingers until the next debounced
+        save."""
+        overrides = self.state.setdefault("cache_spaces", {})
+        if enabled:
+            overrides.pop(space_id, None)
+        else:
+            overrides[space_id] = False
+        self.cfg.save_state(self.state)
+        if not enabled:
+            for room_id, task in list(self._backfill_tasks.items()):
+                if not self.cache_allowed(room_id):
+                    task.cancel()
+            self._cache_dirty = True
+            self._cache_saved_at = 0.0  # bypass the debounce window
+            self._maybe_save_timelines()
+
+    def _restore_timelines(self, resume: bool) -> None:
+        """Seed timelines, reactions, and last-seen ids from the encrypted
+        cache, so rooms open instantly from local data after a restart.
+
+        The cache is only fully trusted when this launch resumes from exactly
+        the sync token the cache was saved at; otherwise (first run, wiped
+        state.json, or a crash between nio's token write and our debounced
+        save) events may sit between the cached tail and the resume point, so
+        every seeded room gets a gap bump: the first open refetches over the
+        cache and the merge keeps already-decrypted bodies (see load_history).
+        """
+        if not self.cfg.cache_messages:
+            # Global off: nothing may live on disk, including caches written
+            # before the setting changed. Saves are also disabled (see
+            # _save_timelines), so this wipe is not undone a minute later.
+            self.cfg.clear_timeline_cache()
+            return
+        msg_fields = {f.name for f in fields(Message)}
+
+        def to_messages(rows) -> list[Message]:
+            out = []
+            for row in rows if isinstance(rows, list) else []:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    out.append(
+                        Message(**{k: v for k, v in row.items() if k in msg_fields})
+                    )
+                except TypeError:
+                    continue  # a field changed type across versions: skip it
+            return out
+
+        payload = self.cfg.load_timeline_cache()
+        if not payload or payload.get("user_id") != self.cfg.user_id:
+            payload = {}
+        for room_id, rows in (payload.get("timelines") or {}).items():
+            if not self.cache_allowed(room_id):
+                continue  # written before a space was toggled off
+            restored = to_messages(rows)
+            if restored:
+                self.timelines[room_id].extend(restored)
+        for room_id, targets in (payload.get("reactions") or {}).items():
+            if not isinstance(targets, dict) or not self.cache_allowed(room_id):
+                continue
+            self.reactions[room_id] = {
+                target: {key: set(senders) for key, senders in keys.items()}
+                for target, keys in targets.items()
+                if isinstance(keys, dict)
+            }
+        for event_id, row in (payload.get("reaction_events") or {}).items():
+            if isinstance(row, list) and len(row) == 4 and self.cache_allowed(row[0]):
+                self._reaction_events[event_id] = tuple(row)
+        for room_id, event_id in (payload.get("last_event_id") or {}).items():
+            if isinstance(event_id, str) and self.cache_allowed(room_id):
+                self.last_event_id.setdefault(room_id, event_id)
+        # A pre-split cache (version 1) carried the archives inline; adopt
+        # them and mark them dirty so the next save migrates each to its own
+        # per-room file and the inline copies stop being written.
+        for room_id, rows in (payload.get("archives") or {}).items():
+            if not self.cache_allowed(room_id):
+                continue
+            restored = to_messages(rows)
+            if restored:
+                arch = self.archives.setdefault(room_id, {})
+                arch.update({m.event_id: m for m in restored if m.event_id})
+                self._archive_dirty.add(room_id)
+        for room_payload in self.cfg.load_room_archives():
+            if room_payload.get("user_id") != self.cfg.user_id:
+                continue
+            room_id = room_payload.get("room_id")
+            if not isinstance(room_id, str) or not room_id:
+                continue
+            if not self.cache_allowed(room_id):
+                # Purge on sight: the space was toggled off since this file
+                # was written (or while the app was not running).
+                self.cfg.clear_room_archive(room_id)
+                continue
+            restored = to_messages(room_payload.get("messages"))
+            if restored:
+                arch = self.archives.setdefault(room_id, {})
+                arch.update({m.event_id: m for m in restored if m.event_id})
+        for room_id, tok in (payload.get("archive_tokens") or {}).items():
+            if isinstance(tok, str) and tok and self.cache_allowed(room_id):
+                self.archive_tokens[room_id] = tok
+        self.archive_done.update(
+            r
+            for r in payload.get("archive_done") or []
+            if isinstance(r, str) and self.cache_allowed(r)
+        )
+        self.archive_stale.update(
+            r
+            for r in payload.get("archive_stale") or []
+            if isinstance(r, str) and self.cache_allowed(r)
+        )
+        token = self.client.next_batch or self.client.loaded_sync_token
+        if not resume or payload.get("next_batch") != token:
+            for room_id in list(self.timelines):
+                self.gap_gen[room_id] = self.gap_gen.get(room_id, 0) + 1
+            # Events between the cache's head and the resume point are also
+            # absent from every archive; each gets re-covered on next open.
+            # Archive files without a main payload (corrupt or deleted) land
+            # here too, via the token mismatch: their alignment is unknown.
+            self.archive_stale.update(self.archives)
+
+    def _timeline_payload(self) -> dict:
+        """The main cache payload (windows, reactions, archive bookkeeping;
+        the archives themselves live in per-room files, see
+        _pending_archive_writes). Built without a single await so it
+        snapshots a consistent moment (vars() rows are safe to hand to a
+        writer thread: Messages are replaced, never mutated, so the dicts
+        stay frozen). Rooms the cache policy disallows are filtered from
+        every section, which is also what purges them from disk: the next
+        save simply rewrites the file without them."""
+        for room_id, timeline in self.timelines.items():
+            arch = self.archives.get(room_id)
+            if arch is None:
+                continue
+            # The live window holds the freshest copy of overlapping events
+            # (redaction marks, adopted server timestamps, live decrypts):
+            # fold it into the archive so the disk copy inherits all of it.
+            for m in timeline:
+                if m.event_id and not m.pending and arch.get(m.event_id) != m:
+                    arch[m.event_id] = m
+                    self._archive_dirty.add(room_id)
+        allowed = {
+            room_id
+            for room_id in (
+                set(self.timelines)
+                | set(self.reactions)
+                | set(self.last_event_id)
+                | set(self.archives)
+                | set(self.archive_tokens)
+                | self.archive_done
+                | self.archive_stale
+            )
+            if self.cache_allowed(room_id)
+        }
+        return {
+            "version": 2,
+            "user_id": self.cfg.user_id,
+            "next_batch": self.client.next_batch
+            or self.client.loaded_sync_token
+            or "",
+            "timelines": {
+                room_id: [vars(m) for m in timeline if not m.pending]
+                for room_id, timeline in self.timelines.items()
+                if timeline and room_id in allowed
+            },
+            "archive_tokens": {
+                room_id: tok
+                for room_id, tok in self.archive_tokens.items()
+                if room_id in allowed
+            },
+            "archive_done": sorted(self.archive_done & allowed),
+            "archive_stale": sorted(self.archive_stale & allowed),
+            "reactions": {
+                room_id: {
+                    target: {key: sorted(senders) for key, senders in keys.items()}
+                    for target, keys in targets.items()
+                }
+                for room_id, targets in self.reactions.items()
+                if room_id in allowed
+            },
+            "reaction_events": {
+                event_id: list(row)
+                for event_id, row in self._reaction_events.items()
+                if row[0] in allowed
+            },
+            "last_event_id": {
+                room_id: event_id
+                for room_id, event_id in self.last_event_id.items()
+                if room_id in allowed
+            },
+        }
+
+    def _pending_archive_writes(self) -> list[tuple[str, dict | None]]:
+        """What the per-room archive files need to catch up with memory:
+        (room_id, payload) rewrites for dirty allowed rooms, (room_id, None)
+        deletions for rooms the policy no longer allows. Untouched rooms do
+        not appear, so a save's cost scales with what changed."""
+        writes: list[tuple[str, dict | None]] = []
+        for room_id, arch in self.archives.items():
+            if not self.cache_allowed(room_id):
+                writes.append((room_id, None))
+            elif room_id in self._archive_dirty and arch:
+                writes.append(
+                    (
+                        room_id,
+                        {
+                            "version": 1,
+                            "user_id": self.cfg.user_id,
+                            "room_id": room_id,
+                            "messages": [
+                                vars(m)
+                                for m in sorted(
+                                    arch.values(),
+                                    key=lambda m: (m.ts, m.event_id),
+                                )
+                            ],
+                        },
+                    )
+                )
+        return writes
+
+    def _write_cache_files(
+        self, payload: dict, archive_writes: list[tuple[str, dict | None]]
+    ) -> None:
+        self.cfg.save_timeline_cache(payload)
+        for room_id, room_payload in archive_writes:
+            if room_payload is None:
+                self.cfg.clear_room_archive(room_id)
+            else:
+                self.cfg.save_room_archive(room_id, room_payload)
+
+    def _save_timelines(self) -> None:
+        if not self.cfg.cache_messages:
+            return  # global off: nothing is ever written
+        payload = self._timeline_payload()
+        writes = self._pending_archive_writes()
+        try:
+            self._write_cache_files(payload, writes)
+        except OSError:
+            return  # disk trouble: stay dirty and let a later save retry
+        self._archive_dirty.difference_update(r for r, _ in writes)
+        self._cache_dirty = False
+        self._cache_saved_at = time.monotonic()
+
+    def _maybe_save_timelines(self) -> None:
+        """Debounced save: serializing every room's window is too heavy to
+        run per 30s sync tick, and close() flushes whatever is left dirty.
+        Archive files can reach tens of MB, so under a running loop only the
+        payload snapshot happens inline and the serialize/encrypt/write of
+        the changed files goes to a thread."""
+        if not self.cfg.cache_messages:
+            return
+        if not self._cache_dirty or self._cache_saving:
+            return
+        if time.monotonic() - self._cache_saved_at < 60:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self._save_timelines()
+            return
+        payload = self._timeline_payload()
+        writes = self._pending_archive_writes()
+        self._archive_dirty.difference_update(r for r, _ in writes)
+        self._cache_dirty = False
+        self._cache_saved_at = time.monotonic()
+        self._cache_saving = True
+
+        async def write() -> None:
+            try:
+                await asyncio.to_thread(self._write_cache_files, payload, writes)
+            except OSError:
+                # Retry on a later tick; re-dirty exactly what was pending.
+                self._cache_dirty = True
+                self._archive_dirty.update(r for r, p in writes if p is not None)
+            finally:
+                self._cache_saving = False
+
+        self._cache_save_task = asyncio.create_task(write())
 
     async def initial_sync(self, progress=None) -> None:
         def step(msg: str) -> None:
@@ -752,6 +1109,11 @@ class MatrixSession:
             self.client.next_batch = ""
             self.client.loaded_sync_token = ""
             step("syncing all rooms (first run, this can take a while)")
+        # Seed the in-memory caches from disk BEFORE the sync: _on_message
+        # dedupes new arrivals against the seeded timelines by event id, so
+        # order matters. After the token clearing above, so a non-resume
+        # launch is seen as a token mismatch and gap-bumps the seeded rooms.
+        self._restore_timelines(resume)
         # Non-429 errors come back immediately as SyncError (nio only retries
         # rate limits itself), and a connection that dies mid-response never
         # becomes a response at all: nio lets the raw aiohttp error through
@@ -844,6 +1206,10 @@ class MatrixSession:
             if getattr(getattr(joined, "timeline", None), "limited", False):
                 self.history_loaded.discard(room_id)
                 self.gap_gen[room_id] = self.gap_gen.get(room_id, 0) + 1
+                # The skipped events are missing from the archive too; the
+                # next backfill re-covers from the head (see _backfill).
+                if room_id in self.archives:
+                    self.archive_stale.add(room_id)
             events = getattr(getattr(joined, "timeline", None), "events", []) or []
             for ev in events:
                 ts = getattr(ev, "server_timestamp", 0) or 0
@@ -858,10 +1224,27 @@ class MatrixSession:
                 event_id = getattr(ev, "event_id", "")
                 if event_id:
                     self.last_event_id[room_id] = event_id
+            if events:
+                # Any timeline event moved the in-memory cache past the disk
+                # copy (messages via _on_message, reactions/redactions via
+                # their callbacks, all of which ran inside this sync).
+                self._cache_dirty = True
         if changed:
             self._persist_recency()
+        self._maybe_save_timelines()
 
     async def close(self) -> None:
+        for task in list(self._backfill_tasks.values()):
+            task.cancel()
+        # A threaded cache write may be mid-file; let it finish (or fail)
+        # before the final flush, or two writers would race on the tmp file.
+        if self._cache_save_task is not None and not self._cache_save_task.done():
+            try:
+                await self._cache_save_task
+            except Exception:
+                pass
+        if self._cache_dirty:
+            self._save_timelines()
         await self.client.close()
 
     # --- interactive SAS (emoji) device verification ----------------------
@@ -2173,6 +2556,10 @@ class MatrixSession:
         timeline = self.timelines[room_id]
         timeline.clear()
         timeline.extend(history)
+        # Freshly fetched (and possibly freshly decrypted) content is worth
+        # having on disk; still debounced, a burst of first opens batches up.
+        self._cache_dirty = True
+        self._maybe_save_timelines()
         # A limited sync that landed while the fetch above was in flight
         # discarded history_loaded for a reason: the window just merged was
         # anchored at the pre-gap token and cannot contain the skipped
@@ -2318,6 +2705,7 @@ class MatrixSession:
         visible window and the previous visit's depth."""
         self.pagination_tokens.pop(room_id, None)
         self.pagination_done.pop(room_id, None)
+        self._archive_served.pop(room_id, None)
 
     async def load_older(self, room_id: str, limit: int = HISTORY_LIMIT) -> list[Message] | None:
         """The next batch of history older than what has been fetched so far,
@@ -2329,6 +2717,31 @@ class MatrixSession:
         initial window ended, so repeated calls walk arbitrarily far back."""
         if self.pagination_done.get(room_id):
             return []
+        # Serve scroll-up from the local archive first: for a downloaded
+        # room this makes arbitrarily deep history instant and offline. The
+        # position is a count from the newest end, so the backfill worker
+        # prepending older rows underneath never shifts what was served; rows
+        # added at the NEW end mid-visit merely re-serve a batch the screen
+        # already knows (its event-id filter drops them). A batch straddling
+        # a stale room's head hole can miss events, but opening the room
+        # started the recovering walk that fills it (see start_backfill).
+        arch = self.archives.get(room_id)
+        if arch:
+            rows = sorted(arch.values(), key=lambda m: (m.ts, m.event_id))
+            served = self._archive_served.get(room_id, 0)
+            end_idx = len(rows) - served
+            if end_idx > 0:
+                batch = rows[max(0, end_idx - limit):end_idx]
+                self._archive_served[room_id] = served + len(batch)
+                return batch
+            if room_id in self.archive_done:
+                self.pagination_done[room_id] = True
+                return []
+            # Partial archive walked dry: continue over the wire from where
+            # the download stopped, so nothing between is skipped.
+            token = self.archive_tokens.get(room_id)
+            if token:
+                self.pagination_tokens.setdefault(room_id, token)
         room = self.client.rooms.get(room_id)
         start = self.pagination_tokens.get(room_id) or self.client.next_batch or ""
         try:
@@ -2357,6 +2770,113 @@ class MatrixSession:
                 out.append(msg)
         out.reverse()  # chunk comes newest-first when paginating back
         return out
+
+    def archive_rows(self, room_id: str) -> list[Message]:
+        """A room's archived history, oldest first, as a snapshot copy: the
+        backfill worker keeps mutating the live dict, and the room screen's
+        browse mode ("g") needs stable indices while it walks forward."""
+        arch = self.archives.get(room_id)
+        if not arch:
+            return []
+        return sorted(arch.values(), key=lambda m: (m.ts, m.event_id))
+
+    def start_backfill(self, room_id: str) -> None:
+        """Kick off (or resume) the full-history download for a room, called
+        whenever a room screen opens. Idempotent: a room already downloading,
+        or fully archived and not stale, is a no-op. The task reference is
+        held (asyncio keeps only weak ones) and errors are swallowed: an
+        aborted download resumes from its persisted token on the next open."""
+        if not self.cache_allowed(room_id):
+            return  # caching is off globally or for this room's space
+        if room_id in self._backfill_tasks:
+            return
+        if room_id in self.archive_done and room_id not in self.archive_stale:
+            return
+
+        def reap(task: asyncio.Task) -> None:
+            self._backfill_tasks.pop(room_id, None)
+            if not task.cancelled():
+                task.exception()  # retrieve it, or asyncio logs a warning
+
+        task = asyncio.ensure_future(self._backfill(room_id))
+        self._backfill_tasks[room_id] = task
+        task.add_done_callback(reap)
+
+    async def _backfill(self, room_id: str) -> None:
+        """Walk /messages backwards until the room's first event is reached,
+        filling the archive. Everything _to_message yields is kept: normal
+        messages, edit rows, redaction tombstones; reactions are recorded as
+        a side effect exactly like the interactive fetch paths.
+
+        A stale room walks from the current head instead of resuming from
+        its depth token, to re-cover a possible hole at the new end; once the
+        walk hits a chunk whose messages are all already archived, the room
+        below that point is known contiguous, so an already-done room stops
+        there instead of re-fetching its entire history."""
+        async with self._backfill_gate:
+            arch = self.archives.setdefault(room_id, {})
+            recover = room_id in self.archive_stale and room_id in self.archive_done
+            start = "" if room_id in self.archive_stale else (
+                self.archive_tokens.get(room_id) or ""
+            )
+            if not start:
+                start = self.client.next_batch or self.client.loaded_sync_token or ""
+            self._ensure_room(room_id)
+            room = self.client.rooms[room_id]
+            while True:
+                try:
+                    resp = await self.client.room_messages(
+                        room_id,
+                        start=start,
+                        direction=MessageDirection.back,
+                        limit=100,
+                    )
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                    return  # resumes from the persisted token next open
+                if isinstance(resp, RoomMessagesError):
+                    return
+                chunk = resp.chunk or []
+                seen = fresh = 0
+                for event in chunk:
+                    msg = self._to_message(room, event)
+                    if msg is None or not msg.event_id:
+                        continue
+                    seen += 1
+                    if msg.event_id not in arch:
+                        fresh += 1
+                        # setdefault semantics on purpose: an archived copy
+                        # may hold decrypted text or a redaction body that a
+                        # refetch cannot reproduce; never overwrite it here.
+                        arch[msg.event_id] = msg
+                self._cache_dirty = True
+                if fresh:
+                    self._archive_dirty.add(room_id)
+                end = getattr(resp, "end", None)
+                # A done room's token is meaningless (there is nothing below
+                # to resume from), and a recover walk must not shrink a
+                # partial room's resume depth either, unless it IS the walk
+                # rebuilding contiguity for a stale partial archive.
+                if end and not recover:
+                    self.archive_tokens[room_id] = end
+                    # A stale partial archive is contiguous [head..token]
+                    # again the moment the head walk records a depth: an
+                    # interrupted recovery can then resume from the token
+                    # instead of starting over from the head.
+                    self.archive_stale.discard(room_id)
+                if not end or not chunk:
+                    self.archive_done.add(room_id)
+                    self.archive_stale.discard(room_id)
+                    self._maybe_save_timelines()
+                    return
+                if recover and seen and not fresh:
+                    # Reached already-archived territory: the hole above is
+                    # covered and everything below was contiguous already.
+                    self.archive_stale.discard(room_id)
+                    self._maybe_save_timelines()
+                    return
+                start = end
+                self._maybe_save_timelines()
+                await asyncio.sleep(0.5)  # be gentle with a loaded homeserver
 
     async def load_thread(self, room_id: str, root: Message, limit: int = 200) -> list[Message]:
         """A thread's replies, oldest first, with the root prepended. Fetched

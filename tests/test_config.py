@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -84,6 +85,7 @@ class TestState:
             "last_opened_ts": {},
             "room_meta": {},
             "space_children": {},
+            "cache_spaces": {},
         }
 
     def test_roundtrip(self, cfg):
@@ -95,7 +97,7 @@ class TestState:
             "selected_space": "!s:hs",
         }
         cfg.save_state(state)
-        assert cfg.load_state() == state
+        assert cfg.load_state() == {**state, "cache_spaces": {}}
         assert not cfg.state_path.with_suffix(".json.tmp").exists()
 
     def test_corrupt_file_falls_back_to_defaults(self, cfg):
@@ -105,6 +107,7 @@ class TestState:
             "last_opened_ts": {},
             "room_meta": {},
             "space_children": {},
+            "cache_spaces": {},
         }
 
     def test_non_dict_json_falls_back_to_defaults(self, cfg):
@@ -114,6 +117,7 @@ class TestState:
             "last_opened_ts": {},
             "room_meta": {},
             "space_children": {},
+            "cache_spaces": {},
         }
 
     def test_missing_keys_are_added(self, cfg):
@@ -130,6 +134,88 @@ class TestState:
         state = cfg.load_state()
         assert state["last_event_ts"] == {}
         assert state["last_opened_ts"] == {}
+
+
+class TestTimelineCache:
+    @pytest.fixture(autouse=True)
+    def no_keychain(self, monkeypatch):
+        monkeypatch.setattr(
+            Config, "get_or_create_store_key", lambda self: "key-one"
+        )
+
+    def test_roundtrip(self, cfg):
+        payload = {"user_id": "@me:hs", "timelines": {"!r:hs": [{"body": "hi"}]}}
+        cfg.save_timeline_cache(payload)
+        assert cfg.load_timeline_cache() == payload
+        assert not cfg._timeline_cache_path.with_suffix(".cache.tmp").exists()
+
+    def test_file_is_not_plaintext(self, cfg):
+        cfg.save_timeline_cache({"body": "a very secret message"})
+        blob = cfg._timeline_cache_path.read_bytes()
+        assert b"very secret" not in blob
+
+    def test_missing_file_is_none(self, cfg):
+        assert cfg.load_timeline_cache() is None
+
+    def test_corrupt_file_is_none(self, cfg):
+        cfg._timeline_cache_path.write_bytes(b"\x01" + b"garbage" * 20)
+        assert cfg.load_timeline_cache() is None
+        cfg._timeline_cache_path.write_bytes(b"short")
+        assert cfg.load_timeline_cache() is None
+
+    def test_wrong_key_is_none(self, cfg, monkeypatch):
+        cfg.save_timeline_cache({"user_id": "@me:hs"})
+        monkeypatch.setattr(
+            Config, "get_or_create_store_key", lambda self: "key-two"
+        )
+        # A fresh instance so the derived key cached on ``cfg`` is not reused.
+        assert replace(cfg).load_timeline_cache() is None
+
+    def test_clear_is_idempotent(self, cfg):
+        cfg.save_timeline_cache({})
+        cfg.clear_timeline_cache()
+        assert not cfg._timeline_cache_path.exists()
+        cfg.clear_timeline_cache()
+
+    def test_room_archive_roundtrip_and_clear(self, cfg):
+        payload = {"user_id": "@me:hs", "room_id": "!r:hs", "messages": []}
+        cfg.save_room_archive("!r:hs", payload)
+        path = cfg._room_archive_path("!r:hs")
+        assert path.exists()
+        # sha256 filename: no room id leaks into a directory listing.
+        assert "!r" not in path.name and path.name.endswith(".cache")
+        assert cfg.load_room_archives() == [payload]
+        cfg.clear_room_archive("!r:hs")
+        assert cfg.load_room_archives() == []
+        cfg.clear_room_archive("!r:hs")  # idempotent
+
+    def test_clear_timeline_cache_removes_room_archives_too(self, cfg):
+        cfg.save_timeline_cache({})
+        cfg.save_room_archive("!r:hs", {"room_id": "!r:hs"})
+        cfg.clear_timeline_cache()
+        assert not cfg._timeline_cache_path.exists()
+        assert cfg.load_room_archives() == []
+
+    def test_unreadable_room_archive_is_skipped(self, cfg):
+        cfg.save_room_archive("!r:hs", {"room_id": "!r:hs"})
+        cfg._room_archive_path("!bad:hs").write_bytes(b"\x01" + b"junk" * 20)
+        assert [p["room_id"] for p in cfg.load_room_archives()] == ["!r:hs"]
+
+
+class TestCacheMessagesSetting:
+    def test_defaults_true_and_parses_false(self, tmp_path):
+        assert Config.load(minimal_config(tmp_path)).cache_messages is True
+        path = write_config(
+            tmp_path,
+            "[matrix]\nhomeserver = https://hs.example\nuser_id = @me:hs.example\n"
+            "\n[cache]\nmessages = false\n",
+        )
+        assert Config.load(path).cache_messages is False
+
+    def test_template_documents_the_section(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            Config.load(tmp_path / "config.ini")
+        assert "[cache]" in (tmp_path / "config.ini").read_text()
 
 
 class TestVersion:
