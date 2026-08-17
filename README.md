@@ -9,9 +9,10 @@ The home screen shows three columns:
 
 - **Spaces**: your spaces; selecting one lists its rooms below, sorted
   unread-first.
-- **Recent + Favourites**: the five rooms you last opened, then rooms and
-  DMs tagged as favourite (toggle with `f`). Pending invites appear above
-  these when there are any.
+- **Recent + Favourites**: the rooms you last opened, then rooms and DMs
+  tagged as favourite (toggle with `f`). Each section shows five rows by
+  default and can be resized with `+` / `-` (see below). Pending invites
+  appear above these when there are any.
 - **DMs**: one entry per person, most recently active first, with unread
   counts and online indicators.
 
@@ -107,6 +108,12 @@ On the home screen:
 - `f`: toggle favourite on the selected room or DM (the label reads
   `Favourite` or `Unfavourite` to match the selected row, and disappears on
   rows that cannot be tagged)
+- `+` / `-`: grow / shrink the section the cursor is in, for Recent and
+  Favourites (vim's `Ctrl-W +`/`-` window resize boiled down to one key;
+  `=` works as an unshifted `+`). Neither section goes below five rows, and
+  growth stops where it would squeeze the other section or run off the
+  screen; shrinking the terminal takes rows back automatically, and the
+  sizes are remembered across sessions
 - `?`: about box
 - `q`: quit, from the home screen only; on any other page `q` returns
   straight to the home screen instead (`Ctrl+Q` and the `Ctrl+P` command
@@ -137,12 +144,19 @@ In a room:
     mouse-clickable (`Open link`): open it with the system's default browser.
     Only `http(s)` links are picked up.
 
-  A message with several of those (more than one link, or a file with a link
-  in its caption) shows a popup to pick which (`Message actions`). Every popup
+  A message with several of those (more than one link, a file with a link in
+  its caption, or reactions on top of either) shows a popup to pick which
+  (`Message actions`), with `Who reacted` among the choices where it applies.
+  Every popup
   takes `j`/`k` or `↓`/`↑` to choose, `Enter` to confirm, and `Esc` to cancel.
-- `Space`: preview the selected image upload right in the terminal, scaled
-  to the window and rescaled live when the window resizes (a gimmick, but a
-  useful one). Two styles, flipped with `~` inside the preview and remembered
+- `Space`: peek at the selected message; a second `Space` closes what the
+  first one opened. On a message wearing a reaction badge it shows **who
+  reacted**: a line per emoji naming everyone who sent it, in the same
+  colors the timeline gives those people. On an image upload it previews
+  the image right in the terminal instead, scaled to the window and
+  rescaled live when the window resizes (a gimmick, but a useful one); a
+  reacted image keeps `Space` for the preview, with its reactions in
+  `Enter`'s actions menu. Two styles, flipped with `~` inside the preview and remembered
   across sessions: truecolor half-blocks (the default), and classic ASCII art
   built from a configurable character ramp (`[preview] ascii_ramp` in
   `config.ini`; the default is
@@ -185,10 +199,15 @@ In a room:
   with its current text and sends the correction as a Matrix edit)
 - `d`: delete the selected message, when it is your own; a confirmation
   popup gates it (Enter confirms, Esc backs out)
+- `a`: react to the selected message: digits `1`-`9` send from a quick row
+  instantly, `/` searches every emoji by Unicode name (`giraff` finds 🦒).
+  Picking one you already sent takes it back; the quick row ticks those
 - `/`: search the loaded history of this room (accent-insensitive, newest
-  hit first); `Enter` jumps the selection to the picked message. It searches
-  what has been loaded this visit, including anything paged back, not the
-  server's full archive.
+  hit first). The query matches the message text, the sender's display
+  name, or their matrix id, so `agnes` finds what Ágnes said as well as
+  messages that mention her. `Enter` jumps the selection to the picked
+  message. It searches what has been loaded this visit, including anything
+  paged back, not the server's full archive.
 - `l` / `h`: unfold / fold the selected message's thread in place. `l` on a
   message with a `⤷ N replies` badge opens its replies inline (indented,
   fetched in full from the server); `l` again steps into the first reply.
@@ -261,6 +280,11 @@ history.
   trust this one.
 - Room-opening recency (used for sorting) is tracked locally; it starts empty
   until you open some rooms.
+- Only one instance runs at a time: a second launch exits immediately with a
+  message naming the first one's pid, because two instances would corrupt
+  the shared encryption store and caches. The lock is released by the OS
+  when the process ends, however it ends, so a crashed or killed instance
+  never blocks the next launch.
 
 ## Development
 
