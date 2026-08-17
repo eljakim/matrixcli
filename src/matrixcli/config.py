@@ -25,11 +25,13 @@ Three kinds of persistence live here:
 from __future__ import annotations
 
 import configparser
+import fcntl
 import hashlib
 import json
 import os
 import secrets
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -163,6 +165,32 @@ class Config:
         store_path.chmod(0o700)  # tighten if it pre-existed under a looser mode
         state_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Atomic writes use pid-suffixed *.tmp names; a crash between write
+        # and rename strands one, and nothing else ever deletes it. Only
+        # touch files at least an hour old: a fresh one may be another
+        # instance's in-flight write, and unlinking it would crash them.
+        # The patterns stay anchored to our own tmp naming because
+        # state_path/store_path are user-configurable, and a bare *.tmp
+        # glob over a shared directory would eat other apps' files.
+        cutoff = time.time() - 3600
+        sweeps = [
+            (state_path.parent, state_path.name + ".*.tmp"),
+            (state_path.parent, state_path.name + ".tmp"),
+            (store_path, "*.cache.*.tmp"),
+            (store_path, "*.cache.tmp"),
+            (store_path / "media", "*.cache.*.tmp"),
+            (store_path / "media", "*.cache.tmp"),
+            (store_path / "archive", "*.cache.*.tmp"),
+            (store_path / "archive", "*.cache.tmp"),
+        ]
+        for directory, pattern in sweeps:
+            for stale in directory.glob(pattern):
+                try:
+                    if stale.stat().st_mtime < cutoff:
+                        stale.unlink()
+                except OSError:
+                    pass
+
         try:
             allow_unverified = m.getboolean("allow_unverified", fallback=True)
         except ValueError:
@@ -277,10 +305,46 @@ class Config:
                 state[key] = {}
         return state
 
+    def acquire_instance_lock(self) -> None:
+        """Exclusive advisory lock held for the process lifetime, released by
+        the OS on any exit. Two live instances share the nio crypto store,
+        state.json, and the caches as unlocked whole-file writes: the loser's
+        stale one-time-key state makes new messages permanently undecryptable,
+        and its stale saves silently revert the other's cached history and
+        privacy opt-outs. Raises SystemExit when another instance holds it."""
+        path = self.store_path / "instance.lock"
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            holder = os.pread(fd, 32, 0).decode(errors="replace").strip()
+            os.close(fd)
+            raise SystemExit(
+                "Another matrixcli instance is already running"
+                + (f" (pid {holder})" if holder else "")
+                + ". A second instance would corrupt the shared encryption "
+                "store and caches; close it first."
+            )
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, str(os.getpid()).encode(), 0)
+        self._instance_lock_fd = fd
+
     def save_state(self, state: dict) -> None:
-        tmp = self.state_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(state))
-        tmp.replace(self.state_path)
+        # The tmp name carries the pid: with a fixed name, a second running
+        # instance can rename the file away between our write and replace,
+        # crashing this one with FileNotFoundError.
+        tmp = self.state_path.with_name(f"{self.state_path.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(json.dumps(state))
+            tmp.replace(self.state_path)
+        except OSError:
+            # This snapshot only speeds up the next launch; a failed write
+            # (disk full, dir deleted, permissions) must degrade to stale
+            # data then, not crash the TUI out of a background worker.
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     # --- Encrypted timeline cache (decrypted message windows at rest) ---
 
@@ -323,7 +387,7 @@ class Config:
         nonce = secrets.token_bytes(16)
         cipher = AES.new(self._timeline_cache_aes_key(), AES.MODE_GCM, nonce=nonce)
         ciphertext, tag = cipher.encrypt_and_digest(json.dumps(payload).encode())
-        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         tmp.write_bytes(b"\x01" + nonce + tag + ciphertext)
         tmp.replace(path)
 
@@ -370,7 +434,7 @@ class Config:
         cipher = AES.new(self._timeline_cache_aes_key(), AES.MODE_GCM, nonce=nonce)
         ciphertext, tag = cipher.encrypt_and_digest(data)
         path = self._media_cache_path(key)
-        tmp = path.with_suffix(".cache.tmp")
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         tmp.write_bytes(b"\x02" + nonce + tag + ciphertext)
         tmp.replace(path)
         # Prune oldest-first past the cap, so a scroll through a photo-heavy

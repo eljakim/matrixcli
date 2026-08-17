@@ -11,6 +11,7 @@ from matrixcli.app import (
     DownloadScreen,
     HistoryScreen,
     HomeScreen,
+    PreviewScreen,
     ReactionsScreen,
     RoomScreen,
     ThreadScreen,
@@ -260,7 +261,6 @@ class TestActionOpen:
         cases = {
             "open_link": self.make_screen("https://a.example"),
             "open_download": self.make_screen("f.png", media_url="mxc://x/y"),
-            "open_reactions": self.make_screen("hot take", reactions=[("👍", 2)]),
             "open_actions": self.make_screen(
                 "f.png https://a.example", media_url="mxc://x/y"
             ),
@@ -273,6 +273,14 @@ class TestActionOpen:
         plain = self.make_screen("nothing to do here")
         assert not any(plain.check_action(a, None) for a in cases)
 
+    def test_enter_leaves_a_reactions_only_message_to_the_spacebar(self):
+        # The popup moved to the spacebar: Enter's footer must not promise
+        # it too, so no Enter label lights up on a reactions-only message.
+        screen = self.make_screen("hot take", reactions=[("👍", 2)])
+        for action in ("open_link", "open_download", "open_actions"):
+            assert screen.check_action(action, None) is False
+        assert screen.check_action("show_reactions", None) is True
+
     def test_the_footer_offers_shift_enter_only_where_there_is_history(self):
         for message, expected in (
             (self.make_screen("x", edited_ts=200), True),
@@ -281,6 +289,75 @@ class TestActionOpen:
             (self.make_screen("plain https://a.example"), False),
         ):
             assert message.check_action("open_details", None) is expected
+
+
+class TestSpacebar:
+    """Space peeks at the selected message: the in-terminal preview on an
+    image, the who-reacted popup on any other message wearing badges, and a
+    second space closes what the first one opened."""
+
+    def make_screen(self, body="", reactions=(), **kw):
+        screen = TestActionOpen.Screen(make_entry())
+        screen.messages = [
+            Message(sender="@a:hs", sender_name="A", body=body, ts=1, event_id="$1", **kw)
+        ]
+        screen.selected = 0
+        screen.reactions = list(reactions)
+        return screen
+
+    def test_footer_offers_exactly_one_space_action(self):
+        image = self.make_screen(
+            "pic.png", media_url="mxc://x/y", media_mime="image/png"
+        )
+        assert image.check_action("preview_image", None) is True
+        assert image.check_action("show_reactions", None) is False
+        reacted = self.make_screen("hot take", reactions=[("👍", 2)])
+        assert reacted.check_action("preview_image", None) is False
+        assert reacted.check_action("show_reactions", None) is True
+        plain = self.make_screen("plain")
+        assert plain.check_action("preview_image", None) is False
+        assert plain.check_action("show_reactions", None) is False
+
+    def test_space_opens_who_reacted(self):
+        screen = self.make_screen("hot take", reactions=[("👍", 2)])
+        screen.action_show_reactions()
+        assert isinstance(screen.pushed[0], ReactionsScreen)
+
+    def test_space_does_nothing_without_reactions(self):
+        screen = self.make_screen("plain")
+        screen.action_show_reactions()
+        assert screen.pushed == []
+
+    def test_reacted_image_keeps_space_for_the_preview(self):
+        screen = self.make_screen(
+            "pic.png",
+            media_url="mxc://x/y",
+            media_mime="image/png",
+            reactions=[("👍", 2)],
+        )
+        assert screen.check_action("preview_image", None) is True
+        assert screen.check_action("show_reactions", None) is False
+        # Its reactions stay reachable through Enter's actions menu.
+        assert screen.check_action("open_actions", None) is True
+
+    def test_deleted_message_hides_its_reactions_from_space_too(self):
+        screen = self.make_screen("kept", reactions=[("👍", 2)], redacted_ts=400)
+        assert screen.check_action("show_reactions", None) is False
+        screen.action_show_reactions()
+        assert screen.pushed == []
+
+    def test_space_closes_both_popups(self):
+        def bound(cls):
+            pairs = set()
+            for b in cls.BINDINGS:
+                if isinstance(b, tuple):
+                    pairs.add((b[0], b[1]))
+                else:
+                    pairs.add((b.key, b.action))
+            return pairs
+
+        assert ("space", "cancel") in bound(PreviewScreen)
+        assert ("space", "dismiss") in bound(ReactionsScreen)
 
 
 class TestPickerKeys:
@@ -1400,6 +1477,35 @@ class TestRoomFlows:
         assert back == "RoomScreen"
         assert selected == 1  # jumped to "from Tashkent"
 
+    def test_slash_search_finds_people_by_name_and_matrix_id(self):
+        history = [
+            Message(sender="@agnes:hs", sender_name="Ágnes", body="hello",
+                    ts=1786400000000, event_id="$by-name"),
+            Message(sender="@b:hs", sender_name="B", body="unrelated",
+                    ts=1786500000000, event_id="$noise"),
+            Message(sender="@carol:hs", sender_name="C", body="hi",
+                    ts=1786600000000, event_id="$by-id"),
+        ]
+
+        def search(query):
+            async def steps(pilot, app, screen, session, calls, composer_area):
+                await pilot.press("slash")
+                await pilot.pause()
+                for ch in query:
+                    await pilot.press(ch)
+                await pilot.pause()
+                await pilot.press("enter")
+                await pilot.pause()
+                return screen.messages[screen.selected].event_id
+
+            return self.run(steps, history=history)
+
+        # The accent-folded display name finds Ágnes's message even though
+        # its body never mentions her.
+        assert search("agnes") == "$by-name"
+        # The matrix id works when only the account name is known.
+        assert search("carol") == "$by-id"
+
     def test_q_leaves_the_room_instead_of_quitting(self):
         async def steps(pilot, app, screen, session, calls, composer_area):
             await pilot.press("q")
@@ -1539,6 +1645,7 @@ class TestHomeKeys:
             state={},
             dashboard=lambda selected_space: data,
             space_cache_enabled=lambda space_id: True,
+            section_rows=lambda section: 5,
         )
 
         class HomeApp(App):
@@ -1610,6 +1717,7 @@ class TestHomeKeys:
             state={},
             dashboard=lambda selected_space: data,
             space_cache_enabled=lambda space_id: True,
+            section_rows=lambda section: 5,
         )
 
         class HomeApp(App):
@@ -1667,6 +1775,218 @@ class TestHomeKeys:
             ("other_rooms", 0),
         ]
         assert self.walk("hjjjj")[-1] == ("space_rooms", 1)
+
+
+class TestSectionRows:
+    """+/- on the dashboard's Recent/Favourites adjust that section's row
+    budget: floored at MIN_SECTION_ROWS, capped at what the middle column
+    fits, clamped back down when the terminal shrinks, and persisted."""
+
+    def run_home(self, steps, state=None):
+        from textual.app import App
+
+        def rooms(names, **kw):
+            return [make_entry(room_id=f"!{n}:hs", title=n, **kw) for n in names]
+
+        saved = []
+        st = dict(state or {})
+
+        def section_rows(section):
+            try:
+                return max(5, int(st.get(f"{section}_rows") or 0))
+            except (TypeError, ValueError):
+                return 5
+
+        session = SimpleNamespace(
+            cfg=SimpleNamespace(
+                user_id="@me:hs",
+                save_state=lambda s: saved.append(dict(s)),
+                cache_messages=True,
+            ),
+            state=st,
+            dashboard=lambda selected_space: {
+                "spaces": rooms(["Space1"], is_space=True),
+                "space_rooms": rooms(["RoomA"]),
+                "others": [],
+                "invites": [],
+                "recent": rooms(["Chat1", "Chat2"]),
+                "favourites": rooms(["Fav1"]),
+                "dms": rooms(["Dana"], is_direct=True),
+            },
+            space_cache_enabled=lambda space_id: True,
+            section_rows=section_rows,
+        )
+
+        class HomeApp(App):
+            def on_mount(self):
+                self.session = session
+                return self.push_screen(HomeScreen())
+
+        async def go():
+            app = HomeApp()
+            async with app.run_test(size=(90, 24)) as pilot:
+                await pilot.pause()
+                return await steps(pilot, app.screen)
+
+        return asyncio.run(go()), st, saved
+
+    def test_plus_grows_the_focused_section_up_to_the_fit(self):
+        async def steps(pilot, screen):
+            budget = screen._rows_budget()
+            for _ in range(20):  # far past the ceiling: growth must stop
+                await pilot.press("plus")
+                await pilot.pause()
+            return budget
+
+        budget, state, saved = self.run_home(steps)
+        assert budget >= 10  # sanity: the floors fit at this size
+        # Recent grew to every free line; Favourites kept its floor.
+        assert state["recent_rows"] == budget - 5
+        assert "favourites_rows" not in state
+        assert saved  # persisted along the way
+
+    def test_each_section_grows_independently(self):
+        async def steps(pilot, screen):
+            await pilot.press("j")  # bottom of Recent
+            await pilot.press("j")  # spills into Favourites
+            await pilot.press("plus")
+            await pilot.pause()
+
+        _, state, _ = self.run_home(steps)
+        assert state.get("favourites_rows") == 6
+        assert "recent_rows" not in state
+
+    def test_minus_never_goes_below_the_floor(self):
+        async def steps(pilot, screen):
+            await pilot.press("minus")
+            await pilot.pause()
+
+        _, state, saved = self.run_home(steps)
+        assert "recent_rows" not in state
+        assert saved == []
+
+    def test_grow_then_shrink_round_trips(self):
+        async def steps(pilot, screen):
+            for key in ("plus", "plus", "minus"):
+                await pilot.press(key)
+                await pilot.pause()
+
+        _, state, _ = self.run_home(steps)
+        assert state["recent_rows"] == 6
+
+    def test_shrinking_terminal_claws_rows_back(self):
+        async def steps(pilot, screen):
+            budget = screen._rows_budget()
+            screen._clamp_section_rows()
+            await pilot.pause()
+            return budget
+
+        budget, state, saved = self.run_home(
+            steps, state={"recent_rows": 99, "favourites_rows": 6}
+        )
+        # The oversized section is trimmed first, down to what fits beside
+        # the other one; neither ends below the floor.
+        assert state["recent_rows"] + state["favourites_rows"] == budget
+        assert state["recent_rows"] >= 5 and state["favourites_rows"] >= 5
+        assert saved
+
+
+class TestOpenRoomRefresh:
+    """Opening a room from the dashboard rebuilds the covered home screen
+    right away (recency to the top, badge cleared, stale cleared), so Esc
+    back to it finds an unchanged signature and repaints nothing: the
+    Recent list must not reorder in front of the user."""
+
+    def test_recent_reorders_behind_the_room_not_on_return(self):
+        from textual.app import App
+        from textual.widgets import ListView
+
+        from matrixcli.app import MatrixApp
+
+        opened = []
+        st = {"last_opened_ts": {"!Chat1:hs": 2, "!Chat2:hs": 1}}
+
+        def rooms(names, **kw):
+            return [make_entry(room_id=f"!{n}:hs", title=n, **kw) for n in names]
+
+        def dashboard(selected_space):
+            order = sorted(
+                ["Chat1", "Chat2"],
+                key=lambda n: -st["last_opened_ts"].get(f"!{n}:hs", 0),
+            )
+            return {
+                "spaces": [],
+                "space_rooms": [],
+                "others": [],
+                "invites": [],
+                "recent": rooms(order),
+                "favourites": rooms(["Fav1"]),
+                "dms": [],
+            }
+
+        def note_opening(rid):
+            opened.append(rid)
+            st["last_opened_ts"][rid] = max(st["last_opened_ts"].values()) + 1
+
+        session = SimpleNamespace(
+            cfg=SimpleNamespace(
+                user_id="@me:hs",
+                save_state=lambda s: None,
+                cache_messages=True,
+            ),
+            state=st,
+            dashboard=dashboard,
+            space_cache_enabled=lambda space_id: True,
+            section_rows=lambda section: 5,
+            note_opening=note_opening,
+            my_name="Me",
+            client=SimpleNamespace(rooms={}),
+            last_event_id={},
+            load_history=lambda room_id, limit=40, cached_only=False: _async([]),
+            mark_read=lambda room_id: _async(None),
+            start_backfill=lambda room_id: None,
+            reset_pagination=lambda room_id: None,
+            drafts={},
+            reaction_summary=lambda room_id, event_id: [],
+        )
+
+        class HomeApp(App):
+            open_room = MatrixApp.open_room
+
+            def on_mount(self):
+                self.session = session
+                self.last_sync_at = None
+                self.sync_ok = True
+                return self.push_screen(HomeScreen())
+
+        async def go():
+            app = HomeApp()
+            async with app.run_test(size=(90, 24)) as pilot:
+                await pilot.pause()
+                home = app.screen
+                await pilot.press("j")  # highlight Chat2 (second row)
+                await pilot.press("enter")  # open it
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                covered_sig = home._last_signature
+                in_room = type(app.screen).__name__
+                await pilot.press("escape")
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                first = list(home.query_one("#recent", ListView).children)[0]
+                return (
+                    in_room,
+                    covered_sig,
+                    home._last_signature,
+                    first.entry.room_id,
+                )
+
+        in_room, covered_sig, resumed_sig, top = asyncio.run(go())
+        assert opened == ["!Chat2:hs"]
+        assert in_room == "RoomScreen"
+        # The reorder happened while covered; the resume changed nothing.
+        assert resumed_sig == covered_sig
+        assert top == "!Chat2:hs"
 
 
 class TestBrowseHistory:

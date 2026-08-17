@@ -3418,3 +3418,188 @@ class TestPreviewCache:
         assert session.cfg.load_media_cache("mxc://hs/pic") is None
         ok, _ = asyncio.run(session.fetch_preview_bytes(m, 100, 100, "!r:hs"))
         assert ok and len(calls) == 1  # in-memory layer is room-agnostic
+
+
+class TestSectionRows:
+    def test_recent_and_favourites_honour_the_stored_budget(
+        self, session, fake_room
+    ):
+        for i in range(12):
+            rid = f"!r{i}:hs"
+            session.client.rooms[rid] = fake_room(
+                rid, display_name=f"R{i}", tags={"m.favourite": {}}
+            )
+            session.state["last_opened_ts"][rid] = i + 1
+        data = session.dashboard()
+        assert len(data["recent"]) == 5
+        assert len(data["favourites"]) == 5
+        session.state["recent_rows"] = 8
+        session.state["favourites_rows"] = 7
+        data = session.dashboard()
+        assert len(data["recent"]) == 8
+        assert len(data["favourites"]) == 7
+
+    def test_budget_floor_beats_garbage_and_small_values(self, session):
+        for value in (2, 0, -3, "nonsense", None, 4.9):
+            session.state["recent_rows"] = value
+            assert session.section_rows("recent") == 5
+        session.state["recent_rows"] = 9
+        assert session.section_rows("recent") == 9
+
+
+class TestNoteOpening:
+    def test_moves_room_to_top_and_clears_badges_eagerly(self, session, fake_room):
+        a = fake_room("!a:hs", display_name="A", unread=3, highlights=1)
+        b = fake_room("!b:hs", display_name="B")
+        session.client.rooms.update({"!a:hs": a, "!b:hs": b})
+        session.state["last_opened_ts"] = {"!a:hs": 100, "!b:hs": 200}
+        session.state["room_meta"]["!a:hs"] = {
+            "title": "A",
+            "unread": 3,
+            "highlights": 1,
+        }
+        assert [e.room_id for e in session.dashboard()["recent"]] == [
+            "!b:hs",
+            "!a:hs",
+        ]
+        session.note_opening("!a:hs")
+        data = session.dashboard()
+        assert [e.room_id for e in data["recent"]] == ["!a:hs", "!b:hs"]
+        assert data["recent"][0].unread == 0
+        assert data["recent"][0].highlights == 0
+        assert session.state["room_meta"]["!a:hs"]["unread"] == 0
+        # Persisted: the next launch starts with the same order.
+        assert session.cfg.load_state()["last_opened_ts"]["!a:hs"] > 200
+
+
+class TestLeftRoomPurge:
+    """A leave synced from another client must purge every trace of the room.
+    nio keeps left rooms in client.rooms (it only removes them on forget(),
+    which this app never sends), and before the fix the dashboard rebuild in
+    the same tick wrote the popped room_meta snapshot straight back, so the
+    room came back as a phantom on every future launch."""
+
+    def test_leave_purges_state_and_live_room(self, session, fake_room):
+        session.client.rooms["!gone:hs"] = fake_room("!gone:hs", display_name="Gone")
+        session.state["room_meta"]["!gone:hs"] = {"title": "Gone"}
+        session.state["last_event_ts"]["!gone:hs"] = 100
+        session.state["last_opened_ts"]["!gone:hs"] = 100
+        resp = SimpleNamespace(
+            rooms=SimpleNamespace(join={}, leave={"!gone:hs": SimpleNamespace()})
+        )
+        session._record_room_timestamps(resp)
+        assert "!gone:hs" not in session.client.rooms
+        for key in ("room_meta", "last_event_ts", "last_opened_ts"):
+            assert "!gone:hs" not in session.state[key]
+        # The same-tick dashboard rebuild must not resurrect it, in memory
+        # or in the persisted snapshot.
+        assert all(e.room_id != "!gone:hs" for e in session.dashboard()["all"])
+        assert "!gone:hs" not in session.cfg.load_state()["room_meta"]
+
+
+class TestFavouriteTagSync:
+    def test_unfavourite_echo_heals_snapshot_and_sticks(self, session, fake_room):
+        room = fake_room("!r:hs", display_name="R")
+        session.client.rooms["!r:hs"] = room
+        session.state["room_meta"]["!r:hs"] = {
+            "title": "R",
+            "is_space": False,
+            "person": "",
+            "is_favourite": True,
+            "unread": 0,
+            "highlights": 0,
+        }
+        # Tags never synced this session: the snapshot rescue must hold.
+        assert [e.room_id for e in session.dashboard()["favourites"]] == ["!r:hs"]
+        # The tag deletion echoes back as an empty tags dict, which room.tags
+        # alone cannot tell apart from "never synced"; before the fix the
+        # rescue re-favourited the room forever.
+        session._on_tags(room, SimpleNamespace(tags={}))
+        assert session.state["room_meta"]["!r:hs"]["is_favourite"] is False
+        assert session.dashboard()["favourites"] == []
+        assert session.cfg.load_state()["room_meta"]["!r:hs"]["is_favourite"] is False
+
+    def test_favourite_added_elsewhere_updates_snapshot(self, session, fake_room):
+        room = fake_room("!r:hs", tags={"m.favourite": {"order": 0.5}})
+        session.client.rooms["!r:hs"] = room
+        session.state["room_meta"]["!r:hs"] = {"title": "R", "is_favourite": False}
+        session._on_tags(room, SimpleNamespace(tags={"m.favourite": {"order": 0.5}}))
+        assert session.state["room_meta"]["!r:hs"]["is_favourite"] is True
+
+
+class TestCacheSaveRecheck:
+    def test_dirtiness_during_threaded_write_chains_followup(
+        self, session, monkeypatch
+    ):
+        import threading
+
+        calls = []
+        gate = threading.Event()
+
+        def fake_write(payload, writes):
+            calls.append(1)
+            if len(calls) == 1:
+                gate.wait(10)
+
+        monkeypatch.setattr(session, "_write_cache_files", fake_write)
+        session._cache_dirty = True
+        session._cache_saved_at = 0.0
+
+        async def main():
+            session._maybe_save_timelines()
+            assert session._cache_saving
+            # What set_space_cache does when the user opts a space out while
+            # a write is in flight; before the fix this bounced off the
+            # _cache_saving guard and the promised immediate purge silently
+            # waited for the next sync tick.
+            session._cache_dirty = True
+            session._cache_saved_at = 0.0
+            session._maybe_save_timelines()
+            gate.set()
+            # Await the chain the way close() does.
+            while (
+                session._cache_save_task is not None
+                and not session._cache_save_task.done()
+            ):
+                await session._cache_save_task
+
+        asyncio.run(main())
+        assert len(calls) == 2
+        assert not session._cache_dirty
+
+
+class TestDownloadWriteFailure:
+    def test_partial_file_is_removed_and_name_stays_free(
+        self, session, monkeypatch, tmp_path
+    ):
+        import os
+
+        async def fetched(message):
+            return True, b"payload"
+
+        monkeypatch.setattr(session, "fetch_media_bytes", fetched)
+        message = SimpleNamespace(media_name="file.bin", body="file.bin")
+
+        class Exploding:
+            def __init__(self, fd, mode):
+                os.close(fd)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def write(self, data):
+                raise OSError(28, "No space left on device")
+
+        with monkeypatch.context() as m:
+            m.setattr("os.fdopen", Exploding)
+            ok, err = asyncio.run(session.download_media(message, tmp_path))
+        assert ok is False and "write failed" in err
+        # The truncated file must not survive wearing the real name...
+        assert not (tmp_path / "file.bin").exists()
+        # ...so the retry lands on the real name, not on "file (1).bin".
+        ok, saved = asyncio.run(session.download_media(message, tmp_path))
+        assert ok and saved == str(tmp_path / "file.bin")
+        assert (tmp_path / "file.bin").read_bytes() == b"payload"

@@ -54,7 +54,13 @@ from rich.text import Text
 
 from nio import SyncResponse
 
-from .client import Entry, MatrixSession, fold_edits, fold_text
+from .client import (
+    MIN_SECTION_ROWS,
+    Entry,
+    MatrixSession,
+    fold_edits,
+    fold_text,
+)
 from .config import Config
 
 
@@ -494,17 +500,21 @@ class RoomScreen(Screen):
         ("h", "collapse", "Fold thread"),
         ("u", "first_unread", "First unread"),
         Binding("slash", "search_room", "Search", show=False),
-        # One key, four labels: check_action leaves exactly the one enabled
+        # One key, three labels: check_action leaves exactly the one enabled
         # that says what Enter will do to the selected message (nothing at all
         # for a plain one), so the footer never promises what it cannot do.
+        # The reactions popup is the spacebar's job below; Enter reaches it
+        # only through the actions menu of a message that offers more.
         Binding("enter", "open_download", "Download"),
         Binding("enter", "open_link", "Open link"),
-        Binding("enter", "open_reactions", "Who reacted"),
         Binding("enter", "open_actions", "Message actions"),
-        # Gated by check_action to image uploads: an in-terminal rendering of
-        # the picture, ASCII art or truecolor half-blocks ("~" in the popup
-        # flips between them).
+        # Two bindings share the spacebar like the "t"/"c" pairs: an image
+        # upload gets an in-terminal rendering of the picture (ASCII art or
+        # truecolor half-blocks, "~" in the popup flips between them), any
+        # other message wearing reaction badges opens who sent them. Inside
+        # either popup the spacebar closes it again, so the key is a toggle.
         ("space", "preview_image", "Preview"),
+        Binding("space", "show_reactions", "Who reacted"),
         # Enter acts on what a message says; Shift+Enter looks behind it, at
         # the versions of an edited one or the text of a deleted one.
         Binding("shift+enter", "open_details", "Show history"),
@@ -1512,13 +1522,31 @@ class RoomScreen(Screen):
             if self.selected >= len(self.messages):
                 return False
             return _is_image(self.messages[self.selected])
+        if action == "show_reactions":
+            if self.selected >= len(self.messages):
+                return False
+            m = self.messages[self.selected]
+            # Deleted messages hide their reactions (as on Enter), and on an
+            # image the spacebar is taken by the preview: its reactions stay
+            # reachable through Enter's actions menu.
+            return not m.redacted_ts and not _is_image(m) and bool(
+                self.app.session.reaction_summary(self.entry.room_id, m.event_id)
+            )
         if action.startswith("open_"):
             actions = self._selected_actions()
             if not actions:
                 return False
             if len(actions) > 1:
                 return action == "open_actions"
-            return action == f"open_{actions[0][1][0]}"
+            kind = actions[0][1][0]
+            if kind == "reactions":
+                # The spacebar owns the reactions popup: a message whose only
+                # Enter action is its reactions is never an image (images
+                # always offer a download too), so its spacebar is free, and
+                # a second footer entry promising the popup on Enter would be
+                # noise.
+                return False
+            return action == f"open_{kind}"
         return True
 
     def _toggle_threads(self) -> None:
@@ -1877,15 +1905,22 @@ class RoomScreen(Screen):
             when_closed,
         )
 
-    # Four names for one key: check_action enables exactly the one that
+    def action_show_reactions(self) -> None:
+        """Space on a reacted message: who is behind each badge."""
+        if self.selected >= len(self.messages):
+            return
+        m = self.messages[self.selected]
+        if m.redacted_ts or _is_image(m):
+            return
+        if self.app.session.reaction_summary(self.entry.room_id, m.event_id):
+            self.app.push_screen(ReactionsScreen(self.entry, m))
+
+    # Three names for one key: check_action enables exactly the one that
     # describes what Enter will do here, so the footer names it.
     def action_open_download(self) -> None:
         self._open_selected()
 
     def action_open_link(self) -> None:
-        self._open_selected()
-
-    def action_open_reactions(self) -> None:
         self._open_selected()
 
     def action_open_actions(self) -> None:
@@ -2417,6 +2452,8 @@ class PreviewScreen(ModalScreen):
     BINDINGS = [
         ("escape", "cancel", "Close"),
         Binding("q", "cancel", "Close", show=False),
+        # The key that opened the preview closes it: space is a toggle.
+        Binding("space", "cancel", "Close", show=False),
         # Gated by check_action to whether another image exists in that
         # direction, so the footer drops them at the ends of the gallery.
         ("j", "next_image", "Next image"),
@@ -2691,11 +2728,14 @@ class HistoryScreen(ModalScreen):
 
 class ReactionsScreen(ModalScreen):
     """Who is behind each reaction badge on one message: a line per emoji
-    with the names of everyone who sent it. Escape or Enter closes it."""
+    with the names of everyone who sent it. Escape, Enter, or the spacebar
+    that opened it closes it."""
 
     BINDINGS = [
         ("escape", "dismiss", "Close"),
         ("enter", "dismiss", "Close"),
+        # The key that opened the popup closes it: space is a toggle.
+        Binding("space", "dismiss", "Close", show=False),
         # A well-voted message can outgrow the box; same keys as everywhere.
         Binding("j", "scroll_reactors(1)", "Down", show=False),
         Binding("k", "scroll_reactors(-1)", "Up", show=False),
@@ -2937,10 +2977,12 @@ class CommandScreen(ModalScreen):
 
 class RoomSearchScreen(ModalScreen):
     """"/" inside a room: accent-insensitive search over the loaded history
-    (including anything paged back this visit), newest hit first. Enter
-    dismisses with the chosen message's event id; the room screen jumps its
-    selection there. Searches what is loaded, not the server: at IOI scale
-    that is the recent traffic being triaged."""
+    (including anything paged back this visit), newest hit first. The query
+    matches the message text, the sender's display name, or their matrix id,
+    so "agnes" finds what Ágnes said as well as messages that mention her.
+    Enter dismisses with the chosen message's event id; the room screen jumps
+    its selection there. Searches what is loaded, not the server: at IOI
+    scale that is the recent traffic being triaged."""
 
     BINDINGS = [
         ("escape", "dismiss", "Close"),
@@ -2954,7 +2996,10 @@ class RoomSearchScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="searchbox"):
-            yield Input(placeholder="Search this room's loaded history…", id="q")
+            yield Input(
+                placeholder="Search messages and senders in loaded history…",
+                id="q",
+            )
             yield ListView(id="results")
 
     def on_mount(self) -> None:
@@ -2969,7 +3014,12 @@ class RoomSearchScreen(ModalScreen):
         hits = [
             m
             for m in reversed(self.messages)
-            if m.event_id and q in fold_text(m.body or "")
+            if m.event_id
+            and (
+                q in fold_text(m.body or "")
+                or q in fold_text(m.sender_name or "")
+                or q in fold_text(m.sender or "")
+            )
         ]
         for m in hits[:30]:
             first_line = (m.body or "").strip().splitlines() or [""]
@@ -3124,6 +3174,16 @@ class HomeScreen(Screen):
         # off in config.ini: the per-space toggle would do nothing.
         Binding("c", "cache_off", "Cache: on"),
         Binding("c", "cache_on", "Cache: off"),
+        # Vim's window-resize chord (Ctrl-W +/-) boiled down to a single
+        # key: with the cursor in Recent or Favourites, +/- grows/shrinks
+        # that section's row budget. check_action gates them to those lists
+        # and to what actually fits: neither section ever drops below
+        # MIN_SECTION_ROWS, and growth stops where it would squeeze the
+        # other section or run off the screen. "=" is the unshifted
+        # convenience alias for "+", as in vim's own maps.
+        Binding("plus", "grow_section", "More rows"),
+        Binding("equals_sign", "grow_section", show=False),
+        Binding("minus", "shrink_section", "Fewer rows"),
         ("q", "app.quit", "Quit"),
     ]
 
@@ -3372,7 +3432,92 @@ class HomeScreen(Screen):
             # "cache_off" is the action that turns it off, so it is the one
             # offered (labelled "Cache: on") while caching is enabled.
             return enabled == (action == "cache_off")
+        if action in ("grow_section", "shrink_section"):
+            section = self._resizable_section()
+            if section is None:
+                return False
+            session = self.app.session
+            if action == "shrink_section":
+                return session.section_rows(section) > MIN_SECTION_ROWS
+            return (
+                session.section_rows("recent")
+                + session.section_rows("favourites")
+                < self._rows_budget()
+            )
         return True
+
+    def _resizable_section(self) -> str | None:
+        """"recent" or "favourites" when the focus sits in that list, else
+        None: the +/- row-budget keys only act there."""
+        fid = getattr(self.focused, "id", None)
+        return fid if fid in ("recent", "favourites") else None
+
+    def _rows_budget(self) -> int:
+        """Entry rows the middle column can devote to Recent and Favourites
+        together without scrolling: its height minus the section labels, the
+        invites section when shown, and the lists' own margins."""
+        recent = self.query_one("#recent", ListView)
+        column = recent.parent
+        budget = column.content_size.height
+        for w in column.children:
+            if not w.display:
+                continue
+            margin = w.styles.margin
+            budget -= margin.top + margin.bottom
+            if w.id not in ("recent", "favourites"):
+                budget -= w.outer_size.height
+        return budget
+
+    def action_grow_section(self) -> None:
+        self._resize_section(1)
+
+    def action_shrink_section(self) -> None:
+        self._resize_section(-1)
+
+    def _resize_section(self, delta: int) -> None:
+        section = self._resizable_section()
+        if section is None:
+            return
+        session = self.app.session
+        rows = session.section_rows(section)
+        total = session.section_rows("recent") + session.section_rows("favourites")
+        if delta > 0 and total >= self._rows_budget():
+            return  # no free line without squeezing the other section
+        if delta < 0 and rows <= MIN_SECTION_ROWS:
+            return
+        session.state[f"{section}_rows"] = rows + delta
+        session.cfg.save_state(session.state)
+        self.refresh_bindings()  # +/- appear and vanish with the limits
+        self.run_worker(self.refresh_data())
+
+    def on_resize(self, event) -> None:
+        self._clamp_section_rows()
+
+    def _clamp_section_rows(self) -> None:
+        """A smaller terminal takes stored row budgets back down so both
+        sections still fit, trimming the larger one first, never below the
+        MIN_SECTION_ROWS floor."""
+        budget = self._rows_budget()
+        if budget < 2 * MIN_SECTION_ROWS:
+            return  # not laid out yet, or too small even for the floors
+        session = self.app.session
+        recent = session.section_rows("recent")
+        favs = session.section_rows("favourites")
+        changed = False
+        while recent + favs > budget and (
+            recent > MIN_SECTION_ROWS or favs > MIN_SECTION_ROWS
+        ):
+            if recent >= favs and recent > MIN_SECTION_ROWS:
+                recent -= 1
+            else:
+                favs -= 1
+            changed = True
+        if changed:
+            session.state["recent_rows"] = recent
+            session.state["favourites_rows"] = favs
+            session.cfg.save_state(session.state)
+            self.refresh_bindings()
+            self.run_worker(self.refresh_data())
 
     def action_cache_on(self) -> None:
         self._toggle_cache()
@@ -3532,6 +3677,9 @@ class MatrixApp(App):
         border-left: solid $surface;
     }
     #columns ListView:focus { border-left: solid $accent; }
+    /* Recent and Favourites keep their floor height even half-empty, so the
+       layout does not jump as rooms enter and leave the lists. */
+    #recent, #favourites { min-height: 5; }
     #loadingbox {
         align: center middle;
         height: 1fr;
@@ -3881,6 +4029,17 @@ class MatrixApp(App):
         # replies would otherwise all render with the thread-reply indent).
         screen.threaded = bool(self.session.state.get("threaded_view"))
         self.push_screen(screen)
+        # The dashboard row changes the moment the room opens (to the top of
+        # Recent, badge cleared): apply that and rebuild the home screen now,
+        # invisibly behind the room just pushed, so Esc back to it finds an
+        # unchanged signature and repaints nothing. Without this the reorder
+        # happened at resume, as a flicker in front of the user.
+        self.session.note_opening(entry.room_id)
+        for s in self.screen_stack:
+            if isinstance(s, HomeScreen):
+                s.stale = False  # this rebuild covers anything deferred
+                s.run_worker(s.refresh_data())
+                break
 
     def action_search(self) -> None:
         self.push_screen(SearchScreen())
@@ -3976,12 +4135,34 @@ async def _run_verify(cfg: Config) -> None:
         line = "  ".join(f"{glyph} {name}" for glyph, name in emoji)
         print("\nCompare these emoji with Element:\n")
         print("    " + line + "\n")
+        # A bare input() here would freeze the asyncio loop, stalling the
+        # sync that must keep flushing and receiving to-device verification
+        # events while you decide. to_thread(input) is no good either: the
+        # worker thread stuck in input() cannot be cancelled and is joined
+        # at interpreter shutdown, so Ctrl+C at this prompt wedges the
+        # process until the user also presses Enter. Reading via the event
+        # loop's own readiness watcher keeps the prompt fully cancellable.
+        print("Do they match? [y/N] ", end="", flush=True)
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[str] = loop.create_future()
+
+        def _read_line() -> None:
+            line = sys.stdin.readline()
+            if not fut.done():
+                fut.set_result(line)
+
         try:
-            # Run the blocking read in a thread: a bare input() here would freeze
-            # the asyncio loop, stalling the sync that must keep flushing and
-            # receiving to-device verification events while you decide.
-            raw = await asyncio.to_thread(input, "Do they match? [y/N] ")
-        except EOFError:
+            loop.add_reader(sys.stdin.fileno(), _read_line)
+        except (OSError, ValueError):
+            # stdin is not selectable (e.g. redirected from a regular
+            # file); fall back to the thread, accepting the Ctrl+C wedge.
+            raw = await asyncio.to_thread(sys.stdin.readline)
+        else:
+            try:
+                raw = await fut
+            finally:
+                loop.remove_reader(sys.stdin.fileno())
+        if not raw:  # EOF
             return False
         return raw.strip().lower() in ("y", "yes")
 
@@ -4050,13 +4231,21 @@ def main() -> None:
 
     try:
         cfg = Config.load(Path(args.config).expanduser() if args.config else None)
-    except (FileNotFoundError, ValueError) as exc:
+    except (OSError, ValueError) as exc:
+        # OSError covers more than the missing-config case: a custom
+        # [storage] path can be unwritable or blocked by a same-named file,
+        # and those deserve the same clean message, not a traceback.
         raise SystemExit(str(exc))
 
     if not cfg.homeserver or "@you:" in cfg.user_id or not cfg.user_id:
         raise SystemExit(
             f"Edit {cfg.config_path} with your real homeserver and user id first."
         )
+
+    # Before anything touches the keyring or the store: a second live
+    # instance corrupts the shared crypto store and caches (last writer
+    # wins), so refuse to start while one is running.
+    cfg.acquire_instance_lock()
 
     # Probe the system keyring now: without a usable backend (common on a bare
     # Linux box) every later credential access raises deep inside the running

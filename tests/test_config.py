@@ -98,7 +98,7 @@ class TestState:
         }
         cfg.save_state(state)
         assert cfg.load_state() == {**state, "cache_spaces": {}}
-        assert not cfg.state_path.with_suffix(".json.tmp").exists()
+        assert not list(cfg.state_path.parent.glob("*.tmp"))
 
     def test_corrupt_file_falls_back_to_defaults(self, cfg):
         cfg.state_path.write_text("{not json")
@@ -147,7 +147,7 @@ class TestTimelineCache:
         payload = {"user_id": "@me:hs", "timelines": {"!r:hs": [{"body": "hi"}]}}
         cfg.save_timeline_cache(payload)
         assert cfg.load_timeline_cache() == payload
-        assert not cfg._timeline_cache_path.with_suffix(".cache.tmp").exists()
+        assert not list(cfg.store_path.glob("*.tmp"))
 
     def test_file_is_not_plaintext(self, cfg):
         cfg.save_timeline_cache({"body": "a very secret message"})
@@ -327,6 +327,108 @@ class TestAsciiRamp:
         with pytest.raises(FileNotFoundError):
             Config.load(tmp_path / "config.ini")
         assert "[preview]" in (tmp_path / "config.ini").read_text()
+
+
+class TestAtomicWrites:
+    def test_state_tmp_name_carries_pid(self, cfg, monkeypatch):
+        """Two live instances must never share a tmp name: with the old fixed
+        name, one instance renamed the other's tmp away mid-save and the loser
+        crashed on FileNotFoundError."""
+        import os
+        from pathlib import Path
+
+        seen = []
+        real_replace = Path.replace
+
+        def spy(self, target):
+            seen.append(self.name)
+            return real_replace(self, target)
+
+        monkeypatch.setattr(Path, "replace", spy)
+        cfg.save_state({})
+        assert seen == [f"state.json.{os.getpid()}.tmp"]
+
+    def test_save_state_survives_stolen_tmp(self, cfg, monkeypatch):
+        from pathlib import Path
+
+        def gone(self, target):
+            raise FileNotFoundError(self)
+
+        monkeypatch.setattr(Path, "replace", gone)
+        cfg.save_state({"x": 1})  # must not raise
+
+    def test_save_state_survives_missing_directory(self, cfg):
+        cfg.state_path = cfg.state_path.parent / "nowhere" / "state.json"
+        cfg.save_state({"x": 1})  # must not raise
+        assert not cfg.state_path.exists()
+
+
+class TestStartupSweep:
+    def test_removes_only_our_stale_tmps(self, tmp_path):
+        import os
+        import time
+
+        for d in ("store", "store/media", "store/archive"):
+            (tmp_path / d).mkdir(parents=True, exist_ok=True)
+        stale = [
+            tmp_path / "state.json.123.tmp",
+            tmp_path / "state.json.tmp",  # legacy fixed name
+            tmp_path / "store" / "timelines.cache.99.tmp",
+            tmp_path / "store" / "timelines.cache.tmp",  # legacy
+            tmp_path / "store" / "media" / "ab12.cache.7.tmp",
+            tmp_path / "store" / "archive" / "cd34.cache.7.tmp",
+        ]
+        kept = [
+            # Not ours: state_path.parent is user-configurable, so a bare
+            # *.tmp glob would eat other applications' files.
+            tmp_path / "some-other-app.tmp",
+            # Ours but fresh: may be another instance's in-flight write.
+            tmp_path / "state.json.456.tmp",
+        ]
+        old = time.time() - 7200
+        for f in stale + kept:
+            f.write_text("x")
+        for f in stale + [kept[0]]:
+            os.utime(f, (old, old))
+        Config.load(minimal_config(tmp_path))
+        assert not [f for f in stale if f.exists()]
+        assert all(f.exists() for f in kept)
+
+
+class TestInstanceLock:
+    def test_second_acquire_refused_then_freed_after_kill(self, cfg):
+        """The lock must block a second instance while the holder lives, name
+        the holder's pid, and evaporate when the holder dies without cleanup:
+        flock lives on the fd, so a stale instance.lock file left on disk by
+        a SIGKILLed process must not keep new launches out."""
+        import signal
+        import subprocess
+        import sys
+
+        child = (
+            "import sys, time\n"
+            "from pathlib import Path\n"
+            "from matrixcli.config import Config\n"
+            "cfg = object.__new__(Config)\n"
+            "cfg.store_path = Path(sys.argv[1])\n"
+            "cfg.acquire_instance_lock()\n"
+            "print('locked', flush=True)\n"
+            "time.sleep(60)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", child, str(cfg.store_path)],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert proc.stdout.readline().strip() == "locked"
+            with pytest.raises(SystemExit, match=f"pid {proc.pid}"):
+                cfg.acquire_instance_lock()
+        finally:
+            proc.send_signal(signal.SIGKILL)
+            proc.wait(timeout=10)
+        assert (cfg.store_path / "instance.lock").exists()
+        cfg.acquire_instance_lock()  # stale file, dead holder: must succeed
 
 
 class TestVersion:

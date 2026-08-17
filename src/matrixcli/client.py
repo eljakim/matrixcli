@@ -49,6 +49,7 @@ from nio import (
     RoomMessageMedia,
     RoomMessagesError,
     SyncError,
+    TagEvent,
     ToDeviceError,
     ToDeviceMessage,
     UnknownToDeviceEvent,
@@ -60,6 +61,9 @@ from .config import Config
 
 HISTORY_LIMIT = 40
 TIMELINE_CAP = 200
+# The dashboard's Recent and Favourites sections never show fewer rows than
+# this, whatever +/- or a shrinking terminal ask for.
+MIN_SECTION_ROWS = 5
 # Minimum seconds between read-marker POSTs per room (see mark_read): at peak
 # an open busy room refreshes once per sync tick, and marking every tick sends
 # redundant m.fully_read updates to an already loaded server.
@@ -500,6 +504,7 @@ class MatrixSession:
         self.client.add_event_callback(self._on_message, RoomMessage)
         self.client.add_event_callback(self._on_reaction, ReactionEvent)
         self.client.add_event_callback(self._on_redaction, RedactionEvent)
+        self.client.add_room_account_data_callback(self._on_tags, TagEvent)
         self.client.add_presence_callback(self._on_presence, PresenceEvent)
 
         # nio decrypts a /messages chunk in place before room_messages()
@@ -1049,10 +1054,21 @@ class MatrixSession:
                 await asyncio.to_thread(self._write_cache_files, payload, writes)
             except OSError:
                 # Retry on a later tick; re-dirty exactly what was pending.
+                # The debounce stamp also moves forward so the recheck below
+                # cannot hot-loop against a persistently failing disk.
                 self._cache_dirty = True
                 self._archive_dirty.update(r for r, p in writes if p is not None)
+                self._cache_saved_at = time.monotonic()
             finally:
                 self._cache_saving = False
+            if self._cache_dirty:
+                # Dirtiness that landed during the write bounced off the
+                # _cache_saving guard above. The urgent case is a space
+                # cache opt-out: its purge promised the decrypted text
+                # leaves the disk now, and this in-flight write has just
+                # re-persisted the pre-toggle snapshot, so the purge must
+                # not wait for the next sync tick (which may never come).
+                self._maybe_save_timelines()
 
         self._cache_save_task = asyncio.create_task(write())
 
@@ -1202,8 +1218,16 @@ class MatrixSession:
         left = getattr(getattr(response, "rooms", None), "leave", {}) or {}
         meta = self.state.get("room_meta") or {}
         for room_id in left:
-            if meta.pop(room_id, None) is not None:
-                changed = True
+            for bucket in (meta, self.state["last_event_ts"], self.state["last_opened_ts"]):
+                if bucket.pop(room_id, None) is not None:
+                    changed = True
+            # nio only drops a room from client.rooms on an explicit
+            # forget(), which this app never sends. Left in there, the
+            # dashboard rebuild running later in this same tick would
+            # snapshot the room right back into room_meta, resurrecting
+            # it on every future launch.
+            self.client.rooms.pop(room_id, None)
+            self.client.invited_rooms.pop(room_id, None)
         for room_id, joined in rooms.items():
             # A "limited" timeline means the server skipped events between
             # the last sync and this window: the cache is missing a chunk,
@@ -1243,7 +1267,10 @@ class MatrixSession:
             task.cancel()
         # A threaded cache write may be mid-file; let it finish (or fail)
         # before the final flush, or two writers would race on the tmp file.
-        if self._cache_save_task is not None and not self._cache_save_task.done():
+        # The write task can also chain a follow-up save (dirtiness that
+        # bounced off the in-flight guard), so keep awaiting until no live
+        # task remains; the sync loop is stopped here, so the chain is finite.
+        while self._cache_save_task is not None and not self._cache_save_task.done():
             try:
                 await self._cache_save_task
             except Exception:
@@ -2041,6 +2068,17 @@ class MatrixSession:
             )
         return entries
 
+    def section_rows(self, section: str) -> int:
+        """The dashboard row budget for the Recent or Favourites section,
+        floored at MIN_SECTION_ROWS. HomeScreen's +/- adjust it and a
+        shrinking terminal clamps it (both persist to state.json); the floor
+        also keeps a hand-edited or corrupt state value from collapsing a
+        section."""
+        try:
+            return max(MIN_SECTION_ROWS, int(self.state.get(f"{section}_rows") or 0))
+        except (TypeError, ValueError):
+            return MIN_SECTION_ROWS
+
     def dashboard(self, selected_space: str | None = None) -> dict:
         """Data for the three-column home screen.
 
@@ -2139,13 +2177,13 @@ class MatrixSession:
         recent = sorted(
             (e for e in entries if not e.is_space and opened.get(e.room_id)),
             key=lambda e: -opened[e.room_id],
-        )[:5]
+        )[: self.section_rows("recent")]
 
         # --- Favourites column --------------------------------------------
         favourites = sorted(
             (e for e in entries if e.is_favourite and not e.is_space),
             key=lambda e: (e.unread == 0, -recency(e), e.title.lower()),
-        )
+        )[: self.section_rows("favourites")]
 
         # --- DMs column: one entry per person -----------------------------
         direct_by_person: dict[str, Entry] = {}
@@ -2231,7 +2269,28 @@ class MatrixSession:
                 room.tags["m.favourite"] = {"order": 0.5}
             else:
                 room.tags.pop("m.favourite", None)
+        # Heal the persisted snapshot too: the dashboard's favourite rescue
+        # (_all_entries) trusts the snapshot whenever room.tags is empty, and
+        # an empty dict is exactly what un-favouriting leaves behind, so a
+        # stale True there would pin the room in Favourites forever.
+        snap = (self.state.get("room_meta") or {}).get(room_id)
+        if ok and isinstance(snap, dict) and bool(snap.get("is_favourite")) != favourite:
+            snap["is_favourite"] = favourite
+            self._persist_recency()
         return ok
+
+    def _on_tags(self, room, event) -> None:
+        """Room tag account data synced (this or another client changed the
+        tags): mirror m.favourite into the persisted snapshot, so the
+        favourite rescue in _all_entries cannot resurrect a tag the server
+        no longer has. Must stay a plain function: nio's room-account-data
+        dispatch asyncio.run()s any coroutine a callback returns, which
+        blows up under the already-running loop."""
+        snap = (self.state.get("room_meta") or {}).get(room.room_id)
+        fav = "m.favourite" in (getattr(event, "tags", None) or {})
+        if isinstance(snap, dict) and bool(snap.get("is_favourite")) != fav:
+            snap["is_favourite"] = fav
+            self._persist_recency()
 
     def find_room(self, ref: str) -> Entry | None:
         """Look up a joined room by exact room id or canonical alias, for the
@@ -3351,8 +3410,18 @@ class MatrixSession:
             except FileExistsError:
                 target = directory / f"{stem} ({counter}){suffix}"
                 counter += 1
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(body)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(body)
+        except OSError as exc:
+            # Never leave a truncated file wearing the real name: it looks
+            # like the download, and a retry would dedup around it into
+            # "name (1)" while the corrupt copy stays.
+            try:
+                os.unlink(target)
+            except OSError:
+                pass
+            return False, f"write failed: {exc}"
         return True, str(target)
 
     async def event_timestamp(self, room_id: str, event_id: str) -> int | None:
@@ -3427,6 +3496,23 @@ class MatrixSession:
             self._marker_time[room_id] = time.monotonic()
         finally:
             self._marker_tasks.pop(room_id, None)
+
+    def note_opening(self, room_id: str) -> None:
+        """Everything the dashboard shows about a room changes the moment it
+        is opened: recency to the top of Recent, badges to zero (the read
+        receipt makes the server agree shortly after). Applying it eagerly,
+        at open time, lets the home screen rebuild behind the covering room,
+        so coming back finds nothing to repaint instead of reordering the
+        list in front of the user."""
+        room = self.client.rooms.get(room_id)
+        if room is not None:
+            room.unread_notifications = 0
+            room.unread_highlights = 0
+        snap = (self.state.get("room_meta") or {}).get(room_id)
+        if isinstance(snap, dict) and (snap.get("unread") or snap.get("highlights")):
+            snap["unread"] = 0
+            snap["highlights"] = 0
+        self.record_opened(room_id)
 
     def record_opened(self, room_id: str) -> None:
         self.state["last_opened_ts"][room_id] = int(time.time() * 1000)
