@@ -64,14 +64,20 @@ state_path =
 `room` is optional: set it to a room id or canonical alias to open that room
 automatically on launch.
 
-Store your password in the Keychain once (you will be prompted for it):
+Store your password in the system keyring once (you will be prompted for it):
 
 ```sh
-security add-generic-password -s "matrix-cli" -a "@you:matrix.org" -w
+security add-generic-password -s "matrix-cli" -a "@you:matrix.org" -w   # macOS
+keyring set matrix-cli @you:matrix.org                                  # Linux
 ```
 
+On Linux the `keyring` CLI comes with the installed dependencies
+(`poetry run keyring ...` also works) and needs a Secret Service keyring
+such as gnome-keyring, or KWallet, installed and unlocked; without one the
+app exits at startup with a pointer to this section.
+
 On first launch the app logs in with that password and caches an **access token +
-device id** back into the Keychain (service `matrix-cli-token`), so later launches
+device id** back into the keyring (service `matrix-cli-token`), so later launches
 never touch your password. To force a fresh login, delete that token entry.
 
 ## Run
@@ -145,8 +151,15 @@ In a room:
   string on a light one). `j`/`k` walk straight to the room's next/previous
   image without leaving the preview, and closing lands the timeline selection
   on the image last shown. Unencrypted images fetch a server-side thumbnail;
-  encrypted ones download and decrypt the full file. The bottom bar shows the
-  current style (`Style: ascii` / `Style: blocks`); `Esc` closes.
+  encrypted ones download and decrypt the full file. Fetched previews are
+  cached (AES-encrypted at rest, capped at 64 MB, oldest pruned first) so
+  reopening one is instant and works offline; the cache follows the same
+  `[cache] messages` switch and per-space opt-outs as message history. The
+  bottom bar shows the current style (`Style: ascii` / `Style: blocks`);
+  `Esc` closes. The preview degrades with the terminal: 24-bit color gets
+  exact blocks, 256-color terminals get Floyd-Steinberg-dithered blocks
+  (the title says so), and 16-color terminals get the ASCII ramp only,
+  with the style toggle hidden.
 - `Shift+Enter`: look behind the selected message, when it carries a trailing
   `*` saying the line on screen is not the whole story (`Show history`). This
   is a separate key from `Enter` so neither has to guess which you meant on,

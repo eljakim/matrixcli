@@ -202,6 +202,60 @@ class TestTimelineCache:
         assert [p["room_id"] for p in cfg.load_room_archives()] == ["!r:hs"]
 
 
+class TestMediaCache:
+    @pytest.fixture(autouse=True)
+    def no_keychain(self, monkeypatch):
+        monkeypatch.setattr(
+            Config, "get_or_create_store_key", lambda self: "key-one"
+        )
+
+    def test_roundtrip_and_missing(self, cfg):
+        assert cfg.load_media_cache("mxc://hs/x") is None
+        cfg.save_media_cache("mxc://hs/x", b"jpeg bytes")
+        assert cfg.load_media_cache("mxc://hs/x") == b"jpeg bytes"
+        path = cfg._media_cache_path("mxc://hs/x")
+        # sha256 filename: no mxc url leaks into a directory listing.
+        assert "hs" not in path.name and path.name.endswith(".cache")
+
+    def test_file_is_not_plaintext(self, cfg):
+        cfg.save_media_cache("mxc://hs/x", b"a very secret picture")
+        blob = cfg._media_cache_path("mxc://hs/x").read_bytes()
+        assert b"very secret" not in blob
+
+    def test_wrong_key_is_none(self, cfg, monkeypatch):
+        from dataclasses import replace
+
+        cfg.save_media_cache("mxc://hs/x", b"data")
+        monkeypatch.setattr(
+            Config, "get_or_create_store_key", lambda self: "key-two"
+        )
+        assert replace(cfg).load_media_cache("mxc://hs/x") is None
+
+    def test_clear_timeline_cache_removes_media_too(self, cfg):
+        cfg.save_media_cache("mxc://hs/x", b"data")
+        cfg.clear_timeline_cache()
+        assert cfg.load_media_cache("mxc://hs/x") is None
+        assert not list(cfg._media_cache_dir.glob("*.cache"))
+
+    def test_prunes_oldest_past_the_cap(self, cfg, monkeypatch):
+        import os
+        import time
+
+        monkeypatch.setattr(Config, "MEDIA_CACHE_MAX_BYTES", 300)
+        for i, key in enumerate(("mxc://hs/a", "mxc://hs/b", "mxc://hs/c")):
+            cfg.save_media_cache(key, bytes(100))
+            # Distinct mtimes without sleeping: prune sorts by them.
+            past = time.time() - 100 + i
+            os.utime(cfg._media_cache_path(key), (past, past))
+        cfg.save_media_cache("mxc://hs/d", bytes(100))
+        # ~133 encrypted bytes each: the two oldest had to go to get back
+        # under the 300-byte cap.
+        assert cfg.load_media_cache("mxc://hs/a") is None
+        assert cfg.load_media_cache("mxc://hs/b") is None
+        assert cfg.load_media_cache("mxc://hs/c") == bytes(100)
+        assert cfg.load_media_cache("mxc://hs/d") == bytes(100)
+
+
 class TestCacheMessagesSetting:
     def test_defaults_true_and_parses_false(self, tmp_path):
         assert Config.load(minimal_config(tmp_path)).cache_messages is True
@@ -216,6 +270,20 @@ class TestCacheMessagesSetting:
         with pytest.raises(FileNotFoundError):
             Config.load(tmp_path / "config.ini")
         assert "[cache]" in (tmp_path / "config.ini").read_text()
+
+
+class TestPasswordHint:
+    def test_platform_specific_command(self, cfg, monkeypatch):
+        import matrixcli.config as config_module
+
+        monkeypatch.setattr(config_module.sys, "platform", "darwin")
+        hint = cfg.store_password_hint()
+        assert hint.startswith("security add-generic-password")
+        assert cfg.user_id in hint
+        monkeypatch.setattr(config_module.sys, "platform", "linux")
+        hint = cfg.store_password_hint()
+        assert hint.startswith("keyring set")
+        assert cfg.user_id in hint
 
 
 class TestAsciiRamp:

@@ -1,22 +1,25 @@
-"""Configuration, on-disk state, and macOS Keychain access for matrixcli.
+"""Configuration, on-disk state, and system-keyring access for matrixcli.
 
 Three kinds of persistence live here:
 
 * ``config.ini`` (non-secret): homeserver, user id, device name, and the paths
   used for the crypto store and local state. Resolved from ``$MATRIXCLI_CONFIG``,
   then ``./config.ini``, then ``~/.config/matrixcli/config.ini``.
-* The macOS Keychain (via ``keyring``): the login password (you store this
-  yourself before first run) and, after the first login, a cached access token +
-  device id so later launches never need the password again.
+* The system keyring (via ``keyring``: macOS Keychain, Secret Service or
+  KWallet on Linux): the login password (you store this yourself before first
+  run) and, after the first login, a cached access token + device id so later
+  launches never need the password again.
 * ``state.json`` (non-secret): per-room "last event seen" and "last opened"
   timestamps, used to rank the home screen's Recent, Favourites, and DMs.
-* ``store/timelines.cache`` and ``store/archive/<sha256(room id)>.cache``
-  (secret): the per-room message windows plus one full-history archive file
-  per room, so a restart paints rooms without refetching them. Message bodies
-  include decrypted E2EE plaintext, so every file is AES-GCM encrypted with a
-  key derived from the same Keychain store key that protects nio's crypto
-  store. ``[cache] messages = false`` disables all of it; individual spaces
-  opt out via ``cache_spaces`` in state.json (the "c" key on a space).
+* ``store/timelines.cache``, ``store/archive/<sha256(room id)>.cache``, and
+  ``store/media/<sha256(mxc url)>.cache`` (secret): the per-room message
+  windows, one full-history archive file per room, and fetched image
+  previews, so a restart paints rooms (and reopens previews) without
+  refetching them. Message bodies and encrypted-room images are decrypted
+  E2EE content, so every file is AES-GCM encrypted with a key derived from
+  the same Keychain store key that protects nio's crypto store. ``[cache]
+  messages = false`` disables all of it; individual spaces opt out via
+  ``cache_spaces`` in state.json (the "c" key on a space).
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ import hashlib
 import json
 import os
 import secrets
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -52,8 +56,10 @@ device_name = matrixcli
 room =
 
 [keychain]
-; The Keychain "service" name. Store your password before first run with:
-;   security add-generic-password -s "matrix-cli" -a "@you:matrix.org" -w
+; The keyring "service" name. Store your password before first run with:
+;   macOS:  security add-generic-password -s "matrix-cli" -a "@you:matrix.org" -w
+;   Linux:  keyring set matrix-cli @you:matrix.org
+; (Linux needs a Secret Service keyring such as gnome-keyring, or KWallet.)
 service = matrix-cli
 
 [storage]
@@ -198,6 +204,18 @@ class Config:
     def get_password(self) -> str | None:
         return keyring.get_password(self.keychain_service, self.user_id)
 
+    def store_password_hint(self) -> str:
+        """The platform's one-liner for putting the login password into the
+        system keyring, quoted in error messages and docs. macOS has the
+        Keychain's own tool; everywhere else the keyring package's bundled
+        CLI talks to whatever backend is installed (Secret Service, KWallet)."""
+        if sys.platform == "darwin":
+            return (
+                f'security add-generic-password -s "{self.keychain_service}" '
+                f'-a "{self.user_id}" -w'
+            )
+        return f'keyring set "{self.keychain_service}" "{self.user_id}"'
+
     def get_or_create_store_key(self) -> str:
         """A per-account random key used to encrypt nio's Olm/Megolm store on
         disk, kept in the Keychain. Without this nio falls back to its literal
@@ -315,6 +333,65 @@ class Config:
     def save_timeline_cache(self, payload: dict) -> None:
         self._write_encrypted(self._timeline_cache_path, payload)
 
+    # Fetched image previews, so reopening one (or coming back offline) skips
+    # the network. Same at-rest protection as the timelines: the bytes stored
+    # are post-decryption, so they are AES-GCM encrypted with the derived key
+    # (version byte \x02: raw bytes, not JSON). Filenames are sha256(mxc url):
+    # a stolen directory listing leaks nothing.
+
+    MEDIA_CACHE_MAX_BYTES = 64 * 1024 * 1024
+
+    @property
+    def _media_cache_dir(self) -> Path:
+        return self.store_path / "media"
+
+    def _media_cache_path(self, key: str) -> Path:
+        return self._media_cache_dir / (
+            hashlib.sha256(key.encode()).hexdigest() + ".cache"
+        )
+
+    def load_media_cache(self, key: str) -> bytes | None:
+        try:
+            blob = self._media_cache_path(key).read_bytes()
+        except OSError:
+            return None
+        if len(blob) < 33 or blob[:1] != b"\x02":
+            return None
+        nonce, tag, ciphertext = blob[1:17], blob[17:33], blob[33:]
+        try:
+            cipher = AES.new(self._timeline_cache_aes_key(), AES.MODE_GCM, nonce=nonce)
+            return cipher.decrypt_and_verify(ciphertext, tag)
+        except (ValueError, KeyError):
+            return None
+
+    def save_media_cache(self, key: str, data: bytes) -> None:
+        self._media_cache_dir.mkdir(mode=0o700, exist_ok=True)
+        nonce = secrets.token_bytes(16)
+        cipher = AES.new(self._timeline_cache_aes_key(), AES.MODE_GCM, nonce=nonce)
+        ciphertext, tag = cipher.encrypt_and_digest(data)
+        path = self._media_cache_path(key)
+        tmp = path.with_suffix(".cache.tmp")
+        tmp.write_bytes(b"\x02" + nonce + tag + ciphertext)
+        tmp.replace(path)
+        # Prune oldest-first past the cap, so a scroll through a photo-heavy
+        # room cannot grow the directory without bound.
+        try:
+            files = [
+                (p.stat().st_mtime, p.stat().st_size, p)
+                for p in self._media_cache_dir.glob("*.cache")
+            ]
+        except OSError:
+            return
+        total = sum(size for _, size, _ in files)
+        for _, size, p in sorted(files):
+            if total <= self.MEDIA_CACHE_MAX_BYTES:
+                break
+            try:
+                p.unlink()
+                total -= size
+            except OSError:
+                pass
+
     # Full-history archives get one file per room so a save only rewrites the
     # rooms that changed (the main cache stays small and is rewritten whole).
     # Filenames are sha256(room id): stable, filesystem-safe, and the listing
@@ -354,16 +431,19 @@ class Config:
             pass
 
     def clear_timeline_cache(self) -> None:
-        """Delete the whole message cache: the main file and every per-room
-        archive (used by --import-keys and by `[cache] messages = false`)."""
+        """Delete the whole message cache: the main file, every per-room
+        archive, and the media previews (used by --import-keys and by
+        `[cache] messages = false`)."""
         try:
             self._timeline_cache_path.unlink()
         except OSError:
             pass
-        try:
-            paths = list(self._archive_dir.glob("*.cache*"))
-        except OSError:
-            paths = []
+        paths = []
+        for directory in (self._archive_dir, self._media_cache_dir):
+            try:
+                paths.extend(directory.glob("*.cache*"))
+            except OSError:
+                pass
         for path in paths:
             try:
                 path.unlink()

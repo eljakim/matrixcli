@@ -1859,12 +1859,33 @@ class TestImagePreview:
         # (two pixel rows per cell row).
         assert 3.0 < len(lines[0]) / len(lines) <= 4.5
 
+    def test_block_art_dithered_emits_exact_palette_indices(self):
+        art = _block_art(self.gradient(), 40, 40, dither=True)
+        assert "▀" in art.plain
+        assert art.spans
+        for span in art.spans:
+            for color in (span.style.foreground, span.style.background):
+                # ansi carries the exact palette index to the terminal; only
+                # the predictable cube/gray entries are allowed, never the
+                # 16 themeable system colors.
+                assert color.ansi is not None and 16 <= color.ansi <= 255
+
     def test_one_pixel_image_does_not_crash(self):
         from PIL import Image
 
         tiny = Image.new("L", (1, 1), 0)
         assert _ascii_art(tiny, 80, 24, "@ ").plain.strip("\n") != ""
         assert "▀" in _block_art(tiny, 80, 24).plain
+
+    def test_color_depth_ladder(self):
+        from matrixcli.app import _color_depth
+
+        assert _color_depth("truecolor") == "truecolor"
+        assert _color_depth("256") == "256"
+        # 16-color, Windows legacy, and no-color consoles all land on basic.
+        assert _color_depth("standard") == "basic"
+        assert _color_depth("windows") == "basic"
+        assert _color_depth(None) == "basic"
 
 
 class TestPreviewScreen:
@@ -1917,7 +1938,7 @@ class TestPreviewScreen:
             drafts={},
             reaction_summary=lambda room_id, event_id: [],
             state=state,
-            fetch_preview_bytes=lambda m, w, h: _async((True, png)),
+            fetch_preview_bytes=lambda m, w, h, room_id="": _async((True, png)),
         )
 
         class RoomApp(App):
@@ -1978,23 +1999,25 @@ class TestPreviewScreen:
             from textual.widgets import Label
 
             def title():
+                # startswith: on a non-truecolor console the title carries a
+                # dim "256-color terminal" suffix after the filename.
                 return str(app.screen.query_one("#previewtitle", Label).content)
 
             await pilot.press("space")
             await pilot.pause()
             await pilot.pause()
-            assert title() == "cat2.png"
+            assert title().startswith("cat2.png")
             # No image below cat2: j is gated off and must do nothing.
             assert app.screen.check_action("next_image", ()) is False
             await pilot.press("j")
             await pilot.pause()
-            assert title() == "cat2.png"
+            assert title().startswith("cat2.png")
 
             # k skips the text row and lands on cat1.
             await pilot.press("k")
             await pilot.pause()
             await pilot.pause()
-            assert title() == "cat1.png"
+            assert title().startswith("cat1.png")
             assert app.screen.check_action("prev_image", ()) is False
 
             await pilot.press("escape")
@@ -2026,3 +2049,52 @@ class TestPreviewScreen:
         # 80->40 columns: the art re-rendered to roughly half the width, with
         # no refetch (the decoded image is cached on the screen).
         assert out["narrow"] <= 40 < out["wide"]
+
+    def test_basic_terminal_forces_ascii_and_hides_the_toggle(self, monkeypatch):
+        import matrixcli.app as app_module
+
+        monkeypatch.setattr(app_module, "_color_depth", lambda system: "basic")
+
+        async def steps(pilot, app, preview_cls, state):
+            from textual.widgets import Label, Static
+
+            state["preview_mode"] = "blocks"  # a remembered choice cannot win
+            await pilot.press("space")
+            await pilot.pause()
+            await pilot.pause()
+            screen = app.screen
+            art = screen.query_one("#previewart", Static).content.plain
+            title = str(screen.query_one("#previewtitle", Label).content)
+            return {
+                "mode": screen.mode,
+                "no_blocks": "▀" not in art and "." in art,
+                "toggle_hidden": screen.check_action("mode_blocks", ())
+                or screen.check_action("mode_ascii", ()),
+                "titled": "16-color" in title,
+            }
+
+        out = self.run(steps)
+        assert out["mode"] == "ascii"
+        assert out["no_blocks"] is True
+        assert out["toggle_hidden"] is False
+        assert out["titled"] is True
+
+    def test_render_failure_shows_error_instead_of_crashing(self, monkeypatch):
+        import matrixcli.app as app_module
+
+        def boom(*args, **kwargs):
+            raise ValueError("bad mode")
+
+        monkeypatch.setattr(app_module, "_block_art", boom)
+
+        async def steps(pilot, app, preview_cls, state):
+            from textual.widgets import Static
+
+            await pilot.press("space")
+            await pilot.pause()
+            await pilot.pause()
+            art = app.screen.query_one("#previewart", Static).content.plain
+            return {"error_shown": "Preview failed" in art and "bad mode" in art}
+
+        out = self.run(steps)
+        assert out["error_shown"] is True

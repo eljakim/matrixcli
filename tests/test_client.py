@@ -2420,7 +2420,7 @@ class TestConnect:
         ok, msg = asyncio.run(session.connect())
         assert not ok
         assert cleared
-        assert "Keychain" in msg
+        assert "keyring" in msg and "Store one with" in msg
 
     def test_unreadable_store_resets_and_relogins(self, session, monkeypatch):
         # restore_login (not a later load_store) is what raises when the store
@@ -2539,7 +2539,7 @@ class TestConnect:
         monkeypatch.setattr(session, "_reset_store", lambda: None)
         ok, msg = asyncio.run(session.connect())
         assert not ok
-        assert "reset" in msg and "Keychain" in msg
+        assert "reset" in msg and "keyring" in msg
 
 
 class TestRefreshSpaceChildren:
@@ -3267,3 +3267,65 @@ class TestCachePolicy:
         saved = cfg.load_room_archives()
         assert [p["room_id"] for p in saved] == ["!a:hs"]
         assert "archives" not in cfg.load_timeline_cache()
+
+
+class TestPreviewCache:
+    def media_msg(self, **kw):
+        defaults = dict(
+            sender=ALICE,
+            sender_name="A",
+            body="pic.png",
+            ts=1,
+            event_id="$1",
+            media_url="mxc://hs/pic",
+            media_name="pic.png",
+            media_mime="image/png",
+        )
+        defaults.update(kw)
+        return Message(**defaults)
+
+    def thumbnail_stub(self, session, calls):
+        async def fake_thumbnail(server, media_id, w, h, **kwargs):
+            calls.append((server, media_id, w, h))
+            return SimpleNamespace(body=b"thumb-bytes")
+
+        session.client.thumbnail = fake_thumbnail
+
+    def test_memory_then_disk_then_network(self, session):
+        calls = []
+        self.thumbnail_stub(session, calls)
+        m = self.media_msg()
+        ok, body = asyncio.run(session.fetch_preview_bytes(m, 100, 100, "!r:hs"))
+        assert ok and body == b"thumb-bytes" and len(calls) == 1
+
+        ok, body = asyncio.run(session.fetch_preview_bytes(m, 100, 100, "!r:hs"))
+        assert ok and body == b"thumb-bytes"
+        assert len(calls) == 1  # second open: served from memory
+
+        session._media_cache.clear()
+        ok, body = asyncio.run(session.fetch_preview_bytes(m, 100, 100, "!r:hs"))
+        assert ok and body == b"thumb-bytes"
+        assert len(calls) == 1  # a fresh session: served from disk
+        assert session.cfg.load_media_cache("mxc://hs/pic") == b"thumb-bytes"
+
+    def test_cache_off_never_touches_disk(self, session):
+        session.cfg.cache_messages = False
+        calls = []
+        self.thumbnail_stub(session, calls)
+        m = self.media_msg()
+        ok, body = asyncio.run(session.fetch_preview_bytes(m, 100, 100, "!r:hs"))
+        assert ok and body == b"thumb-bytes"
+        assert session.cfg.load_media_cache("mxc://hs/pic") is None
+        assert not session.cfg._media_cache_dir.exists()
+
+    def test_space_opt_out_skips_disk_but_memory_still_serves(self, session):
+        session.state["cache_spaces"] = {"!space:hs": False}
+        session.space_children["!space:hs"] = {"!r:hs"}
+        calls = []
+        self.thumbnail_stub(session, calls)
+        m = self.media_msg()
+        ok, _ = asyncio.run(session.fetch_preview_bytes(m, 100, 100, "!r:hs"))
+        assert ok
+        assert session.cfg.load_media_cache("mxc://hs/pic") is None
+        ok, _ = asyncio.run(session.fetch_preview_bytes(m, 100, 100, "!r:hs"))
+        assert ok and len(calls) == 1  # in-memory layer is room-agnostic

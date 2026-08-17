@@ -30,6 +30,9 @@ import textual.events
 import textual.message
 from textual import work
 from textual.binding import Binding
+from textual.color import Color as TextualColor
+from textual.content import Content, Span as ContentSpan
+from textual.style import Style as TextualStyle
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
@@ -170,6 +173,15 @@ def _fmt_size(size: int) -> str:
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".ico")
 
 
+def _color_depth(color_system: str | None) -> str:
+    """The preview's capability tier for a rich color system: "truecolor"
+    (full-color blocks), "256" (dithered blocks), or "basic" (16 colors or
+    none: color art is hopeless, only the ASCII ramp is offered)."""
+    if color_system in ("truecolor", "256"):
+        return color_system
+    return "basic"
+
+
 def _is_image(m) -> bool:
     """True when the upload is worth offering the space-key preview for."""
     if not m.media_url or m.redacted_ts:
@@ -186,11 +198,15 @@ def _ascii_art(img, max_w: int, max_h: int, ramp: str) -> Text:
     ramp[0] paints the brightest pixels, since dense glyphs read bright on a
     dark terminal. A cell is about twice as tall as it is wide, so the pixel
     grid is squeezed to half height to preserve the image's aspect."""
+    from PIL.Image import Resampling
+
     gray = img.convert("L")
     scale = min(max_w / gray.width, 2 * max_h / gray.height)
     w = max(1, round(gray.width * scale))
     h = max(1, round(gray.height * scale / 2))
-    px = gray.resize((w, h)).load()
+    # LANCZOS: proper area-averaging on the way down; the default (bicubic)
+    # visibly aliases on diagonals at these tiny output sizes.
+    px = gray.resize((w, h), Resampling.LANCZOS).load()
     span = len(ramp) - 1
     # no_wrap: rendered against a stale mid-resize width, a wrapping line
     # would spill one cell onto a blank row and stripe the whole picture;
@@ -202,36 +218,124 @@ def _ascii_art(img, max_w: int, max_h: int, ramp: str) -> Text:
     return text
 
 
-def _block_art(img, max_w: int, max_h: int) -> Text:
+# The 240 predictable xterm-256 entries (6x6x6 color cube + 24 grays), for
+# dithering on non-truecolor terminals. The first 16 system colors are left
+# out: terminals theme those freely, so their real RGB is unknowable.
+_XTERM_LEVELS = (0, 95, 135, 175, 215, 255)
+_XTERM_PALETTE_IMG = None
+_XTERM_TEXTUAL_COLORS = None  # index-preserving Textual colors, built once
+
+
+def _xterm_palette():
+    """A Pillow palette image holding the cube+gray entries, built once."""
+    global _XTERM_PALETTE_IMG
+    if _XTERM_PALETTE_IMG is None:
+        from PIL import Image
+
+        flat = [
+            channel
+            for r in _XTERM_LEVELS
+            for g in _XTERM_LEVELS
+            for b in _XTERM_LEVELS
+            for channel in (r, g, b)
+        ]
+        flat += [channel for gray in range(8, 239, 10) for channel in (gray,) * 3]
+        img = Image.new("P", (1, 1))
+        img.putpalette(flat)
+        _XTERM_PALETTE_IMG = img
+    return _XTERM_PALETTE_IMG
+
+
+def _xterm_index(i: int) -> int:
+    """Palette position -> xterm color number (cube 16-231, grays 232-255).
+    Pillow pads the palette to 256 entries with black; those land on 16."""
+    if i < 216:
+        return 16 + i
+    if i < 240:
+        return 232 + (i - 216)
+    return 16
+
+
+def _block_art(img, max_w: int, max_h: int, dither: bool = False) -> Content:
     """The image as truecolor half-blocks fitted into max_w x max_h cells:
     each cell is one "▀" whose foreground is the upper pixel and background
     the lower. The two stacked pixels fill the cell's ~1:2 shape, so pixels
-    come out square and no aspect correction is needed."""
+    come out square and no aspect correction is needed.
+
+    Returns Textual's native Content with ready-made Style objects: a rich
+    Text here costs a style-string parse plus a rich-to-Textual conversion
+    per span at paint time, and with thousands of unique colors defeating
+    every cache that machinery dominates how long a full-screen photo takes
+    to draw.
+
+    ``dither`` is for non-truecolor terminals: the terminal would snap each
+    RGB to the nearest 256-palette entry, posterizing smooth gradients into
+    flat patches. Floyd-Steinberg dithering onto the same cube+gray palette,
+    emitted as exact palette indices, trades those patches for fine noise,
+    which reads far better at cell scale."""
+    from PIL.Image import Dither, Resampling
+
     rgb = img.convert("RGB")
     scale = min(max_w / rgb.width, 2 * max_h / rgb.height)
     w = max(1, round(rgb.width * scale))
     h = max(2, round(rgb.height * scale))
     h -= h % 2  # rows are consumed in upper/lower pairs
-    px = rgb.resize((w, h)).load()
-    text = Text(no_wrap=True)  # see _ascii_art: wrapping would stripe the art
+    resized = rgb.resize((w, h), Resampling.LANCZOS)  # see _ascii_art
+    if dither:
+        global _XTERM_TEXTUAL_COLORS
+        if _XTERM_TEXTUAL_COLORS is None:
+            entries = [
+                (r, g, b)
+                for r in _XTERM_LEVELS
+                for g in _XTERM_LEVELS
+                for b in _XTERM_LEVELS
+            ] + [(gray, gray, gray) for gray in range(8, 239, 10)]
+            # ansi= makes the driver emit the exact palette index, so the
+            # dithered colors survive the terminal untouched.
+            _XTERM_TEXTUAL_COLORS = [
+                TextualColor(r, g, b, ansi=_xterm_index(i))
+                for i, (r, g, b) in enumerate(entries)
+            ]
+        qx = resized.quantize(
+            palette=_xterm_palette(), dither=Dither.FLOYDSTEINBERG
+        ).load()
+
+        def color_at(x: int, y: int) -> TextualColor:
+            i = qx[x, y]
+            # Pillow pads the palette to 256 entries with black: those few
+            # map onto the cube's own black at position 0.
+            return _XTERM_TEXTUAL_COLORS[i if i < 240 else 0]
+
+    else:
+        px = resized.load()
+
+        def color_at(x: int, y: int) -> TextualColor:
+            r, g, b = px[x, y]
+            return TextualColor(r, g, b)
+
+    lines, spans, pos = [], [], 0
     for y in range(0, h, 2):
-        # Append runs of identical color pairs as one styled span, not one
-        # span per cell: photos still make many spans, but flat areas (and
+        if y:
+            pos += 1  # the newline joining this row to the previous one
+        # Emit runs of identical color pairs as one span, not one span per
+        # cell: photos still make many spans, but flat areas (and
         # screenshots are mostly flat) collapse to a few.
-        run_style, run_len = "", 0
+        run_style, run_len = None, 0
         for x in range(w):
-            top, bottom = px[x, y], px[x, y + 1]
-            style = f"rgb({top[0]},{top[1]},{top[2]}) on rgb({bottom[0]},{bottom[1]},{bottom[2]})"
+            style = TextualStyle(
+                foreground=color_at(x, y), background=color_at(x, y + 1)
+            )
             if style == run_style:
                 run_len += 1
                 continue
             if run_len:
-                text.append("▀" * run_len, style=run_style)
+                spans.append(ContentSpan(pos, pos + run_len, run_style))
+                pos += run_len
             run_style, run_len = style, 1
-        text.append("▀" * run_len, style=run_style)
-        if y + 2 < h:
-            text.append("\n")
-    return text
+        spans.append(ContentSpan(pos, pos + run_len, run_style))
+        pos += run_len
+        lines.append("▀" * w)
+    return Content("\n".join(lines), spans)
 
 
 # The sync loop long-polls for 30s, so a healthy session sees a response at
@@ -1743,7 +1847,8 @@ class RoomScreen(Screen):
                 self._highlight()
 
         self.app.push_screen(
-            PreviewScreen(list(self.messages), self.selected), when_closed
+            PreviewScreen(list(self.messages), self.selected, self.entry.room_id),
+            when_closed,
         )
 
     # Four names for one key: check_action enables exactly the one that
@@ -2297,10 +2402,11 @@ class PreviewScreen(ModalScreen):
         Binding("tilde", "mode_ascii", "Style: blocks"),
     ]
 
-    def __init__(self, messages: list, index: int) -> None:
+    def __init__(self, messages: list, index: int, room_id: str = "") -> None:
         super().__init__()
         self.messages = messages  # a snapshot of the room's rows, for j/k
         self.index = index  # the row on show; always an image message
+        self.room_id = room_id  # gates the on-disk media cache per room
         self.image = None  # a PIL image once fetched and decoded
         self.error = ""
         self._cache = {}  # event id -> decoded image, so j/k never refetches
@@ -2312,14 +2418,35 @@ class PreviewScreen(ModalScreen):
 
     @property
     def mode(self) -> str:
+        # 16-color-or-less terminals get no say: block art needs at least the
+        # 256-color palette to dither onto, so only the ramp is honest there.
+        if self._depth() == "basic":
+            return "ascii"
         mode = self.app.session.state.get("preview_mode")
         return mode if mode in ("ascii", "blocks") else "blocks"
 
+    def _depth(self) -> str:
+        return _color_depth(self.app.console.color_system)
+
+    def _title_text(self) -> Text:
+        # Text(), not markup: the filename comes from the sender, and Text
+        # keeps any "[" in it literal. Truncated so it cannot blow out the row.
+        text = Text((self.message.media_name or self.message.body or "image")[:120])
+        depth = self._depth()
+        if depth == "256":
+            # Name the degradation, and the way out for terminals that do
+            # support 24-bit color but do not advertise it.
+            text.append(
+                "  · 256-color terminal, dithered (COLORTERM=truecolor may help)",
+                style="dim",
+            )
+        elif depth == "basic":
+            text.append("  · 16-color terminal, ASCII art only", style="dim")
+        return text
+
     def compose(self) -> ComposeResult:
         with Vertical(id="previewbox"):
-            # escape() + truncation: the filename comes from the sender.
-            raw = (self.message.media_name or self.message.body or "image")[:120]
-            yield Label(escape(raw), id="previewtitle")
+            yield Label(self._title_text(), id="previewtitle")
             yield Static(Text("fetching image...", style="dim italic"), id="previewart")
 
     def on_mount(self) -> None:
@@ -2332,22 +2459,30 @@ class PreviewScreen(ModalScreen):
         message = self.message
         image, error = self._cache.get(message.event_id), ""
         if image is None:
-            # Ask the server for a thumbnail around the largest this window
-            # could show (half-blocks paint two pixel rows per cell);
-            # encrypted media falls back to the full download inside
-            # fetch_preview_bytes.
+            # Ask the server for a thumbnail at twice what this window can
+            # show (half-blocks paint two pixel rows per cell): servers snap
+            # thumbnail requests to pre-generated buckets, and the headroom
+            # keeps a portrait photo out of a tiny bucket whose upscaled JPEG
+            # blocks would dominate the render. Encrypted media falls back to
+            # the full download inside fetch_preview_bytes.
             try:
                 ok, result = await self.app.session.fetch_preview_bytes(
-                    message, self.app.size.width, self.app.size.height * 2
+                    message,
+                    self.app.size.width * 2,
+                    self.app.size.height * 4,
+                    self.room_id,
                 )
             except Exception as exc:
                 ok, result = False, str(exc)
             if ok:
-                from io import BytesIO
-
-                from PIL import Image
-
+                # The imports sit inside the try: a broken Pillow install
+                # must degrade to an error line in the popup, not crash the
+                # worker (and with it the app).
                 try:
+                    from io import BytesIO
+
+                    from PIL import Image
+
                     image = Image.open(BytesIO(result))
                     image.load()  # decode now: errors must land here, not mid-render
                 except Exception as exc:
@@ -2371,10 +2506,20 @@ class PreviewScreen(ModalScreen):
         box = self.query_one("#previewbox", Vertical)
         w = max(2, box.content_size.width)
         h = max(2, box.content_size.height - 1)  # minus the title line
-        if self.mode == "blocks":
-            art.update(_block_art(self.image, w, h))
-        else:
-            art.update(_ascii_art(self.image, w, h, self.app.session.cfg.ascii_ramp))
+        # A render failure (an exotic image mode, a Pillow quirk) must land
+        # in the popup as text, never take down the app: this runs on plain
+        # UI paths like resize, outside any worker's safety net.
+        try:
+            if self.mode == "blocks":
+                art.update(
+                    _block_art(self.image, w, h, dither=self._depth() == "256")
+                )
+            else:
+                art.update(
+                    _ascii_art(self.image, w, h, self.app.session.cfg.ascii_ramp)
+                )
+        except Exception as exc:
+            art.update(Text(f"Preview failed: {exc}", style="bold red"))
 
     def on_resize(self, event) -> None:
         # A cheap full re-render from the already-decoded image, deferred
@@ -2400,8 +2545,7 @@ class PreviewScreen(ModalScreen):
         self.index = target
         self._seq += 1  # orphan any fetch still in flight for the old image
         self.image, self.error = None, ""
-        raw = (self.message.media_name or self.message.body or "image")[:120]
-        self.query_one("#previewtitle", Label).update(escape(raw))
+        self.query_one("#previewtitle", Label).update(self._title_text())
         self.query_one("#previewart", Static).update(
             Text("fetching image...", style="dim italic")
         )
@@ -2415,9 +2559,11 @@ class PreviewScreen(ModalScreen):
         self._go(-1)
 
     def check_action(self, action: str, parameters) -> bool:
-        if action == "mode_blocks":
-            return self.mode == "ascii"
-        if action == "mode_ascii":
+        if action in ("mode_blocks", "mode_ascii"):
+            if self._depth() == "basic":
+                return False  # no block style to toggle to; hide the pair
+            if action == "mode_blocks":
+                return self.mode == "ascii"
             return self.mode == "blocks"
         if action == "next_image":
             return self._image_index(1) is not None
@@ -3412,7 +3558,9 @@ class MatrixApp(App):
         height: 1;
         color: $foreground 60%;
     }
-    #previewart { width: auto; height: auto; }
+    /* nowrap: rendered against a stale mid-resize width, a wrapping art
+       line would spill one cell onto a blank row and stripe the picture. */
+    #previewart { width: auto; height: auto; text-wrap: nowrap; }
     #reactionsbox #reactors { height: auto; max-height: 20; }
     AboutScreen, ConfirmScreen { align: center middle; }
     #confirmbox {
@@ -3880,6 +4028,23 @@ def main() -> None:
     if not cfg.homeserver or "@you:" in cfg.user_id or not cfg.user_id:
         raise SystemExit(
             f"Edit {cfg.config_path} with your real homeserver and user id first."
+        )
+
+    # Probe the system keyring now: without a usable backend (common on a bare
+    # Linux box) every later credential access raises deep inside the running
+    # app; here it can still be a plain, actionable message.
+    import keyring.errors
+
+    try:
+        cfg.load_token()
+    except keyring.errors.KeyringError as exc:
+        raise SystemExit(
+            f"No usable system keyring: {exc}\n"
+            "matrixcli keeps your password, access token, and cache keys in "
+            "the system keyring (macOS Keychain; Secret Service or KWallet "
+            "on Linux). On Linux, install and unlock one (e.g. gnome-keyring "
+            "or KWallet), then store your password with:\n"
+            f"  {cfg.store_password_hint()}"
         )
 
     if args.verify:

@@ -461,6 +461,11 @@ class MatrixSession:
         # nicety and must never compete with itself for a loaded homeserver.
         self._backfill_gate = asyncio.Semaphore(1)
         self._backfill_tasks: dict[str, asyncio.Task] = {}
+        # Image-preview bytes by mxc url, so j/k and reopened previews never
+        # refetch this session; bounded FIFO (thumbnails are ~50 KB each).
+        # The encrypted on-disk layer (cfg.save_media_cache) persists them
+        # across restarts for rooms whose caching is allowed.
+        self._media_cache: dict[str, bytes] = {}
 
         token = cfg.load_token()
         self._new_client(token["device_id"] if token else None)
@@ -630,17 +635,15 @@ class MatrixSession:
                 return False, (
                     "Your encryption store could not be opened (it was written "
                     "under the previous store key) and has been reset. No login "
-                    "password is in the Keychain to sign in fresh.\n"
-                    f'Store one with: security add-generic-password -s '
-                    f'"{self.cfg.keychain_service}" -a "{self.cfg.user_id}" -w\n'
+                    "password is in the keyring to sign in fresh.\n"
+                    f"Store one with: {self.cfg.store_password_hint()}\n"
                     "then relaunch, run 'matrix --verify', and "
                     "'matrix --import-keys <your key export>' to restore history."
                 )
             return (
                 False,
-                "No cached token and no password in Keychain.\n"
-                f'Store one with: security add-generic-password -s '
-                f'"{self.cfg.keychain_service}" -a "{self.cfg.user_id}" -w',
+                "No cached token and no password in the keyring.\n"
+                f"Store one with: {self.cfg.store_password_hint()}",
             )
 
         step("logging in with password")
@@ -3265,13 +3268,37 @@ class MatrixSession:
         return True, body
 
     async def fetch_preview_bytes(
-        self, message: Message, width: int, height: int
+        self, message: Message, width: int, height: int, room_id: str = ""
     ) -> tuple[bool, bytes | str]:
         """Image bytes for an in-terminal preview, at roughly width x height
-        pixels. Unencrypted media asks the server's thumbnail endpoint first
-        (a pre-scaled image instead of a possibly huge original); encrypted
-        attachments have no server-side thumbnails, so those (and a failed
-        thumbnail request) fall back to the full download."""
+        pixels. Served from cache when possible: in-memory first, then the
+        encrypted on-disk media cache; a fetched result is stored back in
+        both (disk only when the room's caching is allowed). Unencrypted
+        media asks the server's thumbnail endpoint first (a pre-scaled image
+        instead of a possibly huge original); encrypted attachments have no
+        server-side thumbnails, so those (and a failed thumbnail request)
+        fall back to the full download."""
+        cached = self._media_cache.get(message.media_url)
+        if cached is None and message.media_url and self.cache_allowed(room_id):
+            cached = self.cfg.load_media_cache(message.media_url)
+        if cached is not None:
+            self._media_cache[message.media_url] = cached
+            return True, cached
+        ok, result = await self._fetch_preview_uncached(message, width, height)
+        if ok and message.media_url:
+            self._media_cache[message.media_url] = result
+            while len(self._media_cache) > 32:
+                self._media_cache.pop(next(iter(self._media_cache)))
+            if self.cache_allowed(room_id):
+                try:
+                    self.cfg.save_media_cache(message.media_url, result)
+                except OSError:
+                    pass  # a full disk must not break the preview itself
+        return ok, result
+
+    async def _fetch_preview_uncached(
+        self, message: Message, width: int, height: int
+    ) -> tuple[bool, bytes | str]:
         if message.media_url and not message.media_crypt:
             # mxc://server/media_id, the two parts nio's thumbnail() wants.
             parts = message.media_url.removeprefix("mxc://").split("/", 1)
