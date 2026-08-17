@@ -32,6 +32,14 @@ from pathlib import Path
 import keyring
 from Crypto.Cipher import AES
 
+# Paul Bourke's 70-level grayscale ramp (paulbourke.net/dataformats/asciiart/),
+# ordered most ink first. The image preview maps the brightest pixels onto the
+# densest glyphs, which is right for light text on a dark terminal; a light
+# terminal wants the string reversed (see the template comments below).
+DEFAULT_ASCII_RAMP = (
+    "$@B%8&WM#*oahkbdpqwmZO0QLCJUYXzcvunxrjft/\\|()1{}[]?-_+~<>i!lI;:,\"^`'. "
+)
+
 CONFIG_TEMPLATE = """\
 [matrix]
 ; Your homeserver's base URL.
@@ -60,6 +68,16 @@ state_path =
 ; messages in memory only; any existing cache is deleted on the next launch.
 ; Individual spaces can also be excluded in-app ("c" on a space).
 messages = true
+
+[preview]
+; The character ramp for the ASCII-art image preview (space on an image),
+; ordered most ink first. The brightest pixels get the densest glyphs, which
+; suits light text on a dark terminal; reverse the string for a light
+; terminal. Wrap the value in double quotes to keep a leading/trailing space.
+; The default is Paul Bourke's 70-level ramp:
+;   ascii_ramp = "$@B%8&WM#*oahkbdpqwmZO0QLCJUYXzcvunxrjft/\\|()1{}[]?-_+~<>i!lI;:,"^`'. "
+; A classic shorter alternative:
+;   ascii_ramp = "@%#*+=-:. "
 """
 
 
@@ -94,6 +112,10 @@ class Config:
     # False keeps history in memory only and wipes any existing cache files at
     # startup. Per-space opt-outs live in state.json ("cache_spaces"), not here.
     cache_messages: bool = True
+    # Glyphs for the ASCII-art image preview, most ink first ([preview]
+    # ascii_ramp). Read raw (the default ramp contains "%", which interpolation
+    # would mangle); wrap the ini value in double quotes to keep edge spaces.
+    ascii_ramp: str = DEFAULT_ASCII_RAMP
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Config":
@@ -147,6 +169,12 @@ class Config:
         except ValueError:
             cache_messages = True
 
+        ramp = parser.get("preview", "ascii_ramp", raw=True, fallback="")
+        if len(ramp) >= 2 and ramp[0] == ramp[-1] == '"':
+            ramp = ramp[1:-1]
+        if len(ramp) < 2:  # unset, or too short to form a gradient
+            ramp = DEFAULT_ASCII_RAMP
+
         return cls(
             homeserver=m.get("homeserver", "").strip(),
             user_id=m.get("user_id", "").strip(),
@@ -158,6 +186,7 @@ class Config:
             config_path=path,
             allow_unverified=allow_unverified,
             cache_messages=cache_messages,
+            ascii_ramp=ramp,
         )
 
     # --- Keychain: password (user-provided) and token cache (we write it) ---

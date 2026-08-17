@@ -218,6 +218,49 @@ class TestCacheMessagesSetting:
         assert "[cache]" in (tmp_path / "config.ini").read_text()
 
 
+class TestAsciiRamp:
+    def test_defaults_to_bourke_ramp(self, tmp_path):
+        from matrixcli.config import DEFAULT_ASCII_RAMP
+
+        cfg = Config.load(minimal_config(tmp_path))
+        assert cfg.ascii_ramp == DEFAULT_ASCII_RAMP
+        # Bourke's 70-level ramp, most ink first, ending on the space.
+        assert len(DEFAULT_ASCII_RAMP) == 70
+        assert DEFAULT_ASCII_RAMP[0] == "$" and DEFAULT_ASCII_RAMP[-1] == " "
+
+    def test_quoted_value_keeps_edge_spaces(self, tmp_path):
+        path = write_config(
+            tmp_path,
+            "[matrix]\nhomeserver = https://hs.example\nuser_id = @me:hs.example\n"
+            '\n[preview]\nascii_ramp = "@%#*+=-:. "\n',
+        )
+        # Raw read: the "%" must not be treated as interpolation syntax, and
+        # the quotes must protect the trailing space configparser would strip.
+        assert Config.load(path).ascii_ramp == "@%#*+=-:. "
+
+    def test_unquoted_value_and_short_fallback(self, tmp_path):
+        from matrixcli.config import DEFAULT_ASCII_RAMP
+
+        path = write_config(
+            tmp_path,
+            "[matrix]\nhomeserver = https://hs.example\nuser_id = @me:hs.example\n"
+            "\n[preview]\nascii_ramp = @+.\n",
+        )
+        assert Config.load(path).ascii_ramp == "@+."
+        path = write_config(
+            tmp_path,
+            "[matrix]\nhomeserver = https://hs.example\nuser_id = @me:hs.example\n"
+            "\n[preview]\nascii_ramp = x\n",
+        )
+        # A single glyph cannot form a gradient: fall back to the default.
+        assert Config.load(path).ascii_ramp == DEFAULT_ASCII_RAMP
+
+    def test_template_documents_the_section(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            Config.load(tmp_path / "config.ini")
+        assert "[preview]" in (tmp_path / "config.ini").read_text()
+
+
 class TestVersion:
     def test_dunder_version_matches_pyproject(self):
         # The version lives in two places: pyproject.toml feeds the packaged

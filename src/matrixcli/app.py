@@ -165,6 +165,75 @@ def _fmt_size(size: int) -> str:
     return ""
 
 
+# Fallback for uploads whose info block advertises no mimetype (the spec makes
+# it optional); anything Pillow can plausibly open by filename.
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".ico")
+
+
+def _is_image(m) -> bool:
+    """True when the upload is worth offering the space-key preview for."""
+    if not m.media_url or m.redacted_ts:
+        return False
+    if (m.media_mime or "").lower().startswith("image/"):
+        return True
+    name = (m.media_name or m.body or "").lower().strip()
+    return name.endswith(IMAGE_EXTENSIONS)
+
+
+def _ascii_art(img, max_w: int, max_h: int, ramp: str) -> Text:
+    """The image as classic ASCII art fitted into max_w x max_h cells: one
+    glyph per pixel, picked from ``ramp`` (most ink first) by luminance.
+    ramp[0] paints the brightest pixels, since dense glyphs read bright on a
+    dark terminal. A cell is about twice as tall as it is wide, so the pixel
+    grid is squeezed to half height to preserve the image's aspect."""
+    gray = img.convert("L")
+    scale = min(max_w / gray.width, 2 * max_h / gray.height)
+    w = max(1, round(gray.width * scale))
+    h = max(1, round(gray.height * scale / 2))
+    px = gray.resize((w, h)).load()
+    span = len(ramp) - 1
+    # no_wrap: rendered against a stale mid-resize width, a wrapping line
+    # would spill one cell onto a blank row and stripe the whole picture;
+    # cropping is invisible by comparison (a follow-up render fixes the size).
+    text = Text(no_wrap=True)
+    for y in range(h):
+        line = "".join(ramp[(255 - px[x, y]) * span // 255] for x in range(w))
+        text.append(line + ("\n" if y + 1 < h else ""))
+    return text
+
+
+def _block_art(img, max_w: int, max_h: int) -> Text:
+    """The image as truecolor half-blocks fitted into max_w x max_h cells:
+    each cell is one "▀" whose foreground is the upper pixel and background
+    the lower. The two stacked pixels fill the cell's ~1:2 shape, so pixels
+    come out square and no aspect correction is needed."""
+    rgb = img.convert("RGB")
+    scale = min(max_w / rgb.width, 2 * max_h / rgb.height)
+    w = max(1, round(rgb.width * scale))
+    h = max(2, round(rgb.height * scale))
+    h -= h % 2  # rows are consumed in upper/lower pairs
+    px = rgb.resize((w, h)).load()
+    text = Text(no_wrap=True)  # see _ascii_art: wrapping would stripe the art
+    for y in range(0, h, 2):
+        # Append runs of identical color pairs as one styled span, not one
+        # span per cell: photos still make many spans, but flat areas (and
+        # screenshots are mostly flat) collapse to a few.
+        run_style, run_len = "", 0
+        for x in range(w):
+            top, bottom = px[x, y], px[x, y + 1]
+            style = f"rgb({top[0]},{top[1]},{top[2]}) on rgb({bottom[0]},{bottom[1]},{bottom[2]})"
+            if style == run_style:
+                run_len += 1
+                continue
+            if run_len:
+                text.append("▀" * run_len, style=run_style)
+            run_style, run_len = style, 1
+        text.append("▀" * run_len, style=run_style)
+        if y + 2 < h:
+            text.append("\n")
+    return text
+
+
 # The sync loop long-polls for 30s, so a healthy session sees a response at
 # least that often; once the last one is older than this, the connection is
 # presumed dead even if no request has errored out yet (a silently dropped
@@ -328,6 +397,10 @@ class RoomScreen(Screen):
         Binding("enter", "open_link", "Open link"),
         Binding("enter", "open_reactions", "Who reacted"),
         Binding("enter", "open_actions", "Message actions"),
+        # Gated by check_action to image uploads: an in-terminal rendering of
+        # the picture, ASCII art or truecolor half-blocks ("~" in the popup
+        # flips between them).
+        ("space", "preview_image", "Preview"),
         # Enter acts on what a message says; Shift+Enter looks behind it, at
         # the versions of an edited one or the text of a deleted one.
         Binding("shift+enter", "open_details", "Show history"),
@@ -1305,6 +1378,10 @@ class RoomScreen(Screen):
             if self.selected >= len(self.messages):
                 return False
             return self._has_history(self.messages[self.selected])
+        if action == "preview_image":
+            if self.selected >= len(self.messages):
+                return False
+            return _is_image(self.messages[self.selected])
         if action.startswith("open_"):
             actions = self._selected_actions()
             if not actions:
@@ -1418,7 +1495,8 @@ class RoomScreen(Screen):
             size = _fmt_size(m.media_size)
             if size:
                 label.append(f"  ({size})", style="dim")
-            label.append("  Enter to download", style="dim italic")
+            hint = "  Enter to download" + (", space to preview" if _is_image(m) else "")
+            label.append(hint, style="dim italic")
             if m.mentions_me:
                 label.append(" @", style="bold red")
             self._mark_history(label, m)
@@ -1645,6 +1723,28 @@ class RoomScreen(Screen):
         m = self.messages[self.selected]
         if self._has_history(m):
             self.app.push_screen(HistoryScreen(self.entry, m))
+
+    def action_preview_image(self) -> None:
+        """Space on an image upload: render it right in the terminal."""
+        if self.selected >= len(self.messages):
+            return
+        if not _is_image(self.messages[self.selected]):
+            return
+
+        def when_closed(event_id) -> None:
+            # j/k inside the preview walked to another image: land the
+            # timeline selection on the one last shown.
+            idx = next(
+                (i for i, m in enumerate(self.messages) if m.event_id == event_id),
+                None,
+            )
+            if idx is not None and idx != self.selected:
+                self.selected = idx
+                self._highlight()
+
+        self.app.push_screen(
+            PreviewScreen(list(self.messages), self.selected), when_closed
+        )
 
     # Four names for one key: check_action enables exactly the one that
     # describes what Enter will do here, so the footer names it.
@@ -2170,6 +2270,178 @@ class ActionScreen(PickerScreen):
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         self.dismiss(getattr(event.item, "action", None))
+
+
+class PreviewScreen(ModalScreen):
+    """An image upload rendered in the terminal (space on an image message):
+    truecolor half-blocks (the default), or classic ASCII art built from
+    the configured ramp. "~" flips between the two styles, and the choice
+    is remembered in state.json; j/k walk to the room's next/previous image
+    without leaving the preview; Escape (or q) closes, dismissing with the
+    event id last shown so the timeline selection can follow. Each image is
+    fetched once, scaled to the window, and rescaled on every resize."""
+
+    BINDINGS = [
+        ("escape", "cancel", "Close"),
+        Binding("q", "cancel", "Close", show=False),
+        # Gated by check_action to whether another image exists in that
+        # direction, so the footer drops them at the ends of the gallery.
+        ("j", "next_image", "Next image"),
+        ("k", "prev_image", "Previous image"),
+        Binding("down", "next_image", "Next image", show=False),
+        Binding("up", "prev_image", "Previous image", show=False),
+        # Two bindings share "~" like the room screen's t/c pairs:
+        # check_action enables the one whose label names the style currently
+        # on screen, so the footer reads as state.
+        Binding("tilde", "mode_blocks", "Style: ascii"),
+        Binding("tilde", "mode_ascii", "Style: blocks"),
+    ]
+
+    def __init__(self, messages: list, index: int) -> None:
+        super().__init__()
+        self.messages = messages  # a snapshot of the room's rows, for j/k
+        self.index = index  # the row on show; always an image message
+        self.image = None  # a PIL image once fetched and decoded
+        self.error = ""
+        self._cache = {}  # event id -> decoded image, so j/k never refetches
+        self._seq = 0  # fetch generation: a stale in-flight fetch must not paint
+
+    @property
+    def message(self):
+        return self.messages[self.index]
+
+    @property
+    def mode(self) -> str:
+        mode = self.app.session.state.get("preview_mode")
+        return mode if mode in ("ascii", "blocks") else "blocks"
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="previewbox"):
+            # escape() + truncation: the filename comes from the sender.
+            raw = (self.message.media_name or self.message.body or "image")[:120]
+            yield Label(escape(raw), id="previewtitle")
+            yield Static(Text("fetching image...", style="dim italic"), id="previewart")
+
+    def on_mount(self) -> None:
+        # In a worker, so Escape closes the popup even while the fetch is in
+        # flight; until it lands the box shows its placeholder line.
+        self.run_worker(self._fetch())
+
+    async def _fetch(self) -> None:
+        seq = self._seq
+        message = self.message
+        image, error = self._cache.get(message.event_id), ""
+        if image is None:
+            # Ask the server for a thumbnail around the largest this window
+            # could show (half-blocks paint two pixel rows per cell);
+            # encrypted media falls back to the full download inside
+            # fetch_preview_bytes.
+            try:
+                ok, result = await self.app.session.fetch_preview_bytes(
+                    message, self.app.size.width, self.app.size.height * 2
+                )
+            except Exception as exc:
+                ok, result = False, str(exc)
+            if ok:
+                from io import BytesIO
+
+                from PIL import Image
+
+                try:
+                    image = Image.open(BytesIO(result))
+                    image.load()  # decode now: errors must land here, not mid-render
+                except Exception as exc:
+                    image, error = None, f"could not decode image: {exc}"
+                else:
+                    self._cache[message.event_id] = image  # GIFs: first frame
+            else:
+                error = str(result)
+        if seq != self._seq or not self.is_attached:
+            return  # j/k moved on (or the popup closed) while this was in flight
+        self.image, self.error = image, error
+        self._render_art()
+
+    def _render_art(self) -> None:
+        art = self.query_one("#previewart", Static)
+        if self.error:
+            art.update(Text(f"Preview failed: {self.error}", style="bold red"))
+            return
+        if self.image is None:
+            return  # still fetching; the placeholder line stays up
+        box = self.query_one("#previewbox", Vertical)
+        w = max(2, box.content_size.width)
+        h = max(2, box.content_size.height - 1)  # minus the title line
+        if self.mode == "blocks":
+            art.update(_block_art(self.image, w, h))
+        else:
+            art.update(_ascii_art(self.image, w, h, self.app.session.cfg.ascii_ramp))
+
+    def on_resize(self, event) -> None:
+        # A cheap full re-render from the already-decoded image, deferred
+        # past the layout pass: this Resize arrives before the children have
+        # their new sizes, and measuring #previewbox now would rebuild the
+        # art against the stale geometry.
+        self.call_after_refresh(self._render_art)
+
+    def _image_index(self, delta: int) -> int | None:
+        """The row index of the nearest image message in that direction, or
+        None when the current one is the last of them."""
+        i = self.index + delta
+        while 0 <= i < len(self.messages):
+            if _is_image(self.messages[i]):
+                return i
+            i += delta
+        return None
+
+    def _go(self, delta: int) -> None:
+        target = self._image_index(delta)
+        if target is None:
+            return
+        self.index = target
+        self._seq += 1  # orphan any fetch still in flight for the old image
+        self.image, self.error = None, ""
+        raw = (self.message.media_name or self.message.body or "image")[:120]
+        self.query_one("#previewtitle", Label).update(escape(raw))
+        self.query_one("#previewart", Static).update(
+            Text("fetching image...", style="dim italic")
+        )
+        self.refresh_bindings()  # the ends of the gallery drop a j/k label
+        self.run_worker(self._fetch())
+
+    def action_next_image(self) -> None:
+        self._go(1)
+
+    def action_prev_image(self) -> None:
+        self._go(-1)
+
+    def check_action(self, action: str, parameters) -> bool:
+        if action == "mode_blocks":
+            return self.mode == "ascii"
+        if action == "mode_ascii":
+            return self.mode == "blocks"
+        if action == "next_image":
+            return self._image_index(1) is not None
+        if action == "prev_image":
+            return self._image_index(-1) is not None
+        return True
+
+    def _set_mode(self, mode: str) -> None:
+        session = self.app.session
+        session.state["preview_mode"] = mode
+        session.cfg.save_state(session.state)
+        self.refresh_bindings()  # footer flips between the style labels
+        self._render_art()
+
+    def action_mode_blocks(self) -> None:
+        self._set_mode("blocks")
+
+    def action_mode_ascii(self) -> None:
+        self._set_mode("ascii")
+
+    def action_cancel(self) -> None:
+        # The event id last on show, so the room lands its selection there
+        # after a j/k walk through the gallery.
+        self.dismiss(self.message.event_id)
 
 
 class HistoryScreen(ModalScreen):
@@ -3126,6 +3398,21 @@ class MatrixApp(App):
     #reactbox #reacthits { max-height: 12; }
     #actionbox #actions { max-height: 12; }
     #editsbox #versions { height: auto; max-height: 20; }
+    /* Full-screen and opaque: the art must not blend into the timeline
+       behind it, and every cell of the window is canvas. */
+    #previewbox {
+        width: 100%;
+        height: 100%;
+        padding: 0 1;
+        background: $background;
+        align: center middle;
+    }
+    #previewtitle {
+        text-style: bold;
+        height: 1;
+        color: $foreground 60%;
+    }
+    #previewart { width: auto; height: auto; }
     #reactionsbox #reactors { height: auto; max-height: 20; }
     AboutScreen, ConfirmScreen { align: center middle; }
     #confirmbox {

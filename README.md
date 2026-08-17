@@ -134,6 +134,19 @@ In a room:
   A message with several of those (more than one link, or a file with a link
   in its caption) shows a popup to pick which (`Message actions`). Every popup
   takes `j`/`k` or `↓`/`↑` to choose, `Enter` to confirm, and `Esc` to cancel.
+- `Space`: preview the selected image upload right in the terminal, scaled
+  to the window and rescaled live when the window resizes (a gimmick, but a
+  useful one). Two styles, flipped with `~` inside the preview and remembered
+  across sessions: truecolor half-blocks (the default), and classic ASCII art
+  built from a configurable character ramp (`[preview] ascii_ramp` in
+  `config.ini`; the default is
+  [Paul Bourke's 70-level ramp](https://paulbourke.net/dataformats/asciiart/),
+  mapped brightest-pixel-to-densest-glyph for dark terminals, so reverse the
+  string on a light one). `j`/`k` walk straight to the room's next/previous
+  image without leaving the preview, and closing lands the timeline selection
+  on the image last shown. Unencrypted images fetch a server-side thumbnail;
+  encrypted ones download and decrypt the full file. The bottom bar shows the
+  current style (`Style: ascii` / `Style: blocks`); `Esc` closes.
 - `Shift+Enter`: look behind the selected message, when it carries a trailing
   `*` saying the line on screen is not the whole story (`Show history`). This
   is a separate key from `Enter` so neither has to guess which you meant on,

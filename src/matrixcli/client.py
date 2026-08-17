@@ -148,6 +148,7 @@ class Message:
     media_url: str = ""  # mxc:// URL when this message is an uploaded file
     media_name: str = ""  # upload filename (body may be a caption)
     media_size: int = 0  # bytes, from content.info, 0 if unknown
+    media_mime: str = ""  # mimetype from content.info ("" if unadvertised)
     media_crypt: dict | None = None  # key/iv/hash for encrypted attachments
     pending: bool = False  # local echo awaiting the server's event id
     replaces: str = ""  # an m.replace edit: the event id whose text it rewrites
@@ -173,6 +174,7 @@ def _media_info(event) -> dict:
         "media_url": event.url or "",
         "media_name": _clean(content.get("filename") or getattr(event, "body", "") or ""),
         "media_size": info.get("size", 0) or 0,
+        "media_mime": _clean(info.get("mimetype") or ""),
     }
     if isinstance(event, RoomEncryptedMedia):
         out["media_crypt"] = {
@@ -3224,11 +3226,11 @@ class MatrixSession:
             return True, resp.event_id, True
         return False, getattr(resp, "message", "reaction failed"), True
 
-    async def download_media(self, message: Message, directory) -> tuple[bool, str]:
-        """Download an uploaded file into ``directory`` (a Path), decrypting
-        it when it came from an encrypted room. Returns (ok, saved-path) or
-        (False, error). The filename comes from the upload, sanitized to its
-        basename and deduplicated so nothing is overwritten."""
+    async def fetch_media_bytes(self, message: Message) -> tuple[bool, bytes | str]:
+        """The full attachment as bytes in memory, decrypted when it came from
+        an encrypted room. Returns (True, bytes) or (False, error string).
+        Shared by download_media (which writes them out) and the image preview
+        (which renders them)."""
         if not message.media_url:
             return False, "not a file message"
         # Reject before downloading when the server-advertised size is already
@@ -3260,6 +3262,42 @@ class MatrixSession:
                 body = decrypt_attachment(body, c["key"], c["sha256"], c["iv"])
             except Exception as exc:
                 return False, f"could not decrypt attachment: {exc}"
+        return True, body
+
+    async def fetch_preview_bytes(
+        self, message: Message, width: int, height: int
+    ) -> tuple[bool, bytes | str]:
+        """Image bytes for an in-terminal preview, at roughly width x height
+        pixels. Unencrypted media asks the server's thumbnail endpoint first
+        (a pre-scaled image instead of a possibly huge original); encrypted
+        attachments have no server-side thumbnails, so those (and a failed
+        thumbnail request) fall back to the full download."""
+        if message.media_url and not message.media_crypt:
+            # mxc://server/media_id, the two parts nio's thumbnail() wants.
+            parts = message.media_url.removeprefix("mxc://").split("/", 1)
+            if len(parts) == 2 and all(parts):
+                try:
+                    resp = await asyncio.wait_for(
+                        self.client.thumbnail(
+                            parts[0], parts[1], max(width, 64), max(height, 64)
+                        ),
+                        timeout=60,
+                    )
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                    resp = None
+                body = getattr(resp, "body", None)
+                if isinstance(body, bytes) and 0 < len(body) <= MAX_DOWNLOAD_BYTES:
+                    return True, body
+        return await self.fetch_media_bytes(message)
+
+    async def download_media(self, message: Message, directory) -> tuple[bool, str]:
+        """Download an uploaded file into ``directory`` (a Path), decrypting
+        it when it came from an encrypted room. Returns (ok, saved-path) or
+        (False, error). The filename comes from the upload, sanitized to its
+        basename and deduplicated so nothing is overwritten."""
+        ok, body = await self.fetch_media_bytes(message)
+        if not ok:
+            return False, body
         # Basename only (strips any directory components), control characters
         # removed, and the degenerate names that would resolve to the directory
         # itself replaced.

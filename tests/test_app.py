@@ -14,9 +14,12 @@ from matrixcli.app import (
     ReactionsScreen,
     RoomScreen,
     ThreadScreen,
+    _ascii_art,
+    _block_art,
     _emoji_names,
     _find_urls,
     _fmt_time,
+    _is_image,
     _sender_color,
 )
 from matrixcli.client import Entry, Message
@@ -1793,3 +1796,233 @@ class TestBrowseHistory:
 
         # Still the 5 archived rows: the live reload did not clobber the view.
         assert self.run(steps) == {"count": 5, "browsing": True}
+
+
+class TestImagePreview:
+    def message(self, **kw):
+        defaults = dict(
+            sender="@a:hs", sender_name="A", body="pic", ts=1, event_id="$1"
+        )
+        defaults.update(kw)
+        return Message(**defaults)
+
+    def test_is_image_by_mimetype_extension_and_not_otherwise(self):
+        assert _is_image(self.message(media_url="mxc://hs/x", media_mime="image/jpeg"))
+        assert _is_image(self.message(media_url="mxc://hs/x", media_name="cat.PNG"))
+        assert not _is_image(self.message(media_url="mxc://hs/x", media_name="doc.pdf"))
+        assert not _is_image(self.message())  # plain text, no upload
+        assert not _is_image(
+            self.message(media_url="mxc://hs/x", media_mime="image/png", redacted_ts=5)
+        )
+
+    def test_check_action_gates_p_to_image_uploads(self):
+        screen = RoomScreen(make_entry())
+        screen.messages = [self.message(media_url="mxc://hs/x", media_mime="image/png")]
+        screen.selected = 0
+        assert screen.check_action("preview_image", ()) is True
+        screen.messages = [self.message(media_url="mxc://hs/x", media_name="doc.pdf")]
+        assert screen.check_action("preview_image", ()) is False
+        assert RoomScreen(make_entry()).check_action("preview_image", ()) is False
+
+    def gradient(self):
+        from PIL import Image
+
+        img = Image.new("L", (64, 32))
+        for x in range(64):
+            for y in range(32):
+                img.putpixel((x, y), min(255, x * 4))
+        return img
+
+    def test_ascii_art_fits_and_keeps_aspect(self):
+        art = _ascii_art(self.gradient(), 40, 40, "@:. ")
+        lines = art.plain.split("\n")
+        assert all(len(line) <= 40 for line in lines) and len(lines) <= 40
+        # A cell is twice as tall as wide: a 2:1 image lands near 4:1 in cells.
+        assert 3.0 < len(lines[0]) / len(lines) <= 4.5
+
+    def test_ascii_art_maps_bright_to_dense(self):
+        from PIL import Image
+
+        img = Image.new("L", (64, 32), 0)
+        img.paste(255, (32, 0, 64, 32))  # left half black, right half white
+        lines = _ascii_art(img, 40, 40, "@ ").plain.split("\n")
+        # ramp[0] carries the most ink and must paint the BRIGHT half (light
+        # text on a dark terminal); pure black gets the ramp's last glyph.
+        assert lines[0][-1] == "@" and lines[0][0] == " "
+
+    def test_block_art_fits_and_is_all_half_blocks(self):
+        art = _block_art(self.gradient(), 40, 40)
+        lines = art.plain.split("\n")
+        assert all(len(line) <= 40 for line in lines) and len(lines) <= 40
+        assert set("".join(lines)) == {"▀"}
+        # Half-blocks show square pixels: a 2:1 image lands near 4:1 in cells
+        # (two pixel rows per cell row).
+        assert 3.0 < len(lines[0]) / len(lines) <= 4.5
+
+    def test_one_pixel_image_does_not_crash(self):
+        from PIL import Image
+
+        tiny = Image.new("L", (1, 1), 0)
+        assert _ascii_art(tiny, 80, 24, "@ ").plain.strip("\n") != ""
+        assert "▀" in _block_art(tiny, 80, 24).plain
+
+
+class TestPreviewScreen:
+    def run(self, steps):
+        """Open a room holding two image uploads (a text row between them) in
+        a headless app, with a session whose fetch_preview_bytes serves a real
+        PNG, and hand the pilot to `steps`. The selection starts on the last
+        row, cat2.png."""
+        import io
+
+        from PIL import Image
+        from textual.app import App
+
+        from matrixcli.app import MatrixApp, PreviewScreen
+
+        buf = io.BytesIO()
+        Image.new("RGB", (32, 16), (200, 30, 30)).save(buf, format="PNG")
+        png = buf.getvalue()
+
+        history = [
+            Message(
+                sender="@a:hs", sender_name="A", body="cat1.png", ts=100,
+                event_id="$img1", media_url="mxc://hs/img1",
+                media_name="cat1.png", media_mime="image/png",
+            ),
+            Message(
+                sender="@a:hs", sender_name="A", body="just text", ts=101,
+                event_id="$txt",
+            ),
+            Message(
+                sender="@a:hs", sender_name="A", body="cat2.png", ts=102,
+                event_id="$img2", media_url="mxc://hs/img2",
+                media_name="cat2.png", media_mime="image/png",
+            ),
+        ]
+        state = {}
+        session = SimpleNamespace(
+            cfg=SimpleNamespace(
+                user_id="@me:hs",
+                ascii_ramp="@:. ",
+                save_state=lambda s: None,
+            ),
+            my_name="Me",
+            client=SimpleNamespace(rooms={}),
+            last_event_id={},
+            load_history=lambda room_id, limit=40, cached_only=False: _async(list(history)),
+            mark_read=lambda room_id: _async(None),
+            start_backfill=lambda room_id: None,
+            reset_pagination=lambda room_id: None,
+            drafts={},
+            reaction_summary=lambda room_id, event_id: [],
+            state=state,
+            fetch_preview_bytes=lambda m, w, h: _async((True, png)),
+        )
+
+        class RoomApp(App):
+            CSS = MatrixApp.CSS
+
+            def on_mount(self):
+                self.session = session
+                self.last_sync_at = None
+                self.sync_ok = True
+                return self.push_screen(RoomScreen(make_entry()))
+
+        async def run() -> dict:
+            app = RoomApp()
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.pause()
+                return await steps(pilot, app, PreviewScreen, state)
+
+        return asyncio.run(run())
+
+    def test_space_opens_toggles_persists_and_closes(self):
+        async def steps(pilot, app, preview_cls, state):
+            from textual.widgets import Static
+
+            await pilot.press("space")
+            await pilot.pause()  # popup mounts, fetch worker starts
+            await pilot.pause()  # worker lands and renders
+            assert isinstance(app.screen, preview_cls)
+            blocks = app.screen.query_one("#previewart", Static).content.plain
+            assert "▀" in blocks  # half-blocks are the default style
+
+            await pilot.press("tilde")
+            await pilot.pause()
+            ascii_art = app.screen.query_one("#previewart", Static).content.plain
+            # Solid (200,30,30) red has luminance ~81, which the "@:. " ramp
+            # maps to ".": a grid of dots, drawn purely from ramp glyphs.
+            assert set(ascii_art) <= set("@:. \n") and "." in ascii_art
+
+            await pilot.press("tilde")
+            await pilot.pause()
+            back = app.screen.query_one("#previewart", Static).content.plain
+            mode_after_two_flips = state.get("preview_mode")
+
+            await pilot.press("escape")
+            await pilot.pause()
+            return {
+                "blocks_again": "▀" in back,
+                "mode": mode_after_two_flips,
+                "closed": isinstance(app.screen, RoomScreen),
+            }
+
+        out = self.run(steps)
+        assert out["blocks_again"] is True
+        assert out["mode"] == "blocks"  # ~ twice lands back where it started
+        assert out["closed"] is True
+
+    def test_j_k_walk_the_images_and_selection_follows(self):
+        async def steps(pilot, app, preview_cls, state):
+            from textual.widgets import Label
+
+            def title():
+                return str(app.screen.query_one("#previewtitle", Label).content)
+
+            await pilot.press("space")
+            await pilot.pause()
+            await pilot.pause()
+            assert title() == "cat2.png"
+            # No image below cat2: j is gated off and must do nothing.
+            assert app.screen.check_action("next_image", ()) is False
+            await pilot.press("j")
+            await pilot.pause()
+            assert title() == "cat2.png"
+
+            # k skips the text row and lands on cat1.
+            await pilot.press("k")
+            await pilot.pause()
+            await pilot.pause()
+            assert title() == "cat1.png"
+            assert app.screen.check_action("prev_image", ()) is False
+
+            await pilot.press("escape")
+            await pilot.pause()
+            room = app.screen
+            return {"closed": isinstance(room, RoomScreen), "selected": room.selected}
+
+        out = self.run(steps)
+        assert out["closed"] is True
+        assert out["selected"] == 0  # the timeline followed the j/k walk
+
+    def test_window_resize_rescales_the_art(self):
+        async def steps(pilot, app, preview_cls, state):
+            from textual.widgets import Static
+
+            await pilot.press("space")
+            await pilot.pause()
+            await pilot.pause()
+            wide = app.screen.query_one("#previewart", Static).content.plain
+            await pilot.resize_terminal(40, 24)
+            await pilot.pause()
+            narrow = app.screen.query_one("#previewart", Static).content.plain
+            return {
+                "wide": max(len(line) for line in wide.split("\n")),
+                "narrow": max(len(line) for line in narrow.split("\n")),
+            }
+
+        out = self.run(steps)
+        # 80->40 columns: the art re-rendered to roughly half the width, with
+        # no refetch (the decoded image is cached on the screen).
+        assert out["narrow"] <= 40 < out["wide"]

@@ -1,6 +1,6 @@
 [project]
 name = "matrixcli"
-version = "2.6"
+version = "2.7"
 description = "A terminal Matrix client with an unread-first home dashboard, end-to-end encryption, and macOS Keychain credentials"
 authors = [{ name = "Eljakim" }]
 readme = "README.md"
@@ -9,6 +9,7 @@ dependencies = [
     "textual (>=0.80.0,<9.0.0)",
     "matrix-nio[e2e] (>=0.26.0,<0.30.0)",
     "keyring (>=24.0,<26.0)",
+    "pillow (>=12.3.0,<13.0.0)",
 ]
 # matrix-nio's e2e extra uses vodozemac (prebuilt Rust wheels), so it
 # installs cleanly everywhere with no system crypto libraries.
