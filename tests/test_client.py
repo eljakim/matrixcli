@@ -1883,6 +1883,72 @@ class TestRoomMetaSnapshot:
         asyncio.run(main())
         assert posts == ["$1", "$3"]
 
+    def test_marker_post_names_a_message_not_the_latest_reaction(self, session):
+        # A reaction bumps last_event_id (that is what triggers redraws), but
+        # the posted m.fully_read must name a timeline row, or the divider on
+        # the next open cannot find it and degrades to the count guess. The
+        # receipt still carries the true latest event; an edit entry maps to
+        # the message it rewrites; pending local echoes are skipped.
+        posts = []
+
+        async def fake_markers(room_id, fully_read_event=None, read_event=None):
+            posts.append((fully_read_event, read_event))
+
+        session.client.room_read_markers = fake_markers
+        session.timelines["!a:hs"].extend(
+            [
+                Message(
+                    sender=ALICE, sender_name="A", body="hi", ts=1, event_id="$m1"
+                ),
+                Message(
+                    sender=ALICE,
+                    sender_name="A",
+                    body="hi!",
+                    ts=2,
+                    event_id="$edit",
+                    replaces="$m1",
+                ),
+                Message(
+                    sender=ALICE,
+                    sender_name="A",
+                    body="echo",
+                    ts=3,
+                    event_id="~local.1",
+                    pending=True,
+                ),
+            ]
+        )
+
+        async def main():
+            session.last_event_id["!a:hs"] = "$react"
+            await session.mark_read("!a:hs")
+            task = session._marker_tasks.get("!a:hs")
+            if task is not None:
+                await task
+
+        asyncio.run(main())
+        assert posts == [("$m1", "$react")]
+
+    def test_marker_post_falls_back_to_last_event_id(self, session):
+        # No cached timeline (e.g. an encrypted room we lack keys for):
+        # last_event_id is the only signal there is.
+        posts = []
+
+        async def fake_markers(room_id, fully_read_event=None, read_event=None):
+            posts.append((fully_read_event, read_event))
+
+        session.client.room_read_markers = fake_markers
+
+        async def main():
+            session.last_event_id["!a:hs"] = "$only"
+            await session.mark_read("!a:hs")
+            task = session._marker_tasks.get("!a:hs")
+            if task is not None:
+                await task
+
+        asyncio.run(main())
+        assert posts == [("$only", "$only")]
+
     def test_ensure_room_registers_with_persisted_encryption_flag(self, session):
         # Sending into a room the resumed session has not seen live: nio's
         # room_send looks the room up (KeyError without this) and its
@@ -1899,6 +1965,29 @@ class TestRoomMetaSnapshot:
         session.client.rooms["!a:hs"] = room
         session._ensure_room("!a:hs")
         assert session.client.rooms["!a:hs"] is room
+
+
+class TestEventTimestamp:
+    def test_returns_the_server_timestamp(self, session):
+        async def fake_get(room_id, event_id):
+            return SimpleNamespace(event=SimpleNamespace(server_timestamp=123))
+
+        session.client.room_get_event = fake_get
+        assert asyncio.run(session.event_timestamp("!a:hs", "$e")) == 123
+
+    def test_error_response_yields_none(self, session):
+        async def fake_get(room_id, event_id):
+            return SimpleNamespace(message="not found")
+
+        session.client.room_get_event = fake_get
+        assert asyncio.run(session.event_timestamp("!a:hs", "$e")) is None
+
+    def test_transport_exception_yields_none(self, session):
+        async def fake_get(room_id, event_id):
+            raise RuntimeError("network down")
+
+        session.client.room_get_event = fake_get
+        assert asyncio.run(session.event_timestamp("!a:hs", "$e")) is None
 
 
 class TestInvites:

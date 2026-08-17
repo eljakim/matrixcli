@@ -755,7 +755,18 @@ class RoomScreen(Screen):
             # snapshot, and recomputing it as live messages grow the list
             # would drift the divider onto messages that arrived while you
             # were reading.
-            idx = self._first_unread_index()
+            marker = self._opened_read_marker
+            marker_ts = None
+            if (
+                self._divider_ts_fallback
+                and marker
+                and self.messages
+                and all(m.event_id != marker for m in self.messages)
+            ):
+                marker_ts = await self.app.session.event_timestamp(
+                    self.entry.room_id, marker
+                )
+            idx = self._first_unread_index(marker_ts)
             self._first_unread_event = (
                 self.messages[idx].event_id if idx is not None else None
             )
@@ -1386,7 +1397,12 @@ class RoomScreen(Screen):
         self.expanded.discard(root_id)
         self.run_worker(self._reload_view(keep=root_id))
 
-    def _first_unread_index(self) -> int | None:
+    # The timestamp fallback below asks the server about a marker that is
+    # not a display row; threads opt out (their override only trusts a
+    # marker inside the thread, so the fetch would be wasted).
+    _divider_ts_fallback = True
+
+    def _first_unread_index(self, marker_ts: int | None = None) -> int | None:
         """Index in the display list of the first message after the read
         marker captured at open, or None when everything was already read.
         Evaluated once against the opening snapshot (on_mount stores the
@@ -1401,9 +1417,19 @@ class RoomScreen(Screen):
             )
             if pos is not None:
                 return pos + 1 if pos + 1 < len(self.messages) else None
-        # No marker recorded, or it predates the loaded window: fall back to
-        # the unread count the room reported when opened; without either
-        # signal, treat the room as read rather than flagging everything.
+        # The marker exists but is not a row here (a reaction or redaction
+        # id, or an event beyond the loaded window). Its fetched timestamp
+        # is the exact read horizon: the first newer message starts the
+        # unread run, and no newer message means everything was read.
+        if marker_ts is not None:
+            return next(
+                (i for i, m in enumerate(self.messages) if m.ts > marker_ts),
+                None,
+            )
+        # No marker recorded, or its timestamp could not be fetched: fall
+        # back to the unread count the room reported when opened; without
+        # either signal, treat the room as read rather than flagging
+        # everything.
         if self.entry.unread:
             return max(0, len(self.messages) - self.entry.unread)
         return None
@@ -2233,7 +2259,9 @@ class ThreadScreen(RoomScreen):
         # same room do not overwrite each other.
         return f"{self.entry.room_id}:{self.root.event_id}"
 
-    def _first_unread_index(self) -> int | None:
+    _divider_ts_fallback = False
+
+    def _first_unread_index(self, marker_ts: int | None = None) -> int | None:
         """The room-level unread count counts main-timeline events, so it says
         nothing about this thread; only an explicit read marker that lands
         inside the thread can place the divider meaningfully."""

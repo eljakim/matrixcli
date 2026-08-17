@@ -3355,6 +3355,19 @@ class MatrixSession:
             fh.write(body)
         return True, str(target)
 
+    async def event_timestamp(self, room_id: str, event_id: str) -> int | None:
+        """Server timestamp of a single event, or None when it cannot be
+        fetched. Lets the unread divider place itself when the stored read
+        marker is not a timeline row (a reaction or redaction id, or an edit
+        written by another client): everything at or before this moment had
+        been read."""
+        try:
+            resp = await self.client.room_get_event(room_id, event_id)
+        except Exception:
+            return None
+        ts = getattr(getattr(resp, "event", None), "server_timestamp", None)
+        return ts if isinstance(ts, int) else None
+
     async def mark_read(self, room_id: str) -> None:
         """Move the room's read marker to its latest event. Called after
         every refresh of an open room, which at peak traffic is once per
@@ -3393,9 +3406,20 @@ class MatrixSession:
             event_id = self.last_event_id.get(room_id)
             if not event_id or self._marker_sent.get(room_id) == event_id:
                 return
+            # The receipt tracks the true latest event, but m.fully_read
+            # should name a message: last_event_id may be a reaction or
+            # redaction id (their callbacks bump it to trigger redraws), and
+            # a marker pointing at one is invisible to the unread divider on
+            # the next open, degrading it to the unread-count guess. Edits
+            # map to the message they rewrite, which is the row on screen.
+            fully_read = event_id
+            for m in reversed(self.timelines.get(room_id) or ()):
+                if m.event_id and not m.pending:
+                    fully_read = m.replaces or m.event_id
+                    break
             try:
                 await self.client.room_read_markers(
-                    room_id, fully_read_event=event_id, read_event=event_id
+                    room_id, fully_read_event=fully_read, read_event=event_id
                 )
             except Exception:
                 return  # the next refresh retries; the marker is cosmetic

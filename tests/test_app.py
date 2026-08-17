@@ -341,6 +341,19 @@ class TestFirstUnread:
         screen = self.make_screen(marker="$gone", unread=2)
         assert screen._first_unread_index() == 3
 
+    def test_marker_ts_places_divider_after_the_read_horizon(self):
+        # The stored marker can be a reaction id, never a display row; its
+        # fetched timestamp still says exactly what had been read, and it
+        # wins over the count fallback (which would answer 1 here).
+        screen = self.make_screen(marker="$react", unread=4)
+        assert screen._first_unread_index(marker_ts=2) == 3
+
+    def test_marker_ts_newer_than_every_row_means_read(self):
+        # A thumbs-up (or an edit) after the last message must not flag an
+        # already-read message as new, even when a stale count says so.
+        screen = self.make_screen(marker="$react", unread=2)
+        assert screen._first_unread_index(marker_ts=9) is None
+
     def test_no_signals_means_read(self):
         assert self.make_screen()._first_unread_index() is None
 
@@ -383,6 +396,14 @@ class TestThreadScreenUnread:
 
     def test_marker_at_last_reply_means_no_unread(self):
         assert self.make_screen(marker="$4")._first_unread_index() is None
+
+    def test_marker_ts_is_ignored_in_threads(self):
+        # A room-level marker timestamp says nothing about which thread
+        # replies were read; only a marker inside the thread places the
+        # divider (and _divider_ts_fallback stops the fetch upstream).
+        screen = self.make_screen(marker="$gone")
+        assert screen._first_unread_index(marker_ts=1) is None
+        assert screen._divider_ts_fallback is False
 
 
 def msg(event_id, ts, root="", count=0):
