@@ -1,9 +1,10 @@
 import asyncio
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import aiohttp
-from nio.events.room_events import RoomMessageText
+from nio.events.room_events import Event, RoomMessageText, RoomSpaceChildEvent
 
 from matrixcli.client import MatrixSession, Message, fold_edits
 
@@ -44,12 +45,6 @@ def edit_source(event_id, sender, ts, new_body, target):
             "m.relates_to": {"rel_type": "m.replace", "event_id": target},
         },
     }
-
-
-def edit_event(event_id, sender, ts, new_body, target):
-    return RoomMessageText.from_dict(
-        edit_source(event_id, sender, ts, new_body, target)
-    )
 
 
 class TestEntry:
@@ -132,9 +127,7 @@ class TestDashboard:
         assert {e.room_id for e in rooms} == {"!child:hs", "!via:hs"}
 
     def test_space_rooms_include_hierarchy_fallback(self, session, fake_room):
-        # A server can publish malformed m.space.child events (e.g. via as a
-        # string), which nio drops, so neither children nor parents carry the
-        # link; the /hierarchy fetch cached in space_children must fill in.
+        # nio drops malformed m.space.child links; the cached /hierarchy map fills in.
         space = fake_room("!s:hs", room_type="m.space")
         orphan = fake_room("!orphan:hs")
         session.client.rooms.update({"!s:hs": space, "!orphan:hs": orphan})
@@ -143,17 +136,14 @@ class TestDashboard:
         assert {e.room_id for e in rooms} == {"!orphan:hs"}
 
     def test_others_lists_rooms_outside_every_space(self, session, fake_room):
-        # In a space via each of the three link kinds: none of these are
-        # orphans. The space itself, DMs, and never-linked rooms are judged
-        # on their own rules.
+        # Rooms linked via any of the three link kinds are not orphans.
         space = fake_room("!s:hs", room_type="m.space", children={"!child:hs"})
         child = fake_room("!child:hs")
         viaparent = fake_room("!via:hs", parents={"!s:hs"})
         fallback = fake_room("!fb:hs")
         dm = fake_room("!dm:hs", users={ME: {}, ALICE: {}})
         orphan = fake_room("!weoi:hs")
-        # A parent pointer at a space we are not joined to does not rescue a
-        # room: it would still be unreachable from the Spaces column.
+        # A parent pointer at an unjoined space does not rescue a room.
         stray = fake_room("!stray:hs", parents={"!unjoined:hs"})
         session.client.rooms.update(
             {
@@ -224,9 +214,7 @@ class TestRecordRoomTimestamps:
             )
         )
         session._record_room_timestamps(resp)
-        # The recency timestamp never goes backwards, but the latest event id
-        # follows sync stream order even when the sender's clock lags: a
-        # freshly synced event is newer regardless of its server_timestamp.
+        # The timestamp never regresses, but the event id follows stream order.
         assert session.state["last_event_ts"]["!a:hs"] == 500
         assert session.last_event_id["!a:hs"] == "$skewed"
 
@@ -263,6 +251,91 @@ class TestSearch:
         assert [e.room_id for e in session.search("mares")] == ["!m:hs"]
         assert [e.room_id for e in session.search("\u00c1gnes")] == ["!a:hs"]
 
+    def test_scoped_search_covers_the_whole_section(self, session, fake_room):
+        fav_a = fake_room("!fa:hs", display_name="alpha team", tags={"m.favourite": {}})
+        fav_b = fake_room("!fb:hs", display_name="beta team", tags={"m.favourite": {}})
+        other = fake_room("!o:hs", display_name="alpha misc")
+        session.client.rooms.update(
+            {"!fa:hs": fav_a, "!fb:hs": fav_b, "!o:hs": other}
+        )
+        session.state["last_opened_ts"]["!o:hs"] = 100
+        session.state["last_opened_ts"]["!fb:hs"] = 200
+        # An empty scoped query lists the full section; global stays empty.
+        assert {e.room_id for e in session.search("", "favourites")} == {
+            "!fa:hs",
+            "!fb:hs",
+        }
+        assert session.search("") == []
+        # A scoped query matches only inside its section.
+        assert [e.room_id for e in session.search("alpha", "favourites")] == ["!fa:hs"]
+        assert [e.room_id for e in session.search("team", "recent")] == ["!fb:hs"]
+        # Recents keep the section's order: most recently opened first.
+        assert [e.room_id for e in session.search("", "recent")] == ["!fb:hs", "!o:hs"]
+
+
+class TestMessageIndex:
+    def test_merges_archives_and_live_windows(self, session, fake_room):
+        room = fake_room("!a:hs", display_name="general chat")
+        session.client.rooms["!a:hs"] = room
+        old = Message(sender="@a:hs", sender_name="A", body="archived",
+                      ts=100, event_id="$old")
+        live = Message(sender="@b:hs", sender_name="B", body="live",
+                       ts=200, event_id="$live")
+        session.archives["!a:hs"] = {"$old": old}
+        session.timelines["!a:hs"].append(live)
+        # A cached room that no longer resolves to a joined room stays out.
+        session.archives["!gone:hs"] = {"$x": old}
+        pairs = session.message_index()
+        assert [(e.room_id, m.event_id) for e, m in pairs] == [
+            ("!a:hs", "$old"),
+            ("!a:hs", "$live"),
+        ]
+        assert pairs[0][0].title == "general chat"
+
+
+class TestBackfillAll:
+    def test_skips_spaces_and_finished_rooms(self, session, fake_room):
+        session.client.rooms.update(
+            {
+                "!r1:hs": fake_room("!r1:hs", display_name="one"),
+                "!r2:hs": fake_room("!r2:hs", display_name="two"),
+                "!s:hs": fake_room("!s:hs", display_name="a space",
+                                   room_type="m.space"),
+            }
+        )
+        session.archive_done.add("!r2:hs")
+        kicked = []
+        session.start_backfill = kicked.append
+        assert session.backfill_all() == 1
+        assert kicked == ["!r1:hs"]
+        # A finished-but-stale room needs its head re-covered, so it counts.
+        session.archive_stale.add("!r2:hs")
+        kicked.clear()
+        assert session.backfill_all() == 2
+        assert sorted(kicked) == ["!r1:hs", "!r2:hs"]
+
+
+class TestReadMarker:
+    def test_fully_read_skips_thread_replies_and_their_edits(self, session):
+        posted = []
+
+        async def room_read_markers(room_id, fully_read_event=None, read_event=None):
+            posted.append((room_id, fully_read_event, read_event))
+
+        session.client.room_read_markers = room_read_markers
+        main = Message(sender="@a:hs", sender_name="A", body="main",
+                       ts=100, event_id="$main")
+        reply = Message(sender="@b:hs", sender_name="B", body="in thread",
+                        ts=200, event_id="$reply", thread_root="$main")
+        edit = Message(sender="@b:hs", sender_name="B", body="in thread v2",
+                       ts=300, event_id="$edit", replaces="$reply")
+        session.timelines["!a:hs"].extend([main, reply, edit])
+        session.last_event_id["!a:hs"] = "$latest-reaction"
+        asyncio.run(session._send_read_marker("!a:hs", 0))
+        # The marker must land on a main-timeline row the divider can find;
+        # the receipt still names the true latest event.
+        assert posted == [("!a:hs", "$main", "$latest-reaction")]
+
 
 class TestSanitize:
     def test_clean_strips_escape_and_bidi_keeps_newline_tab(self):
@@ -290,11 +363,9 @@ class TestSanitize:
 
 
 class TestSasEmoji:
-    """Regression guard for the nio-vs-vodozemac SAS emoji bug: vodozemac's
-    emoji_indices are the seven final SAS indices and must map straight onto the
-    emoji table. nio's own get_emoji() re-packs them and scrambles the result,
-    so _sas_emoji bypasses it. If a future nio bump 'fixes' get_emoji upstream,
-    this stays correct because it never calls get_emoji at all."""
+    """vodozemac's emoji_indices are the final SAS indices and map straight
+    onto the emoji table; nio's get_emoji() scrambles them, so _sas_emoji
+    bypasses it."""
 
     def _fake_sas(self, indices):
         return SimpleNamespace(
@@ -321,9 +392,7 @@ class TestSasEmoji:
         ]
 
     def test_does_not_reinterpret_indices_as_bytes(self):
-        # nio's buggy get_emoji() would re-pack these indices into 8-bit binary
-        # and regroup into 6-bit chunks, yielding a different sequence. Assert we
-        # do NOT reproduce that scrambling for a simple, distinctive input.
+        # get_emoji() would regroup these into 6-bit chunks; we must not.
         from matrixcli.client import _sas_emoji
         from nio.crypto.sas import Sas
 
@@ -341,11 +410,7 @@ class TestLoadHistory:
         return asyncio.run(session.load_history(room_id, limit=limit))
 
     def test_member_fetch_runs_in_background(self, session, fake_room):
-        # Startup syncs members lazily; the first open of a room kicks off the
-        # member fetch so older senders get display names. On a big room
-        # /joined_members takes seconds server-side, so the history must
-        # return WITHOUT waiting for it (awaiting it froze every first open);
-        # when it lands, cached sender names re-resolve and the UI is told.
+        # /joined_members can take seconds; history must not wait for it.
         room = fake_room("!a:hs")
         room.members_synced = False
         session.client.rooms["!a:hs"] = room
@@ -382,12 +447,8 @@ class TestLoadHistory:
         assert repainted == ["!a:hs"]
 
     def test_quiet_room_absent_from_rooms_map_still_gets_names(self, session):
-        # A resumed (incremental) launch never mentions a room without fresh
-        # activity, so it is absent from client.rooms entirely. Opening one
-        # used to skip the member fetch (and nio would drop the /joined_members
-        # response for an unknown room anyway), leaving every sender a raw
-        # @user:server id forever. load_history must register the room itself
-        # so the background fetch runs and the names resolve.
+        # A resumed sync omits quiet rooms; load_history must register the
+        # room itself so the member fetch runs and names resolve.
         repainted = []
         session.on_members_loaded = repainted.append
 
@@ -440,9 +501,7 @@ class TestLoadHistory:
         assert "!a:hs" not in session._member_fetches
 
     def test_reloads_serve_the_cache_after_the_first_fetch(self, session):
-        # A room smaller than the window used to refetch /messages on every
-        # reload (each one seconds on a slow homeserver); once the initial
-        # window has been merged, the sync-fed cache is authoritative.
+        # Once the initial window is merged, the sync-fed cache is authoritative.
         calls = []
 
         async def fake_room_messages(*args, **kwargs):
@@ -457,9 +516,7 @@ class TestLoadHistory:
         assert len(calls) == 1
 
     def test_gappy_sync_refetches_even_with_a_full_cache(self, session):
-        # A limited sync only discarded history_loaded, but the serve-from-
-        # cache size shortcut ran first: a room with >= limit cached messages
-        # kept serving the cache with the skipped chunk silently missing.
+        # A full cache must not mask the hole a limited sync left.
         calls = []
 
         async def fake_room_messages(*args, **kwargs):
@@ -491,10 +548,7 @@ class TestLoadHistory:
         assert len(calls) == 1
 
     def test_gap_landing_mid_fetch_leaves_the_room_unloaded(self, session):
-        # The fetch was anchored at the pre-gap sync token, so a limited sync
-        # completing during the await means the merged window cannot contain
-        # the skipped events; marking the room history_loaded anyway would
-        # declare the hole filled and never refetch.
+        # The merged window cannot hold the skipped events; stay unloaded.
         async def main():
             async def fake_room_messages(*args, **kwargs):
                 gappy = SimpleNamespace(
@@ -516,9 +570,7 @@ class TestLoadHistory:
         assert "!a:hs" not in session.history_loaded
 
     def test_decrypted_fetch_beats_cached_placeholder(self, session):
-        # Keys that arrive mid-session (live key-share after verification)
-        # let a refetch decrypt what an earlier fetch could not; the cached
-        # "[encrypted: ...]" placeholder must not win the merge over it.
+        # A refetch can decrypt what the cached placeholder could not; it wins.
         session.timelines["!a:hs"].append(
             Message(
                 sender=ALICE,
@@ -536,8 +588,7 @@ class TestLoadHistory:
         assert [m.body for m in msgs] == ["secret"]
 
     def test_gappy_sync_forces_a_refetch(self, session):
-        # A "limited" sync timeline means events were skipped: the cache is
-        # missing a chunk, so serving it would show history with a hole.
+        # A limited sync skipped events: the cache has a hole, so refetch.
         calls = []
 
         async def fake_room_messages(*args, **kwargs):
@@ -699,8 +750,7 @@ class TestLoadHistory:
         assert m.reply_to == "$target"
 
     def test_quoted_own_mxid_in_fallback_is_not_a_mention(self, session):
-        # Before the fallback was stripped, our own user id inside the quoted
-        # block made every reply-to-us light up as a mention.
+        # Our own id in the quoted fallback must not count as a mention.
         chunk = [
             text_event(
                 "$reply",
@@ -715,8 +765,6 @@ class TestLoadHistory:
         assert not m.mentions_me
 
     def test_media_metadata_is_extracted(self, session):
-        from nio.events.room_events import Event
-
         ev = Event.parse_event(
             {
                 "type": "m.room.message",
@@ -754,8 +802,6 @@ class TestLoadHistory:
 
 
 def reaction_event(event_id, sender, ts, target):
-    from nio.events.room_events import Event
-
     return Event.parse_event(
         {
             "type": "m.reaction",
@@ -776,9 +822,8 @@ def reaction_event(event_id, sender, ts, target):
 class TestLoadHistoryStarvedWindow:
     """A raw /messages window says nothing about how many rows it paints:
     reactions and redactions never become Messages, and thread replies
-    collapse out of the normal view. A reaction/thread flood (a busy room
-    during a live event) used to leave the first window with zero
-    main-timeline messages and the room rendered as "(no messages yet)"."""
+    collapse out of the normal view, so a flood can starve the first window
+    of main-timeline messages."""
 
     def serve(self, session, windows):
         """Serve each (chunk, end) in turn and record the start tokens."""
@@ -867,9 +912,7 @@ class TestLoadHistoryStarvedWindow:
         assert len(calls) == 2
 
     def test_thread_only_cache_does_not_short_circuit(self, session):
-        # A cache holding `limit` messages used to satisfy any reload, even
-        # when every one of them is a thread reply and the main view would
-        # still paint empty.
+        # A cache of nothing but thread replies must not satisfy the reload.
         for i in range(10):
             session.timelines["!a:hs"].append(
                 Message(
@@ -889,9 +932,7 @@ class TestLoadHistoryStarvedWindow:
         assert sum(1 for m in msgs if not m.thread_root) == 5
 
     def test_floor_unreachable_returns_everything_held(self, session):
-        # A room whose entire history holds fewer main-timeline messages
-        # than the floor must return what exists, not loop or come back
-        # empty.
+        # Fewer messages than the floor: return what exists, do not loop.
         chunk = [text_event(f"${i}", ALICE, 200 - i, f"m{i}") for i in range(3)]
         calls = self.serve(session, [(chunk, "t1"), ([], None)])
         msgs = asyncio.run(session.load_history("!a:hs", limit=10))
@@ -902,9 +943,7 @@ class TestLoadHistoryStarvedWindow:
     def test_pagination_is_capped_at_timeline_cap_raw_events(self, session):
         from matrixcli.client import TIMELINE_CAP
 
-        # A pathological room that never yields a main-timeline message
-        # (endless reactions) must stop at the raw-event budget, not walk
-        # history forever.
+        # Endless reactions must stop at the raw-event budget.
         flood = [
             reaction_event(f"$r{i}", ALICE, 300 - i, "$old") for i in range(10)
         ]
@@ -1024,10 +1063,7 @@ class TestThreads:
     def test_thread_merge_takes_the_servers_edit_fold_over_a_stale_cache(
         self, session, monkeypatch
     ):
-        # The reply was edited; the /relations fetch returns it with the
-        # bundled edit already folded in, but the cache still holds the
-        # pre-edit copy. Cached must win on identity (decryption) without
-        # reverting the text the whole rest of the app shows.
+        # Cached wins on identity but must not revert the folded edit text.
         reply_source = {
             "type": "m.room.message",
             "event_id": "$r1",
@@ -1063,9 +1099,7 @@ class TestThreads:
     def test_thread_includes_cached_live_edits_so_the_screen_can_fold_them(
         self, session, monkeypatch
     ):
-        # An edit received live sits in the cache with an m.replace relation
-        # and no thread root; /relations m.thread never returns it. It must
-        # ride along, or the thread view shows the reply's pre-edit text.
+        # /relations never returns live edits; they must ride along from cache.
         class Boom:
             def __init__(self, *args, **kwargs):
                 raise aiohttp.ClientError("no network")
@@ -1130,12 +1164,7 @@ class TestThreads:
 
 class TestToMessageEncrypted:
     def test_wrapper_thread_info_survives_failed_decrypt(self, session):
-        # nio rebuilds decrypted events from the plaintext payload and drops
-        # the wrapper's unsigned aggregation, so _to_message must read the
-        # thread info from the wire-format event BEFORE decrypting. Here
-        # decryption fails (no key), which must still yield a placeholder
-        # message carrying the wrapper's thread root and server count.
-        from nio.events.room_events import Event
+        # Thread info lives on the wrapper and must survive a failed decrypt.
 
         ev = Event.parse_event(
             {
@@ -1162,11 +1191,7 @@ class TestToMessageEncrypted:
         assert "encrypted" in m.body
 
     def test_messages_fetch_grafts_wrapper_unsigned_onto_decrypted(self, session):
-        # nio's _handle_messages_response swaps decryptable events for their
-        # decrypted forms IN the chunk, and those keep none of the wrapper's
-        # unsigned (thread counts, bundled edits). The wrap installed in
-        # _new_client must graft it back so _to_message still sees it.
-        from nio.events.room_events import Event
+        # nio drops the wrapper's unsigned on decrypt; the wrap grafts it back.
 
         wrapper = Event.parse_event(
             {
@@ -1211,7 +1236,8 @@ class TestEdits:
         )
 
     def test_new_content_is_preferred_over_the_star_fallback(self, session):
-        m = session._to_message(None, edit_event("$e", ALICE, 200, "fixed", "$o"))
+        ev = RoomMessageText.from_dict(edit_source("$e", ALICE, 200, "fixed", "$o"))
+        m = session._to_message(None, ev)
         assert m.replaces == "$o"
         assert m.body == "fixed"
 
@@ -1256,9 +1282,7 @@ class TestEdits:
         assert [m.body for m in folded] == ["fixed"]
 
     def test_a_deleted_edit_stops_applying(self):
-        # Redacting an edit retracts it: the server un-applies it and a fresh
-        # client shows the previous text. Ours must not keep displaying the
-        # retracted body (which may be exactly what the sender deleted it for).
+        # A redacted edit is retracted; the retracted body must not stay shown.
         folded = fold_edits([
             self.msg("$o", ALICE, 100, "as written"),
             self.msg("$e", ALICE, 200, "pasted secret", replaces="$o",
@@ -1277,9 +1301,7 @@ class TestEdits:
         assert folded[0].edited_ts == 200
 
     def test_a_retracted_bundled_fold_is_undone(self):
-        # The server bundled the edit onto the original, so _to_message baked
-        # the new text into the target; then the edit was deleted live. The
-        # bake must revert to the original text.
+        # Deleting an edit that was baked in must revert to the original text.
         baked = Message(
             sender=ALICE, sender_name=ALICE, body="pasted secret", ts=100,
             event_id="$o", edited_ts=200, original_body="as written",
@@ -1301,9 +1323,7 @@ class TestEdits:
         assert folded[0].edited_ts == 200
 
     def test_bundled_edit_applies_without_the_edit_event(self, session):
-        # The server aggregates the newest edit onto the event it rewrites, so
-        # an old message shows current text even when the edit is far outside
-        # the fetched window.
+        # The server aggregates the newest edit onto the event it rewrites.
         ev = text_event(
             "$o", ALICE, 100, "typo",
             unsigned={"m.relations": {"m.replace": edit_source("$e", ALICE, 200, "fixed", "$o")}},
@@ -1349,16 +1369,12 @@ class TestRedactions:
         }
 
     def test_fetched_deletion_becomes_an_empty_tombstone(self, session):
-        from nio.events.room_events import Event
-
         ev = Event.parse_event(self.redacted_source("$d", ALICE, 100, 400))
         m = session._to_message(None, ev)
         assert (m.event_id, m.body, m.ts, m.redacted_ts) == ("$d", "", 100, 400)
 
     def test_a_removed_reaction_is_not_a_deleted_message(self, session):
-        # Taking back a 👍 redacts an event too. The timeline never showed it,
-        # so it must not turn into a "this message has been deleted" line.
-        from nio.events.room_events import Event
+        # Taking back a reaction must not become a deleted-message line.
 
         ev = Event.parse_event(
             self.redacted_source("$x", ALICE, 100, 400, type="m.reaction")
@@ -1393,7 +1409,6 @@ class TestRedactions:
     def test_history_merge_marks_a_cached_message_the_server_lost(self, session):
         # Deleted while we were away: the fetch brings back an empty
         # tombstone, the cache still holds the text. Keep both facts.
-        from nio.events.room_events import Event
 
         session.timelines["!a:hs"].append(
             Message(sender=ALICE, sender_name="Alice", body="secret", ts=100,
@@ -1445,8 +1460,7 @@ class TestLoadEdits:
         assert [(v.ts, v.body) for v in versions] == [(100, "v1"), (300, "v3")]
 
     def test_a_deleted_message_is_never_fetched_for(self, session, monkeypatch):
-        # The server has dropped the content; only the local copy is left, and
-        # asking /relations about it would just be a pointless round-trip.
+        # Only the local copy is left; /relations would be a pointless trip.
         fake = TestRefreshSpaceChildren.FakeHttp({"chunk": []})
         monkeypatch.setattr(
             "matrixcli.client.aiohttp.ClientSession", lambda **kw: fake
@@ -1558,9 +1572,7 @@ class TestInitialSync:
         assert session.client.next_batch == ""
 
     def test_later_runs_resume_from_the_stored_token(self, session, monkeypatch):
-        # A from-scratch sync is Synapse's slowest path (minutes on a loaded
-        # server); once a token and the room_meta snapshot exist, launch must
-        # sync incrementally and must NOT clear the stored position.
+        # With a token and snapshot, sync incrementally and keep the position.
         session.client.loaded_sync_token = "s123"
         session.state["room_meta"] = {"!a:hs": {"title": "A"}}
         good = SimpleNamespace(rooms=SimpleNamespace(join={}))
@@ -1573,9 +1585,7 @@ class TestInitialSync:
     def test_cached_space_hierarchy_refreshes_in_the_background(
         self, session, monkeypatch
     ):
-        # With the child map restored from state.json, startup must not wait
-        # for the raw-state refetch (multi-second per space on a loaded
-        # server): a refresh that never finishes would otherwise hang this.
+        # A refresh that never finishes must not block startup.
         session.space_children = {"!s:hs": {"!c:hs"}}
         started = []
 
@@ -1636,10 +1646,7 @@ class TestRoomMetaSnapshot:
         assert session.state["room_meta"]["!a:hs"]["title"] == "Fresh name"
 
     def test_stateless_live_room_backfills_from_snapshot(self, session, fake_room):
-        # A room delivered by a resumed (incremental) sync has no state this
-        # session: nio invents a title and knows nothing of space/favourite
-        # status. Those fields must come from the snapshot, and the snapshot
-        # must not be poisoned by the stateless entry either.
+        # A stateless resumed room must inherit from the snapshot, not poison it.
         session.state["room_meta"] = {
             "!a:hs": {"title": "IOI 2026", "is_space": True, "is_favourite": True}
         }
@@ -1654,10 +1661,7 @@ class TestRoomMetaSnapshot:
         assert session.state["room_meta"]["!a:hs"]["title"] == "IOI 2026"
 
     def test_heroes_blob_title_never_beats_the_snapshot(self, session, fake_room):
-        # An ACTIVE room in a resumed session has members (lazy loading still
-        # delivers the message senders' member events), and nio then builds a
-        # heroes-based group name. That blob must not displace the real name
-        # in the snapshot; only m.room.name/alias or a DM peer outranks it.
+        # A heroes-based name blob must not displace the snapshot's real name.
         session.state["room_meta"] = {"!d:hs": {"title": "ioi.discuss"}}
         room = fake_room(
             "!d:hs",
@@ -1684,10 +1688,7 @@ class TestRoomMetaSnapshot:
     def test_dm_mxid_title_rescued_from_snapshot_without_poisoning_it(
         self, session, fake_room
     ):
-        # A DM whose peer sent nothing since the resume token has no member
-        # event under lazy loading, so the live title degrades to the bare
-        # user id. The snapshot's real name must win, on screen and in the
-        # snapshot refresh.
+        # A quiet DM degrades to the bare user id; the snapshot's name wins.
         session.state["room_meta"] = {
             "!dm:hs": {"title": "Alice Liddell", "person": ALICE}
         }
@@ -1733,9 +1734,7 @@ class TestRoomMetaSnapshot:
         assert repaints == [True]
 
     def test_named_room_never_becomes_dm_via_fallback(self, session, fake_room):
-        # A big room seen through a lazy resume sync can hold exactly two
-        # users (self + the one member who spoke); a real room name means it
-        # is a group room regardless.
+        # Lazy sync can show two users; a real room name means group room.
         room = fake_room("!ga:hs", users={ME: {}, ALICE: {}})
         room.name = "ioi.ga"
         e = session._entry(room)
@@ -1744,10 +1743,7 @@ class TestRoomMetaSnapshot:
     def test_snapshot_group_record_blocks_dm_misdetection(
         self, session, fake_room
     ):
-        # Same lazy two-member illusion, but the room has no name state this
-        # session. A snapshot that recorded the room as not-a-DM outranks
-        # the heuristic while the member map is incomplete, and the real
-        # title comes back from the snapshot rescue.
+        # A not-a-DM snapshot outranks the incomplete two-member heuristic.
         session.state["room_meta"] = {"!ga:hs": {"title": "ioi.ga", "person": ""}}
         room = fake_room(
             "!ga:hs",
@@ -1774,9 +1770,7 @@ class TestRoomMetaSnapshot:
         assert e.is_direct and e.person == ALICE and e.title == "Alice"
 
     def test_room_name_fetch_heals_poisoned_snapshot(self, session, fake_room):
-        # A session that misread the lazy two-member illusion as a DM wrote
-        # the peer's name (and possibly the peer) into the snapshot; the
-        # m.room.name fetch repairs the room, the snapshot, and repaints.
+        # The m.room.name fetch repairs a snapshot poisoned by DM misdetection.
         session.state["room_meta"] = {
             "!ga:hs": {"title": "PHL-TL-Cisco Ortega", "person": ALICE}
         }
@@ -1854,9 +1848,7 @@ class TestRoomMetaSnapshot:
         assert session.state["room_meta"]["!a:hs"]["highlights"] == 0
 
     def test_mark_read_debounces_the_marker_post(self, session, monkeypatch):
-        # At peak an open room refreshes (and marked read) once per sync
-        # tick; only the first call may POST immediately, a burst then folds
-        # into one trailing send carrying the newest event id.
+        # A burst folds into one trailing POST carrying the newest event id.
         import matrixcli.client as client_mod
 
         monkeypatch.setattr(client_mod, "MARK_READ_INTERVAL", 0.05)
@@ -1884,11 +1876,8 @@ class TestRoomMetaSnapshot:
         assert posts == ["$1", "$3"]
 
     def test_marker_post_names_a_message_not_the_latest_reaction(self, session):
-        # A reaction bumps last_event_id (that is what triggers redraws), but
-        # the posted m.fully_read must name a timeline row, or the divider on
-        # the next open cannot find it and degrades to the count guess. The
-        # receipt still carries the true latest event; an edit entry maps to
-        # the message it rewrites; pending local echoes are skipped.
+        # m.fully_read must name a timeline row, or the next open's divider
+        # cannot find it; the receipt still carries the true latest event.
         posts = []
 
         async def fake_markers(room_id, fully_read_event=None, read_event=None):
@@ -1950,10 +1939,7 @@ class TestRoomMetaSnapshot:
         assert posts == [("$only", "$only")]
 
     def test_ensure_room_registers_with_persisted_encryption_flag(self, session):
-        # Sending into a room the resumed session has not seen live: nio's
-        # room_send looks the room up (KeyError without this) and its
-        # encrypted flag decides plaintext vs megolm, so it MUST come from
-        # nio's persisted encrypted-rooms set, never default to False.
+        # The encrypted flag decides plaintext vs megolm; never default to False.
         session.client.encrypted_rooms = {"!enc:hs"}
         session._ensure_room("!enc:hs")
         session._ensure_room("!plain:hs")
@@ -2138,8 +2124,6 @@ class TestLoadOlderErrors:
 
 class TestReactions:
     def react(self, event_id, sender, target, key="👍", ts=100):
-        from nio.events.room_events import Event
-
         return Event.parse_event(
             {
                 "type": "m.reaction",
@@ -2203,11 +2187,7 @@ class TestReactions:
     def test_refetched_reaction_tombstone_subtracts_that_sender(
         self, session, fake_room
     ):
-        # The redaction that removed a noted reaction can be skipped by a
-        # gappy sync; the only trace is then the reaction's tombstone in a
-        # /messages refetch, which must subtract the vote instead of leaving
-        # the badge one too high forever.
-        from nio.events.room_events import Event
+        # A gappy sync can skip the redaction; the tombstone subtracts the vote.
 
         room = fake_room("!a:hs")
         session.client.rooms["!a:hs"] = room
@@ -2262,10 +2242,7 @@ class TestReactions:
     def test_undecryptable_encrypted_reaction_is_still_counted(
         self, session, fake_room
     ):
-        # The wrapper carries the whole relation (target AND key) in
-        # cleartext; no key material is needed, and no "[could not decrypt]"
-        # row may appear for a thumbs-up.
-        from nio.events.room_events import Event
+        # The relation is cleartext on the wrapper; no decrypt-failure row.
 
         ev = Event.parse_event(
             {
@@ -2320,7 +2297,9 @@ class TestMentions:
 
 
 class TestOwnEdits:
-    def run_send(self, session, coro):
+    def test_send_edit_wire_format_and_local_cache(self, session):
+        target = Message(sender=ME, sender_name="Me", body="typo", ts=100,
+                         event_id="$o")
         sent = {}
 
         async def room_send(room_id, message_type, content, **kwargs):
@@ -2328,15 +2307,7 @@ class TestOwnEdits:
             return SimpleNamespace(event_id="$new")
 
         session.client.room_send = room_send
-        result = asyncio.run(coro)
-        return sent, result
-
-    def test_send_edit_wire_format_and_local_cache(self, session):
-        target = Message(sender=ME, sender_name="Me", body="typo", ts=100,
-                         event_id="$o")
-        sent, (ok, info) = self.run_send(
-            session, session.send_edit("!a:hs", target, "fixed")
-        )
+        ok, info = asyncio.run(session.send_edit("!a:hs", target, "fixed"))
         assert ok and info == "$new"
         content = sent["content"]
         assert content["body"] == "* fixed"
@@ -2464,11 +2435,7 @@ class TestConnect:
     def test_relogin_with_new_device_id_rebuilds_the_client(
         self, session, monkeypatch
     ):
-        # The token path loads the store for the revoked device id before
-        # whoami can reject the token. If the password login then mints a
-        # DIFFERENT device id, keeping the loaded client would sign with the
-        # old device's olm account; connect must rebuild the client so the
-        # store is re-bound to the new device id.
+        # A new device id needs a rebuilt client, or we sign as the old device.
         whoami = SimpleNamespace(status_code="M_UNKNOWN_TOKEN", message="bad")
         cleared, saved = self._prep(session, monkeypatch, whoami, password="hunter2")
         original = session.client
@@ -2541,10 +2508,7 @@ class TestConnect:
     def test_unreadable_store_on_no_token_login_resets_and_retries(
         self, session, monkeypatch
     ):
-        # With no cached token, login() is what loads the store (nio sets the
-        # access token, then load_store raises on the old pickle key), so the
-        # raise comes out of login rather than restore_login; connect must
-        # give it the same reset-and-retry treatment.
+        # With no token, the store raise comes out of login, not restore_login.
         from nio import AsyncClient
 
         monkeypatch.setattr(
@@ -2725,7 +2689,6 @@ class TestSpacesWithChildChanges:
     def test_matches_bad_events_without_typed_fields(self, session):
         # The malformed child events this whole path exists for arrive as
         # BadEvent, which keeps only the source dict.
-        from nio.events.room_events import Event, RoomSpaceChildEvent
 
         bad = Event.parse_event(
             {
@@ -2762,8 +2725,6 @@ class TestDownloadMedia:
         return Message(**defaults)
 
     def test_saves_dedups_and_sanitizes(self, session, tmp_path):
-        from pathlib import Path
-
         async def fake_download(mxc=None, **kwargs):
             assert mxc == "mxc://hs/abc"
             return SimpleNamespace(body=b"data")
@@ -2817,8 +2778,6 @@ class TestDownloadMedia:
         assert mode == 0o600
 
     def test_strips_control_chars_from_filename(self, session, tmp_path):
-        from pathlib import Path
-
         async def fake_download(mxc=None, **kwargs):
             return SimpleNamespace(body=b"data")
 
@@ -2832,8 +2791,6 @@ class TestDownloadMedia:
         assert name == "a[31mb.pdf"
 
     def test_dotdot_only_name_does_not_escape_directory(self, session, tmp_path):
-        from pathlib import Path
-
         async def fake_download(mxc=None, **kwargs):
             return SimpleNamespace(body=b"data")
 
@@ -2846,7 +2803,6 @@ class TestDownloadMedia:
 
     def test_does_not_follow_symlink_at_target(self, session, tmp_path):
         import os
-        from pathlib import Path
 
         async def fake_download(mxc=None, **kwargs):
             return SimpleNamespace(body=b"data")
@@ -2875,6 +2831,12 @@ class TestInsecureHomeserver:
     def test_localhost_http_allowed(self, session):
         session.cfg.homeserver = "http://localhost:8008"
         assert session._insecure_homeserver() is False
+
+    def test_ipv6_loopback_http_allowed(self, session):
+        # The old first-colon split parsed "[::1]" as host "[" and refused it.
+        for hs in ("http://[::1]:8008", "http://[::1]", "http://127.0.0.1"):
+            session.cfg.homeserver = hs
+            assert session._insecure_homeserver() is False, hs
 
     def test_connect_refuses_insecure(self, session):
         session.cfg.homeserver = "http://evil.example"
@@ -3473,11 +3435,9 @@ class TestNoteOpening:
 
 
 class TestLeftRoomPurge:
-    """A leave synced from another client must purge every trace of the room.
-    nio keeps left rooms in client.rooms (it only removes them on forget(),
-    which this app never sends), and before the fix the dashboard rebuild in
-    the same tick wrote the popped room_meta snapshot straight back, so the
-    room came back as a phantom on every future launch."""
+    """A leave synced from another client must purge every trace of the room:
+    nio keeps left rooms in client.rooms, and the same-tick dashboard rebuild
+    must not write the popped room_meta snapshot back."""
 
     def test_leave_purges_state_and_live_room(self, session, fake_room):
         session.client.rooms["!gone:hs"] = fake_room("!gone:hs", display_name="Gone")
@@ -3511,9 +3471,8 @@ class TestFavouriteTagSync:
         }
         # Tags never synced this session: the snapshot rescue must hold.
         assert [e.room_id for e in session.dashboard()["favourites"]] == ["!r:hs"]
-        # The tag deletion echoes back as an empty tags dict, which room.tags
-        # alone cannot tell apart from "never synced"; before the fix the
-        # rescue re-favourited the room forever.
+        # An empty tags echo looks like "never synced" to room.tags alone;
+        # the rescue must not re-favourite the room.
         session._on_tags(room, SimpleNamespace(tags={}))
         assert session.state["room_meta"]["!r:hs"]["is_favourite"] is False
         assert session.dashboard()["favourites"] == []
@@ -3548,10 +3507,7 @@ class TestCacheSaveRecheck:
         async def main():
             session._maybe_save_timelines()
             assert session._cache_saving
-            # What set_space_cache does when the user opts a space out while
-            # a write is in flight; before the fix this bounced off the
-            # _cache_saving guard and the promised immediate purge silently
-            # waited for the next sync tick.
+            # Re-dirtying while a write is in flight must chain a follow-up.
             session._cache_dirty = True
             session._cache_saved_at = 0.0
             session._maybe_save_timelines()
@@ -3603,3 +3559,38 @@ class TestDownloadWriteFailure:
         ok, saved = asyncio.run(session.download_media(message, tmp_path))
         assert ok and saved == str(tmp_path / "file.bin")
         assert (tmp_path / "file.bin").read_bytes() == b"payload"
+
+
+class TestArchivePreservation:
+    def test_fold_never_clobbers_readable_archive_text(self, session):
+        # A no-key placeholder or an emptied redaction tombstone in the live
+        # window must not displace text the archive preserved; a refetch
+        # cannot reproduce it.
+        good = Message(sender="@a:hs", sender_name="A", body="secret text",
+                       ts=100, event_id="$e")
+        session.archives["!a:hs"] = {"$e": good}
+        session.timelines["!a:hs"].append(
+            replace(good, body="[encrypted: no key for this message]")
+        )
+        session._timeline_payload()
+        assert session.archives["!a:hs"]["$e"].body == "secret text"
+        session.timelines["!a:hs"].clear()
+        session.timelines["!a:hs"].append(
+            replace(good, body="", redacted_ts=555)
+        )
+        session._timeline_payload()
+        kept = session.archives["!a:hs"]["$e"]
+        assert kept.body == "secret text"
+        assert kept.redacted_ts == 555  # the deletion mark itself is adopted
+
+    def test_redaction_flags_the_archived_copy(self, session):
+        m = Message(sender="@a:hs", sender_name="A", body="text",
+                    ts=100, event_id="$e")
+        session.archives["!a:hs"] = {"$e": m}
+        session._flag_archived_redaction("!a:hs", "$e", 999)
+        flagged = session.archives["!a:hs"]["$e"]
+        assert flagged.redacted_ts == 999
+        assert flagged.body == "text"  # deleted text is preserved
+        assert "!a:hs" in session._archive_dirty
+
+

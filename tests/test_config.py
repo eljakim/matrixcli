@@ -1,5 +1,7 @@
 import json
+import os
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -223,8 +225,6 @@ class TestMediaCache:
         assert b"very secret" not in blob
 
     def test_wrong_key_is_none(self, cfg, monkeypatch):
-        from dataclasses import replace
-
         cfg.save_media_cache("mxc://hs/x", b"data")
         monkeypatch.setattr(
             Config, "get_or_create_store_key", lambda self: "key-two"
@@ -238,7 +238,6 @@ class TestMediaCache:
         assert not list(cfg._media_cache_dir.glob("*.cache"))
 
     def test_prunes_oldest_past_the_cap(self, cfg, monkeypatch):
-        import os
         import time
 
         monkeypatch.setattr(Config, "MEDIA_CACHE_MAX_BYTES", 300)
@@ -334,9 +333,6 @@ class TestAtomicWrites:
         """Two live instances must never share a tmp name: with the old fixed
         name, one instance renamed the other's tmp away mid-save and the loser
         crashed on FileNotFoundError."""
-        import os
-        from pathlib import Path
-
         seen = []
         real_replace = Path.replace
 
@@ -349,8 +345,6 @@ class TestAtomicWrites:
         assert seen == [f"state.json.{os.getpid()}.tmp"]
 
     def test_save_state_survives_stolen_tmp(self, cfg, monkeypatch):
-        from pathlib import Path
-
         def gone(self, target):
             raise FileNotFoundError(self)
 
@@ -365,7 +359,6 @@ class TestAtomicWrites:
 
 class TestStartupSweep:
     def test_removes_only_our_stale_tmps(self, tmp_path):
-        import os
         import time
 
         for d in ("store", "store/media", "store/archive"):
@@ -431,13 +424,68 @@ class TestInstanceLock:
         cfg.acquire_instance_lock()  # stale file, dead holder: must succeed
 
 
+class TestPercentInValue:
+    def test_bare_percent_does_not_crash_load(self, tmp_path):
+        # configparser interpolation raises lazily at get() time; the parser
+        # is built with interpolation=None so a "%" is just a character.
+        cfg = Config.load(
+            write_config(
+                tmp_path,
+                f"""\
+[matrix]
+homeserver = https://hs.example
+user_id = @me:hs.example
+device_name = 100%cli
+
+[storage]
+store_path = {tmp_path}/store
+state_path = {tmp_path}/state.json
+""",
+            )
+        )
+        assert cfg.device_name == "100%cli"
+
+
+class TestMediaCacheCap:
+    @pytest.fixture(autouse=True)
+    def no_keychain(self, monkeypatch):
+        monkeypatch.setattr(
+            Config, "get_or_create_store_key", lambda self: "key-one"
+        )
+
+    def test_oversize_blob_is_not_cached_and_evicts_nothing(
+        self, cfg, monkeypatch
+    ):
+        monkeypatch.setattr(Config, "MEDIA_CACHE_MAX_BYTES", 100)
+        cfg.save_media_cache("small", b"x" * 10)
+        cfg.save_media_cache("huge", b"y" * 101)
+        assert cfg.load_media_cache("huge") is None
+        # The old behavior pruned the whole directory, the small entry too.
+        assert cfg.load_media_cache("small") == b"x" * 10
+
+
+class TestTokenShape:
+    def test_malformed_keyring_entry_falls_back_to_login(
+        self, cfg, monkeypatch
+    ):
+        import keyring
+
+        monkeypatch.setattr(
+            keyring, "get_password", lambda service, user: '"just-a-string"'
+        )
+        assert cfg.load_token() is None
+        monkeypatch.setattr(
+            keyring,
+            "get_password",
+            lambda service, user: '{"access_token": "t", "device_id": "D"}',
+        )
+        assert cfg.load_token() == {"access_token": "t", "device_id": "D"}
+
+
 class TestVersion:
     def test_dunder_version_matches_pyproject(self):
-        # The version lives in two places: pyproject.toml feeds the packaged
-        # metadata the footer displays, __init__.__version__ is the in-code
-        # copy. Nothing else ties them together, so pin it here.
+        # Nothing ties pyproject.toml and __version__ together, so pin it here.
         import tomllib
-        from pathlib import Path
 
         import matrixcli
 

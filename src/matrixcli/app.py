@@ -17,14 +17,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
+import logging
 import os
 import re
 import subprocess
 import sys
 import time
 import unicodedata
+from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
+
+import keyring.errors
 
 import textual.events
 import textual.message
@@ -36,6 +41,7 @@ from textual.style import Style as TextualStyle
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
+from textual.strip import Strip
 from textual.widgets import (
     Footer,
     Header,
@@ -58,15 +64,15 @@ from .client import (
     MIN_SECTION_ROWS,
     Entry,
     MatrixSession,
+    Message,
     fold_edits,
     fold_text,
 )
 from .config import Config
 
 
-# Colors that stay readable on a black background (no navy/maroon/dark grays).
-# Each other participant is assigned one deterministically from their user id,
-# so a given person always renders in the same color. My own name is orange.
+# Colors that stay readable on a black background. Each participant gets one
+# deterministically from their user id; my own name is orange.
 MY_COLOR = "dark_orange"
 SENDER_COLORS = [
     "deep_sky_blue1",
@@ -86,17 +92,16 @@ def _sender_color(user_id: str) -> str:
     return SENDER_COLORS[sum(ord(c) for c in user_id) % len(SENDER_COLORS)]
 
 
-# Only http(s): the URL ends up as an argument to the system's URL handler, and
-# schemes like file:, javascript: or smb: coming from a remote sender have no
-# business being opened on one keystroke. Brackets, quotes and whitespace end
-# the match, so the closing ")" of a markdown [label](url) link stays out of it.
+# Only http(s): the URL goes to the system's URL handler, and remote-sent
+# schemes like file: or javascript: must not open on one keystroke. Brackets,
+# quotes and whitespace end the match.
 URL_RE = re.compile(r"https?://[^\s<>\"'`\[\]{}()]+", re.IGNORECASE)
 
 
 def _find_urls(text: str) -> list[tuple[int, int, str]]:
-    """(start, end, url) for every link in ``text``, in reading order. Sentence
-    punctuation directly after a URL is stripped: people write "see https://x.y."
-    and mean the sentence to end there."""
+    """(start, end, url) for every link in ``text``. Trailing sentence
+    punctuation is stripped: "see https://x.y." ends the sentence, not the
+    URL."""
     spans = []
     for match in URL_RE.finditer(text or ""):
         url = match.group(0).rstrip(".,;:!?")
@@ -106,8 +111,8 @@ def _find_urls(text: str) -> list[tuple[int, int, str]]:
     return spans
 
 
-# The out-of-the-box quick-reaction row ("a" then a digit); once reactions
-# have been sent, the ones actually used bubble to the front (see ReactScreen).
+# Default quick-reaction row ("a" then a digit); the ones actually used
+# bubble to the front (see ReactScreen).
 DEFAULT_QUICK_REACTIONS = ["👍", "✅", "❤️", "😂", "🎉", "😮", "👀", "🙏", "➕"]
 
 _EMOJI_NAMES: list[tuple[str, str]] | None = None
@@ -115,9 +120,8 @@ _EMOJI_NAMES: list[tuple[str, str]] | None = None
 
 def _emoji_names() -> list[tuple[str, str]]:
     """(emoji, lowercase Unicode name) pairs for the reaction search, built
-    once on first use from the emoji blocks. The formal names are good
-    search keys ("giraff" finds GIRAFFE, "thumbs" THUMBS UP SIGN) and need
-    no emoji-database dependency."""
+    once. The formal names are decent search keys and need no emoji-database
+    dependency."""
     global _EMOJI_NAMES
     if _EMOJI_NAMES is None:
         pairs = []
@@ -148,9 +152,9 @@ def _version() -> str:
 
 
 def _safe_localtime(ts_ms: int):
-    """localtime of a server timestamp, or None when it is outside the
-    platform's range: origin_server_ts is whatever some federated server put
-    on the wire, and one absurd value must not crash the room render."""
+    """localtime of a server timestamp, or None when out of range:
+    origin_server_ts comes off the wire, and one absurd value must not crash
+    the render."""
     try:
         return time.localtime(ts_ms / 1000)
     except (OverflowError, OSError, ValueError):
@@ -174,15 +178,14 @@ def _fmt_size(size: int) -> str:
     return ""
 
 
-# Fallback for uploads whose info block advertises no mimetype (the spec makes
-# it optional); anything Pillow can plausibly open by filename.
+# Fallback for uploads whose info block has no mimetype (optional in the
+# spec).
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".ico")
 
 
 def _color_depth(color_system: str | None) -> str:
-    """The preview's capability tier for a rich color system: "truecolor"
-    (full-color blocks), "256" (dithered blocks), or "basic" (16 colors or
-    none: color art is hopeless, only the ASCII ramp is offered)."""
+    """Preview capability tier: "truecolor", "256" (dithered blocks), or
+    "basic" (16 colors or none: only the ASCII ramp is offered)."""
     if color_system in ("truecolor", "256"):
         return color_system
     return "basic"
@@ -199,24 +202,22 @@ def _is_image(m) -> bool:
 
 
 def _ascii_art(img, max_w: int, max_h: int, ramp: str) -> Text:
-    """The image as classic ASCII art fitted into max_w x max_h cells: one
-    glyph per pixel, picked from ``ramp`` (most ink first) by luminance.
-    ramp[0] paints the brightest pixels, since dense glyphs read bright on a
-    dark terminal. A cell is about twice as tall as it is wide, so the pixel
-    grid is squeezed to half height to preserve the image's aspect."""
+    """The image as ASCII art fitted into max_w x max_h cells, one glyph per
+    pixel picked from ``ramp`` by luminance. ramp[0] paints the brightest
+    pixels (dense glyphs read bright on a dark terminal). Cells are about
+    twice as tall as wide, so the grid is halved in height to keep the
+    aspect."""
     from PIL.Image import Resampling
 
     gray = img.convert("L")
     scale = min(max_w / gray.width, 2 * max_h / gray.height)
     w = max(1, round(gray.width * scale))
     h = max(1, round(gray.height * scale / 2))
-    # LANCZOS: proper area-averaging on the way down; the default (bicubic)
-    # visibly aliases on diagonals at these tiny output sizes.
+    # LANCZOS: the default bicubic visibly aliases at these tiny sizes.
     px = gray.resize((w, h), Resampling.LANCZOS).load()
     span = len(ramp) - 1
-    # no_wrap: rendered against a stale mid-resize width, a wrapping line
-    # would spill one cell onto a blank row and stripe the whole picture;
-    # cropping is invisible by comparison (a follow-up render fixes the size).
+    # no_wrap: a line wrapping against a stale mid-resize width would stripe
+    # the picture; cropping is invisible by comparison.
     text = Text(no_wrap=True)
     for y in range(h):
         line = "".join(ramp[(255 - px[x, y]) * span // 255] for x in range(w))
@@ -224,9 +225,8 @@ def _ascii_art(img, max_w: int, max_h: int, ramp: str) -> Text:
     return text
 
 
-# The 240 predictable xterm-256 entries (6x6x6 color cube + 24 grays), for
-# dithering on non-truecolor terminals. The first 16 system colors are left
-# out: terminals theme those freely, so their real RGB is unknowable.
+# The 240 predictable xterm-256 entries (6x6x6 cube + 24 grays). The first 16
+# system colors are terminal-themed, so their real RGB is unknowable.
 _XTERM_LEVELS = (0, 95, 135, 175, 215, 255)
 _XTERM_PALETTE_IMG = None
 _XTERM_TEXTUAL_COLORS = None  # index-preserving Textual colors, built once
@@ -264,21 +264,16 @@ def _xterm_index(i: int) -> int:
 
 def _block_art(img, max_w: int, max_h: int, dither: bool = False) -> Content:
     """The image as truecolor half-blocks fitted into max_w x max_h cells:
-    each cell is one "▀" whose foreground is the upper pixel and background
-    the lower. The two stacked pixels fill the cell's ~1:2 shape, so pixels
-    come out square and no aspect correction is needed.
+    each cell is one "▀" with the upper pixel as foreground and the lower as
+    background, so pixels come out square.
 
-    Returns Textual's native Content with ready-made Style objects: a rich
-    Text here costs a style-string parse plus a rich-to-Textual conversion
-    per span at paint time, and with thousands of unique colors defeating
-    every cache that machinery dominates how long a full-screen photo takes
-    to draw.
+    Returns Textual's native Content with ready-made Style objects: rich Text
+    costs a style parse and conversion per span at paint time, which
+    dominates a full-screen photo with thousands of unique colors.
 
-    ``dither`` is for non-truecolor terminals: the terminal would snap each
-    RGB to the nearest 256-palette entry, posterizing smooth gradients into
-    flat patches. Floyd-Steinberg dithering onto the same cube+gray palette,
-    emitted as exact palette indices, trades those patches for fine noise,
-    which reads far better at cell scale."""
+    ``dither`` is for non-truecolor terminals: Floyd-Steinberg onto the
+    cube+gray palette, emitted as exact indices, trades posterized patches
+    for fine noise, which reads far better at cell scale."""
     from PIL.Image import Dither, Resampling
 
     rgb = img.convert("RGB")
@@ -323,9 +318,8 @@ def _block_art(img, max_w: int, max_h: int, dither: bool = False) -> Content:
     for y in range(0, h, 2):
         if y:
             pos += 1  # the newline joining this row to the previous one
-        # Emit runs of identical color pairs as one span, not one span per
-        # cell: photos still make many spans, but flat areas (and
-        # screenshots are mostly flat) collapse to a few.
+        # One span per run of identical color pairs, not per cell: flat
+        # areas (most screenshots) collapse to a few spans.
         run_style, run_len = None, 0
         for x in range(w):
             style = TextualStyle(
@@ -344,25 +338,20 @@ def _block_art(img, max_w: int, max_h: int, dither: bool = False) -> Content:
     return Content("\n".join(lines), spans)
 
 
-# The sync loop long-polls for 30s, so a healthy session sees a response at
-# least that often; once the last one is older than this, the connection is
-# presumed dead even if no request has errored out yet (a silently dropped
-# network hangs the poll without raising until much later).
+# The sync loop long-polls for 30s; once the last response is older than
+# this, the connection is presumed dead (a silently dropped network hangs the
+# poll without raising).
 STALE_AFTER = 45.0
 
 
 class ConnStatus(Static):
-    """Connectivity/staleness indicator in the footer's bottom-right corner.
-
-    Shows a green dot plus the age of the last successful sync while the
-    connection is healthy, and a red "offline" marker with the same age (now:
-    how stale everything on screen is) when the last sync failed or none has
-    completed within STALE_AFTER. Re-rendered on a 1s timer so the age ticks.
-    """
+    """Connectivity indicator in the footer's bottom-right corner: a green
+    dot plus the age of the last successful sync, or a red "offline" marker
+    with the same age (how stale the screen is). Re-rendered on a 1s timer."""
 
     def on_mount(self) -> None:
-        # layout=True: the text width changes as the age grows ("59s" -> "1m",
-        # "● 5s" -> "✗ offline 2m") and the dock: right slot must resize.
+        # layout=True: the text width changes as the age grows, and the
+        # dock: right slot must resize.
         self.set_interval(1.0, lambda: self.refresh(layout=True))
 
     def render(self) -> Text:
@@ -400,6 +389,16 @@ class EntryItem(ListItem):
         self.entry = entry
 
 
+class MessageHitItem(ListItem):
+    """A global-search result row pointing at one message in one room:
+    opening it opens the room and jumps to that message."""
+
+    def __init__(self, entry: Entry, event_id: str, label: str) -> None:
+        super().__init__(Label(label))
+        self.entry = entry
+        self.event_id = event_id
+
+
 class MessageLine(Static):
     """One rendered message in the scrollable list. Holds the index into the
     screen's message list so navigation and replies can find it back."""
@@ -426,15 +425,10 @@ class ComposerArea(TextArea):
 
     def render_lines(self, crop):
         # Textual wipes a pruned widget's styles, but the compositor can
-        # still paint one frame from its stale map before the next reflow
-        # drops the widget; TextArea's per-frame theme application then
-        # crashes the app on the half-torn-down state (closing the composer
-        # no longer forces the timeline reflow that used to hide this
-        # window). The editor is gone from the layout anyway: hand the
-        # compositor blank lines instead of rendering.
+        # still paint one frame from its stale map; TextArea's per-frame
+        # theme application then crashes on the half-torn-down state. Hand
+        # the compositor blank lines instead.
         if not self.is_attached:
-            from textual.strip import Strip
-
             return [Strip.blank(crop.size.width) for _ in range(crop.size.height)]
         return super().render_lines(crop)
 
@@ -449,11 +443,9 @@ class ComposerArea(TextArea):
     _submitted = False
 
     async def _on_key(self, event: textual.events.Key) -> None:
-        # TextArea's own _on_key turns Enter into an inserted newline and stops
-        # the event before bindings run, so the enter->send binding above is
-        # footer decoration only; the real interception has to happen here.
-        # Shift+Enter is not consumed by TextArea, so its binding fires
-        # normally.
+        # TextArea's own _on_key consumes Enter before bindings run, so the
+        # enter->send binding above is footer decoration only; intercept
+        # here. Shift+Enter is not consumed, so its binding fires normally.
         if event.key == "enter":
             event.stop()
             event.prevent_default()
@@ -466,9 +458,8 @@ class ComposerArea(TextArea):
         self._replace_via_keyboard("\n", start, end)
 
     def action_send(self) -> None:
-        # One send per editor instance: the editor stays mounted during the
-        # network round-trip, so a second Enter would otherwise queue a
-        # duplicate send. Every redraw mounts a fresh instance, resetting this.
+        # One send per editor instance: a second Enter during the round-trip
+        # would queue a duplicate. Every redraw mounts a fresh instance.
         if self._submitted:
             return
         self._submitted = True
@@ -488,10 +479,9 @@ class RoomScreen(Screen):
         ("k", "up", "Up"),
         Binding("down", "down", "Down", show=False),
         Binding("up", "up", "Up", show=False),
-        # Vim's g/G: g browses the room's archived history from its very
-        # first message (detaching from the live tail; j at the bottom walks
-        # forward), or falls back to the first loaded message when nothing
-        # is archived; G jumps to the newest message and reattaches.
+        # Vim's g/G: g browses archived history from the room's first message
+        # (or falls back to the first loaded one); G jumps to the newest
+        # message and reattaches to the live tail.
         Binding("g", "first_message", "First", show=False),
         Binding("G", "last_message", "Last", show=False),
         # Gated by check_action to the messages they can actually act on, so
@@ -500,19 +490,16 @@ class RoomScreen(Screen):
         ("h", "collapse", "Fold thread"),
         ("u", "first_unread", "First unread"),
         Binding("slash", "search_room", "Search", show=False),
-        # One key, three labels: check_action leaves exactly the one enabled
-        # that says what Enter will do to the selected message (nothing at all
-        # for a plain one), so the footer never promises what it cannot do.
-        # The reactions popup is the spacebar's job below; Enter reaches it
-        # only through the actions menu of a message that offers more.
+        # One key, three labels: check_action enables exactly the one that
+        # says what Enter will do to the selected message. The reactions
+        # popup is the spacebar's job; Enter reaches it only via the actions
+        # menu.
         Binding("enter", "open_download", "Download"),
         Binding("enter", "open_link", "Open link"),
         Binding("enter", "open_actions", "Message actions"),
-        # Two bindings share the spacebar like the "t"/"c" pairs: an image
-        # upload gets an in-terminal rendering of the picture (ASCII art or
-        # truecolor half-blocks, "~" in the popup flips between them), any
-        # other message wearing reaction badges opens who sent them. Inside
-        # either popup the spacebar closes it again, so the key is a toggle.
+        # Two bindings share the spacebar: an image gets an in-terminal
+        # preview, any other message with reaction badges shows who sent
+        # them. Inside either popup space closes it again: a toggle.
         ("space", "preview_image", "Preview"),
         Binding("space", "show_reactions", "Who reacted"),
         # Enter acts on what a message says; Shift+Enter looks behind it, at
@@ -533,13 +520,11 @@ class RoomScreen(Screen):
         Binding("t", "threads_on", "View: normal"),
         Binding("t", "threads_off", "View: threaded"),
         ("T", "thread", "Open thread"),
-        # Two bindings share "c" like the "t" pair: check_action enables the
-        # one naming the current spacing, so the footer reads as state.
+        # Same pattern as "t": the enabled label names the current spacing.
         Binding("c", "compact_on", "Compact: off"),
         Binding("c", "compact_off", "Compact: on"),
-        # Same pattern for "~" (vim's toggle-the-form key): the enabled label
-        # names what the sender column currently shows (display names or raw
-        # @user:server ids).
+        # Same pattern for "~": the enabled label names what the sender
+        # column shows (display names or raw @user:server ids).
         Binding("tilde", "ids_on", "Show: names"),
         Binding("tilde", "ids_off", "Show: ids"),
     ]
@@ -559,36 +544,40 @@ class RoomScreen(Screen):
         self.older: list = []  # back-paginated messages, kept across refreshes
         self._paginating = False  # guard against overlapping fetches
         self._at_beginning = False  # history start reached and announced
-        # Browse mode ("g"): a snapshot of the room's archived history while
-        # the view is detached from the live tail and walking it from the
-        # very first message; None when following the tail as usual. The
-        # counter is how many snapshot rows are in the view so far ("j" at
-        # the bottom extends it; "G" or walking past the end reattaches).
+        # Browse mode ("g", or a search jump into deep history): a snapshot
+        # of the archived history, detached from the live tail; None while
+        # following the tail. [start, upto) is the slice of snapshot rows in
+        # view.
         self._browse: list | None = None
+        self._browse_start = 0
         self._browse_upto = 0
         # The room's fully-read marker as it was when this screen opened;
         # everything after it renders below a "new" divider, and "u" jumps
         # there. Frozen at open so live arrivals stay marked until you leave.
         self._opened_read_marker: str | None = None
+        # Event id to land the selection on once the initial load is in, set
+        # by open_room for a global-search message hit; consumed once.
+        self._jump_target: str | None = None
+        # Signature of the message list the sync-refresh path last acted on
+        # (see refresh_messages); None forces the first refresh to compare
+        # against the initial load.
+        self._live_sig: list | None = None
         # Event id of the first unread message, chosen once from the opening
         # snapshot (see on_mount); the divider is anchored to it thereafter.
         self._first_unread_event: str | None = None
         # False until _finish_mount's full history fetch has run once;
-        # refresh_messages stays a no-op before that (the opening load ends by
-        # syncing _last_seen_event itself, so nothing is lost by waiting).
+        # refresh_messages stays a no-op before that.
         self._loaded = False
         self._composing = False  # True while an "n" new-message editor is open
         self._editing = None  # own Message being rewritten with "e", or None
         self._last_seen_event: str | None = None  # latest event id we rendered
-        # What _redraw last mounted: the per-message signature list, the
-        # view-mode tuple, and the (sender, day) carry at the tail, so a
-        # tail-append can continue instead of rebuilding everything.
+        # What _redraw last mounted, so a tail-append can continue instead of
+        # rebuilding everything.
         self._drawn_sig: list | None = None
         self._drawn_mode: tuple | None = None
         self._drawn_tail: tuple = (None, None)
-        # Local echoes still in flight: shown in gray immediately on Enter and
-        # spliced back into every reload so a background sync cannot drop them
-        # before the server confirms (see _finish_send).
+        # In-flight local echoes, spliced back into every reload so a sync
+        # cannot drop them before the server confirms (see _finish_send).
         self._pending: list = []
         # _redraw is reached from workers, this screen's own handlers, and
         # app-level sync callbacks; the lock keeps rebuilds from interleaving.
@@ -603,19 +592,15 @@ class RoomScreen(Screen):
         yield StatusFooter()
 
     async def _load_messages(self, cached_only: bool = False) -> list:
-        """The message list this screen renders. Normal view: the room's main
-        timeline with thread replies collapsed out (they live in their own
-        ThreadScreen) and per-root reply counts collected for the ⤷ badges.
-        Threaded view: replies render indented directly under their root, and
-        replies whose root fell out of the history window stay inline at their
-        own position so nothing is hidden. ThreadScreen overrides this to load
-        a single thread instead. cached_only skips the network and serves
-        whatever the timeline cache already holds; on_mount uses it to paint
-        instantly before the (slow) full fetch."""
+        """The message list this screen renders. Normal view: the main
+        timeline with thread replies collapsed out and per-root reply counts
+        for the ⤷ badges. Threaded view: replies indented under their root;
+        replies whose root fell out of the window stay inline. ThreadScreen
+        overrides this to load a single thread. cached_only skips the network
+        so on_mount can paint instantly before the full fetch."""
         if self._browse is not None:
-            # Browse mode: the view is exactly the archive rows loaded so far
-            # (kept in self.older) with the live window deliberately absent;
-            # everything below (edit folding, thread collapse) still applies.
+            # Browse mode: exactly the archive rows loaded so far (in
+            # self.older), the live window deliberately absent.
             messages = list(self.older)
         else:
             messages = await self.app.session.load_history(
@@ -673,15 +658,11 @@ class RoomScreen(Screen):
         return self._splice_pending(out)
 
     def _splice_pending(self, messages: list) -> list:
-        """Append the in-flight local echoes to a freshly built display list.
-        Reloads rebuild from the session cache, which knows nothing about a
-        message whose send has not returned yet; without this it would blink
-        out of the timeline whenever a sync lands during the round-trip.
-
-        An echo whose real event already arrived via sync (outrunning the
-        /send response, so the echo still has its provisional id) is skipped
-        rather than shown next to it. Matching is one confirmed message per
-        echo, so sending the same text twice still shows two entries."""
+        """Append the in-flight local echoes to a freshly built display list;
+        without this an unconfirmed message would blink out whenever a sync
+        lands during the round-trip. An echo whose real event already arrived
+        via sync is skipped, one confirmed message per echo, so sending the
+        same text twice still shows two entries."""
         claimed: set[str] = set()
         for p in self._pending:
             if any(m.event_id == p.event_id for m in messages):
@@ -695,8 +676,7 @@ class RoomScreen(Screen):
                     and m.sender == p.sender
                     and m.body == p.body
                     # Window against clock skew: only a message from roughly
-                    # now can be this echo's confirmation, not an identical
-                    # text from an hour ago.
+                    # now can be this echo's confirmation.
                     and abs(m.ts - p.ts) < 5 * 60 * 1000
                 ),
                 None,
@@ -716,20 +696,17 @@ class RoomScreen(Screen):
         room = self.app.session.client.rooms.get(self.entry.room_id)
         self._opened_read_marker = getattr(room, "fully_read_marker", None)
         self._reset_history_position()
-        # Paint whatever the sync-seeded cache already holds before touching
-        # the network: the full /messages fetch takes seconds on a slow
-        # homeserver, and a shallow timeline right away beats a blank
-        # screen. The unread divider waits for the full window below, whose
-        # count fallback needs the complete opening snapshot.
+        # Paint from the sync-seeded cache before touching the network: the
+        # full fetch can take seconds, and a shallow timeline beats a blank
+        # screen. The unread divider waits for the full window below.
         quick = await self._load_messages(cached_only=True)
         if quick:
             self.messages = quick
             self.selected = len(quick) - 1
             await self._redraw()
-        # The full fetch goes to the network; on this screen's message pump it
-        # would block every key bound here (q, escape, :) until it returned,
-        # and Textual's shutdown waits on this pump, so quitting would hang
-        # too. In a worker the screen stays interactive from the first paint.
+        # In a worker: on this screen's message pump the network fetch would
+        # block every key bound here, and Textual's shutdown waits on the
+        # pump, so quitting would hang too.
         self.run_worker(self._finish_mount(), group="initial_load", exclusive=True)
 
     async def _finish_mount(self) -> None:
@@ -740,9 +717,15 @@ class RoomScreen(Screen):
             messages = await self._load_messages()
             if not self.is_attached:
                 return  # backed out of the room while the fetch was in flight
-            # The quick paint made the screen interactive during the fetch; if
-            # the user moved off the tail meanwhile, keep their place (by event
-            # id, since the full window may have inserted rows above it).
+            # Captured NOW, not after the marker fetches below: an event
+            # arriving during those round trips must still look new to the
+            # first sync refresh, or it would be marked seen unrendered.
+            opening_latest = self.app.session.last_event_id.get(
+                self.entry.room_id
+            )
+            # If the user moved off the tail during the fetch, keep their
+            # place by event id (the full window may have inserted rows
+            # above it).
             follow = (
                 not self.messages or self.selected >= len(self.messages) - 1
             )
@@ -761,10 +744,16 @@ class RoomScreen(Screen):
                     else min(self.selected, max(0, len(messages) - 1))
                 )
             # Anchor the "new" divider to an event id now: the count fallback
-            # in _first_unread_index is only meaningful against the opening
-            # snapshot, and recomputing it as live messages grow the list
-            # would drift the divider onto messages that arrived while you
-            # were reading.
+            # is only meaningful against the opening snapshot, and
+            # recomputing it as the list grows would drift the divider.
+            if self._opened_read_marker is None:
+                # nio usually has no marker on the first open after a launch
+                # (resumed syncs do not carry old room account data). Fetch
+                # it rather than trust the unread-count guess below, which
+                # counts thread replies and can misplace the divider.
+                self._opened_read_marker = (
+                    await self.app.session.fetch_fully_read(self.entry.room_id)
+                )
             marker = self._opened_read_marker
             marker_ts = None
             if (
@@ -781,32 +770,49 @@ class RoomScreen(Screen):
                 self.messages[idx].event_id if idx is not None else None
             )
             if not self.messages:
-                # Auto-open the composer in an empty room as real state, not
-                # an unconditional mount, so Escape can cancel it and leave
-                # the room.
+                # Auto-open the composer in an empty room as real state, so
+                # Escape can cancel it and leave the room.
                 self._composing = True
-            self._last_seen_event = self.app.session.last_event_id.get(
-                self.entry.room_id
-            )
+            self._last_seen_event = opening_latest
+            self._live_sig = self._signature(messages)
             await self._redraw(keep_scroll=not follow)
             await self.app.session.mark_read(self.entry.room_id)
-            # After the visible window is up: download the room's ENTIRE
-            # history in the background, so everything from the first message
-            # on survives locally (deletions and edit versions included).
-            # No-op when the room is already archived or downloading; a
-            # ThreadScreen mount kicks the same room, equally a no-op.
+            if self._jump_target:
+                # Opened from a global-search hit: land on it, wherever it
+                # lives.
+                target, self._jump_target = self._jump_target, None
+                idx = next(
+                    (
+                        i
+                        for i, m in enumerate(self.messages)
+                        if m.event_id == target
+                    ),
+                    None,
+                )
+                if idx is not None:
+                    self.selected = idx
+                    self._highlight()
+                else:
+                    corpus = self._search_corpus()
+                    hit = next(
+                        (m for m in corpus if m.event_id == target), None
+                    )
+                    if hit is not None:
+                        await self._jump_to_hit(hit, corpus)
+            # With the visible window up, download the room's ENTIRE history
+            # in the background so everything survives locally (deletions
+            # and edit versions included). No-op when already archived or
+            # downloading.
             self.app.session.start_backfill(self.entry.room_id)
         finally:
-            # Even on a failed or superseded load, hand live updates over to
-            # refresh_messages; its next run reloads everything this one
-            # missed (the guard below keeps the two from interleaving).
+            # Even on a failed load, hand live updates over to
+            # refresh_messages; its next run reloads what this one missed.
             self._loaded = True
 
     async def refresh_names(self) -> None:
-        """Called by the app when the background member fetch for this room
-        lands (launch syncs members lazily, see MatrixSession._fetch_members):
-        senders that painted as raw @user:server ids get their display names.
-        Selection and scroll stay put; only the text changes."""
+        """Called when the background member fetch for this room lands:
+        senders painted as raw @user:server ids get their display names.
+        Selection and scroll stay put."""
         if not self.is_attached:
             return
         messages = await self._load_messages(cached_only=True)
@@ -825,16 +831,13 @@ class RoomScreen(Screen):
         the room received events since we last drew, follow the tail if the
         selection was on it, and mark the new messages read (we are looking at
         the room, after all)."""
-        # The sync loop runs this as a worker; by the time it runs (or
-        # resumes from the history await below) the user may have popped the
-        # screen, whose widgets are then gone. Before the opening load has
-        # finished it would also race _finish_mount, which picks up anything
-        # that arrives meanwhile itself.
+        # Runs as a worker: the screen may have been popped by now, and
+        # before the opening load finishes it would race _finish_mount.
         if not self.is_attached or not self._loaded:
             return
-        # Browsing history from the top: a reload would clobber the detached
-        # view with the live tail. _last_seen_event stays untouched, so the
-        # first refresh after leaving browse mode catches everything up.
+        # Browsing history: a reload would clobber the detached view.
+        # _last_seen_event stays untouched, so the first refresh after
+        # leaving browse mode catches up.
         if self._browse is not None:
             return
         latest = self.app.session.last_event_id.get(self.entry.room_id)
@@ -844,15 +847,12 @@ class RoomScreen(Screen):
         messages = await self._load_messages()
         if not self.is_attached:
             return
-        # Only now mark the batch seen: as an exclusive worker this reload can
-        # be cancelled mid-await by the next sync's, and marking before the
-        # load would make that next run skip the batch entirely.
-        self._last_seen_event = latest
-        # A new thread reply changes only a badge count, not the main list.
-        if (
-            self._signature(messages) != self._signature(self.messages)
-            or self.thread_counts != prev_counts
-        ):
+        # Compare against the signature this path last acted on, NOT a fresh
+        # signature of self.messages: reaction summaries are looked up live,
+        # so a reaction would otherwise never repaint. A new thread reply
+        # only changes a badge count, hence the counts check.
+        new_sig = self._signature(messages)
+        if new_sig != self._live_sig or self.thread_counts != prev_counts:
             follow = not self.messages or self.selected >= len(self.messages) - 1
             # Keep the selection on the same message by event id, not index:
             # a thread reply arriving in threaded (or unfolded) view inserts
@@ -863,9 +863,8 @@ class RoomScreen(Screen):
                 if follow or self.selected >= len(self.messages)
                 else self.messages[self.selected].event_id
             )
-            # The reload built fresh Message objects; re-point the reply target
-            # at its new incarnation, so the composer's header keeps quoting
-            # the current text of the message being replied to.
+            # The reload built fresh Message objects; re-point the reply
+            # target so the composer keeps quoting current text.
             if self.reply_to is not None and self.reply_to.event_id:
                 self.reply_to = next(
                     (m for m in messages if m.event_id == self.reply_to.event_id),
@@ -887,6 +886,11 @@ class RoomScreen(Screen):
             # Not following the tail means the user is reading somewhere
             # above; keep their scroll position instead of snapping back.
             await self._redraw(keep_scroll=not follow)
+        # Only now mark the batch seen: this exclusive worker can be
+        # cancelled mid-await by the next sync's run, and marking earlier
+        # would make that run skip the batch, leaving a stale screen.
+        self._live_sig = new_sig
+        self._last_seen_event = latest
         await self.app.session.mark_read(self.entry.room_id)
 
     def _signature(self, messages: list) -> list:
@@ -911,12 +915,9 @@ class RoomScreen(Screen):
 
     def _render_sig(self) -> list:
         """Everything a message's mounted widget depends on, one tuple per
-        message. If an entry (and the _render_mode below) is unchanged, the
-        widget on screen is still correct; _redraw compares these to skip
-        work. A message also renders a quote of its reply TARGET, but any
-        change to the target changes the target's own entry, which breaks
-        the prefix match and forces the full rebuild that refreshes the
-        quote."""
+        message; _redraw compares these to skip work. A change to a reply's
+        TARGET changes the target's own entry, breaking the prefix match and
+        forcing the rebuild that refreshes the quote."""
         return [
             (
                 m.event_id,
@@ -965,10 +966,9 @@ class RoomScreen(Screen):
             if day != prev_day and prev_day is not None:
                 stamp = time.strftime("%a %d %b %Y", lt)
                 rows.append(Static(Text(f"── {stamp} ──", style="dim")))
-                # The header is only drawn on a sender change; without this
-                # the first message of a day inherits suppression from the
-                # same sender's last message of the previous day and renders
-                # attributed to nobody.
+                # Without this the first message of a day inherits header
+                # suppression from the previous day and renders attributed
+                # to nobody.
                 prev = None
             prev_day = day
             if i == first_unread:
@@ -986,24 +986,17 @@ class RoomScreen(Screen):
         return rows, prev, prev_day
 
     async def _redraw(self, keep_scroll: bool = False) -> None:
-        """Bring the timeline widgets in line with self.messages.
-        Serialized by a lock: two interleaved rebuilds would duplicate
-        widgets. The composer is not part of this: it lives in its own
-        docked panel (see _sync_composer), so a rebuild can never swallow a
-        half-typed draft.
+        """Bring the timeline widgets in line with self.messages. Serialized
+        by a lock: two interleaved rebuilds would duplicate widgets. The
+        composer lives in its own docked panel (see _sync_composer), so a
+        rebuild can never swallow a half-typed draft.
 
-        The mounted widgets are tracked by signature so the common live
-        cases stay cheap: messages appended at the tail mount only the new
-        rows, and a refresh that changed nothing visible keeps every widget
-        in place. Anything else (an edit, a deletion, a reaction, a view
-        toggle, cap eviction at the head) rebuilds the whole list, batched
-        into a single mount call. A full teardown-and-remount used to cost
-        ~300 ms of blocked event loop per sync tick on a back-paginated
-        timeline.
+        Widgets are tracked by signature: tail-appends mount only the new
+        rows and a no-change refresh keeps every widget; anything else
+        rebuilds the whole list in a single batched mount.
 
-        keep_scroll: restore the current scroll offset instead of snapping to
-        the highlighted message. Live refreshes use it so a message arriving
-        while the user has mouse-scrolled away does not yank the view back."""
+        keep_scroll: restore the scroll offset instead of snapping to the
+        highlighted message, so a live refresh does not yank the view back."""
         async with self._redraw_lock:
             if not self.is_attached:
                 return
@@ -1048,9 +1041,9 @@ class RoomScreen(Screen):
 
             if keep_scroll:
                 self._highlight(scroll=False)
-                # After layout settles, put the view back where it was; new
-                # content only grew the bottom, so the offset still points at
-                # the same rows.
+                # After layout settles, put the view back; new content only
+                # grew the bottom, so the offset still points at the same
+                # rows.
                 self.call_after_refresh(
                     lambda: tl.scroll_to(y=scroll_y, animate=False)
                 )
@@ -1071,10 +1064,9 @@ class RoomScreen(Screen):
 
     async def _sync_composer(self) -> None:
         """Bring the docked composer in line with the editing state. An open
-        editor is mounted once and then left alone, so live refreshes cannot
-        disturb what you are typing; the panel's fixed height means a long
-        draft scrolls inside it instead of running off the bottom of the
-        screen."""
+        editor is mounted once and left alone, so live refreshes cannot
+        disturb typing; its fixed height makes a long draft scroll
+        internally."""
         panel = self.query_one("#composer", Vertical)
         if self.reply_to is None and not self._composing:
             await panel.remove_children()
@@ -1149,9 +1141,8 @@ class RoomScreen(Screen):
         if not self.messages:
             return
         if self._browse is not None and self.selected >= len(self.messages) - 1:
-            # Bottom of the browse view: pull the next chunk of archived
-            # history into it, or reattach to the live tail once the
-            # snapshot is walked dry.
+            # Bottom of the browse view: pull the next chunk of archive, or
+            # reattach to the live tail once the snapshot is walked dry.
             self.run_worker(
                 self._extend_browse(), group="browse", exclusive=True
             )
@@ -1168,9 +1159,8 @@ class RoomScreen(Screen):
         self.selected -= 1
         self._highlight()
 
-    # How much archived history "g" loads at once, and each "j" at the bottom
-    # of the browse view adds. Widgets are not virtualized, so the chunk is
-    # what keeps a 20k-message room from mounting 20k widgets in one go.
+    # Archived history loaded per chunk: widgets are not virtualized, so
+    # this keeps a 20k-message room from mounting 20k widgets in one go.
     BROWSE_CHUNK = 200
 
     def action_first_message(self) -> None:
@@ -1182,6 +1172,7 @@ class RoomScreen(Screen):
             rows = self.app.session.archive_rows(self.entry.room_id)
             if rows:
                 self._browse = rows
+                self._browse_start = 0
                 self._browse_upto = min(len(rows), self.BROWSE_CHUNK)
                 self.older = rows[: self._browse_upto]
                 if self.entry.room_id not in self.app.session.archive_done:
@@ -1232,7 +1223,7 @@ class RoomScreen(Screen):
         self._browse_upto = min(
             len(self._browse), self._browse_upto + self.BROWSE_CHUNK
         )
-        self.older = self._browse[: self._browse_upto]
+        self.older = self._browse[self._browse_start : self._browse_upto]
         messages = await self._load_messages()
         if not self.is_attached:
             return
@@ -1249,10 +1240,40 @@ class RoomScreen(Screen):
         await self._redraw(keep_scroll=True)
         self._highlight()
 
+    async def _extend_browse_up(self) -> None:
+        """"k" at the top of a browse window that does not start at the
+        room's first message (a search jump landed it mid-history): pull the
+        previous chunk of snapshot rows into view."""
+        if self._browse is None or self._browse_start <= 0:
+            return
+        anchor = (
+            self.messages[self.selected].event_id
+            if self.selected < len(self.messages)
+            else None
+        )
+        self._browse_start = max(0, self._browse_start - self.BROWSE_CHUNK)
+        self.older = self._browse[self._browse_start : self._browse_upto]
+        messages = await self._load_messages()
+        if not self.is_attached:
+            return
+        self.messages = messages
+        pos = next(
+            (i for i, m in enumerate(messages) if m.event_id == anchor),
+            None,
+        )
+        # The pressed "k" still means "one step up" from where we were.
+        self.selected = max(0, (pos - 1) if pos is not None else 0)
+        await self._redraw()
+
     async def _exit_browse(self) -> None:
         self._browse = None
+        self._browse_start = 0
         self._browse_upto = 0
         self.older = []
+        # Browsing advanced the pagination depth past rows this view no
+        # longer holds; resuming from it would silently skip messages.
+        self.app.session.reset_pagination(self.entry.room_id)
+        self._at_beginning = False
         messages = await self._load_messages()
         if not self.is_attached:
             return
@@ -1264,12 +1285,10 @@ class RoomScreen(Screen):
         await self.refresh_messages()
 
     def _reset_history_position(self) -> None:
-        """Called once on mount. The messages a previous visit back-paginated
-        died with its screen (self.older starts empty), so the session-held
-        continuation token must die too, or scrolling up would resume from the
-        old depth and silently skip everything in between. ThreadScreen
-        overrides this to a no-op: opening a thread must not discard the
-        position of the room screen still live beneath it."""
+        """Called once on mount: self.older starts empty, so the session-held
+        continuation token must be reset too, or scrolling up would resume
+        from the old depth and skip messages. ThreadScreen overrides this to
+        a no-op (the room screen beneath still owns its position)."""
         self.app.session.reset_pagination(self.entry.room_id)
 
     def _fetch_older(self) -> None:
@@ -1280,17 +1299,22 @@ class RoomScreen(Screen):
         if self._paginating or self._at_beginning:
             return
         if self._browse is not None:
-            return  # the view already starts at the room's first message
+            # A window landed mid-history by a search jump grows upward;
+            # one that starts at the room's first message has nothing above.
+            if self._browse_start > 0:
+                self.run_worker(
+                    self._extend_browse_up(), group="browse", exclusive=True
+                )
+            return
         self._paginating = True
 
         async def fetch() -> None:
             try:
                 known = {m.event_id for m in self.messages}
                 known.update(m.event_id for m in self.older)
-                # A batch can consist entirely of events we already have
-                # (e.g. the first call re-covers the initial window, or
-                # non-message events were filtered out); skip past those,
-                # bounded so a dead room cannot loop forever.
+                # A batch can consist entirely of events we already have;
+                # skip past those, bounded so a dead room cannot loop
+                # forever.
                 fresh: list = []
                 for _ in range(3):
                     batch = await self.app.session.load_older(self.entry.room_id)
@@ -1407,9 +1431,8 @@ class RoomScreen(Screen):
         self.expanded.discard(root_id)
         self.run_worker(self._reload_view(keep=root_id))
 
-    # The timestamp fallback below asks the server about a marker that is
-    # not a display row; threads opt out (their override only trusts a
-    # marker inside the thread, so the fetch would be wasted).
+    # Threads opt out of the timestamp fallback below: their override only
+    # trusts a marker inside the thread, so the fetch would be wasted.
     _divider_ts_fallback = True
 
     def _first_unread_index(self, marker_ts: int | None = None) -> int | None:
@@ -1427,19 +1450,15 @@ class RoomScreen(Screen):
             )
             if pos is not None:
                 return pos + 1 if pos + 1 < len(self.messages) else None
-        # The marker exists but is not a row here (a reaction or redaction
-        # id, or an event beyond the loaded window). Its fetched timestamp
-        # is the exact read horizon: the first newer message starts the
-        # unread run, and no newer message means everything was read.
+        # The marker is not a row here (a reaction id, or beyond the loaded
+        # window); its fetched timestamp is the exact read horizon.
         if marker_ts is not None:
             return next(
                 (i for i, m in enumerate(self.messages) if m.ts > marker_ts),
                 None,
             )
-        # No marker recorded, or its timestamp could not be fetched: fall
-        # back to the unread count the room reported when opened; without
-        # either signal, treat the room as read rather than flagging
-        # everything.
+        # No marker and no timestamp: fall back to the unread count at open;
+        # without either signal, treat the room as read.
         if self.entry.unread:
             return max(0, len(self.messages) - self.entry.unread)
         return None
@@ -1540,11 +1559,8 @@ class RoomScreen(Screen):
                 return action == "open_actions"
             kind = actions[0][1][0]
             if kind == "reactions":
-                # The spacebar owns the reactions popup: a message whose only
-                # Enter action is its reactions is never an image (images
-                # always offer a download too), so its spacebar is free, and
-                # a second footer entry promising the popup on Enter would be
-                # noise.
+                # The spacebar owns the reactions popup; a second footer
+                # entry promising it on Enter would be noise.
                 return False
             return action == f"open_{kind}"
         return True
@@ -1660,16 +1676,14 @@ class RoomScreen(Screen):
             self._mark_history(label, m)
             grid.add_row(time_cell, label)
         else:
-            # Only an unconfirmed local echo renders gray; a delivered own
-            # message uses the same color as everyone else's (the orange name
-            # already marks it as ours), so gray unambiguously means "not on
-            # the server yet". _finish_send flips it on confirm.
+            # Only an unconfirmed local echo renders gray, so gray
+            # unambiguously means "not on the server yet". _finish_send
+            # flips it on confirm.
             style = "grey50" if m.pending else ""
             text = Text(body, style=style)
             for start, end, url in _find_urls(body):
-                # "link <url>" makes Rich emit an OSC 8 hyperlink, so the URL is
-                # also mouse-clickable in terminals that support it; the
-                # underline marks it in the ones that do not.
+                # "link <url>": Rich emits an OSC 8 hyperlink, mouse-clickable
+                # where supported; the underline marks it elsewhere.
                 text.stylize(f"underline deep_sky_blue1 link {url}", start, end)
             if m.mentions_me:
                 text.append(" @", style="bold red")
@@ -1733,9 +1747,8 @@ class RoomScreen(Screen):
 
         def when_picked(key) -> None:
             if key:
-                # An app worker, same as _finish_send: a screen worker dies
-                # with the screen, and leaving the room during the round-trip
-                # must not silently drop the reaction.
+                # An app worker: a screen worker dies with the screen, and
+                # leaving the room mid-round-trip must not drop the reaction.
                 self.app.run_worker(self._finish_react(m, key))
 
         self.app.push_screen(ReactScreen(self.entry, m), when_picked)
@@ -1746,8 +1759,7 @@ class RoomScreen(Screen):
             self.entry.room_id, m.event_id, key
         )
         if not ok:
-            # The room is named because the user may have moved on meanwhile
-            # and the toast can appear anywhere in the app (as _finish_send).
+            # The room is named: the toast can appear anywhere in the app.
             self.app.notify(
                 f"Failed to react in {self.entry.title}: {info}",
                 severity="error",
@@ -1787,9 +1799,8 @@ class RoomScreen(Screen):
 
         def when_answered(yes) -> None:
             if yes:
-                # An app worker, same as _finish_send: a screen worker dies
-                # with the screen, so confirming and then leaving the room
-                # during the round-trip would silently skip the deletion.
+                # An app worker: a screen worker dies with the screen, and
+                # leaving the room mid-round-trip must not skip the deletion.
                 self.app.run_worker(self._finish_delete(m))
 
         first_line = ((m.body or "").strip().splitlines() or [""])[0][:60]
@@ -1800,8 +1811,7 @@ class RoomScreen(Screen):
     async def _finish_delete(self, m) -> None:
         ok, info = await self.app.session.redact(self.entry.room_id, m.event_id)
         if not ok:
-            # The room is named because the user may have left it meanwhile
-            # and the toast can appear anywhere in the app (as _finish_send).
+            # The room is named: the toast can appear anywhere in the app.
             self.app.notify(
                 f"Failed to delete in {self.entry.title}: {info}",
                 severity="error",
@@ -1855,8 +1865,42 @@ class RoomScreen(Screen):
             return []
         return self._actions_for(self.messages[self.selected])
 
+    # ThreadScreen turns this off: a thread's "/" searches only the thread
+    # itself, never the whole room archive underneath it.
+    _archive_search = True
+
+    def _search_corpus(self) -> list:
+        """Every message this client holds for the room: the downloaded
+        archive merged with the live window and anything paged back this
+        visit, edits folded, thread replies included (the display list drops
+        those in normal view; search must not)."""
+        if not self._archive_search:
+            return list(self.messages)
+        session = self.app.session
+        merged = {
+            m.event_id: m for m in session.archive_rows(self.entry.room_id)
+        }
+        rows = [
+            *session.timelines.get(self.entry.room_id, ()),
+            *self.older,
+            *self.messages,
+        ]
+        for m in rows:
+            if m.event_id and not m.pending:
+                merged[m.event_id] = m
+        return fold_edits(
+            sorted(merged.values(), key=lambda m: (m.ts, m.event_id))
+        )
+
     def action_search_room(self) -> None:
-        """"/": search the loaded history and jump to the picked hit."""
+        """"/": search everything held locally and jump to the picked hit."""
+        session = self.app.session
+        corpus = self._search_corpus()
+        downloading = bool(
+            self._archive_search
+            and session.cache_allowed(self.entry.room_id)
+            and self.entry.room_id not in session.archive_done
+        )
 
         def when_picked(event_id) -> None:
             if not event_id:
@@ -1872,8 +1916,85 @@ class RoomScreen(Screen):
             if idx is not None:
                 self.selected = idx
                 self._highlight()
+                return
+            hit = next((m for m in corpus if m.event_id == event_id), None)
+            if hit is not None:
+                self.run_worker(
+                    self._jump_to_hit(hit, corpus),
+                    group="browse",
+                    exclusive=True,
+                )
 
-        self.app.push_screen(RoomSearchScreen(list(self.messages)), when_picked)
+        where = (
+            self.entry.title
+            if self._archive_search
+            else f"this thread ({self.entry.title})"
+        )
+        self.app.push_screen(
+            RoomSearchScreen(corpus, downloading, where), when_picked
+        )
+
+    async def _jump_to_hit(self, hit, corpus: list) -> None:
+        """Land the selection on a hit the display list does not contain:
+        unfold its thread and reload; if still not visible, detach into
+        archive browse mode (as "g" does) with the window grown just far
+        enough to cover it. "G" reattaches as usual."""
+        if hit.thread_root:
+            self.expanded.add(hit.thread_root)
+        await self._reload_view(keep=hit.event_id)
+        if (
+            self.messages
+            and self.selected < len(self.messages)
+            and self.messages[self.selected].event_id == hit.event_id
+        ):
+            return
+        rows = self._browse or corpus
+        pos = next(
+            (i for i, m in enumerate(rows) if m.event_id == hit.event_id), None
+        )
+        if pos is None:
+            return  # gone from the snapshot being browsed: nowhere to land
+        # A bounded window ending at the hit: a deep hit in a big room must
+        # not mount thousands of rows in one go. "k" at the top grows it.
+        self._browse = rows
+        self._browse_upto = min(len(rows), pos + 1)
+        start = max(0, self._browse_upto - self.BROWSE_CHUNK)
+        if hit.thread_root:
+            # The reply renders under its root; keep the root in the window
+            # even when the thread is longer than a whole chunk.
+            root_pos = next(
+                (
+                    i
+                    for i, m in enumerate(rows)
+                    if m.event_id == hit.thread_root
+                ),
+                None,
+            )
+            if root_pos is not None:
+                start = min(start, root_pos)
+        self._browse_start = start
+        self.older = rows[self._browse_start : self._browse_upto]
+        messages = await self._load_messages()
+        if not self.is_attached:
+            return
+        self.messages = messages
+        idx = next(
+            (i for i, m in enumerate(messages) if m.event_id == hit.event_id),
+            None,
+        )
+        if idx is None and hit.thread_root:
+            # The reply itself cannot render (its root is missing from the
+            # browsed rows); settle for the closest visible position.
+            idx = next(
+                (
+                    i
+                    for i, m in enumerate(messages)
+                    if m.event_id == hit.thread_root
+                ),
+                None,
+            )
+        self.selected = idx if idx is not None else max(0, len(messages) - 1)
+        await self._redraw()
 
     def action_open_details(self) -> None:
         if not self.messages:
@@ -1951,7 +2072,7 @@ class RoomScreen(Screen):
             def when_chosen(directory: str | None) -> None:
                 if directory:
                     # App worker: leaving the room must not abort a save the
-                    # user asked for (screen workers die with the screen).
+                    # user asked for.
                     self.app.run_worker(self._download(m, directory))
 
             self.app.push_screen(DownloadScreen(m), when_chosen)
@@ -2049,9 +2170,9 @@ class RoomScreen(Screen):
             self.app.pop_screen()
 
     def _cancel_editor(self) -> None:
-        # Stash (or clear) the draft before the composer unmounts: Escape must
-        # never cost a paragraph. Typing r/R again hands it back. Cancelled
-        # edits are not stashed: their text is the message's own, not a draft.
+        # Stash (or clear) the draft before the composer unmounts: Escape
+        # must never cost a paragraph. Cancelled edits are not stashed: their
+        # text is the message's own, not a draft.
         try:
             text = self.query_one("#editor", ComposerArea).text
         except Exception:
@@ -2102,12 +2223,9 @@ class RoomScreen(Screen):
         # Capture the relation arguments before touching any state: the
         # thread override reads self.messages for the latest-reply fallback.
         kwargs = self._send_kwargs(reply)
-        from .client import Message
-
-        # Optimistic local echo: show the message (in gray) and close the
-        # editor immediately, then do the network round-trip in a worker.
-        # The provisional "~local." id keeps it distinct in every event-id
-        # keyed merge until the server assigns the real one.
+        # Optimistic local echo: show it gray and close the editor now, do
+        # the network round-trip in a worker. The provisional "~local." id
+        # keeps it distinct until the server assigns the real one.
         echo = Message(
             sender=self.app.session.cfg.user_id,
             sender_name=self.app.session.my_name,
@@ -2124,10 +2242,8 @@ class RoomScreen(Screen):
         self._composing = False
         self.selected = len(self.messages) - 1
         await self._redraw()
-        # An app worker, not a screen worker: unmounting a widget cancels its
-        # workers, so a screen-owned send would be killed mid-flight by an
-        # Escape during the round-trip, and the message would silently never
-        # go out.
+        # An app worker: unmounting cancels a screen's workers, so an Escape
+        # during the round-trip would kill a screen-owned send mid-flight.
         self.app.run_worker(self._finish_send(echo, text, reply, kwargs))
 
     async def _finish_edit(self, target, text: str) -> None:
@@ -2135,8 +2251,8 @@ class RoomScreen(Screen):
             self.entry.room_id, target, text
         )
         if not ok:
-            # Same shape as _finish_send: report even after leaving the room,
-            # and park the rewrite in the drafts so it is not lost.
+            # Report even after leaving the room, and park the rewrite in
+            # the drafts so it is not lost.
             self.app.session.drafts[self._draft_key()] = text
             self.app.notify(
                 f"Failed to edit in {self.entry.title}: {info}",
@@ -2152,10 +2268,9 @@ class RoomScreen(Screen):
         if echo in self._pending:
             self._pending.remove(echo)
         if not ok:
-            # Before the is_attached gate: a failure must be reported even if
-            # the user already left the room, or the message is lost with no
-            # notice. The room is named because the toast can now appear
-            # anywhere in the app.
+            # Before the is_attached gate: a failure must be reported even
+            # after leaving the room. The room is named because the toast
+            # can appear anywhere in the app.
             self.app.notify(
                 f"Failed to send in {self.entry.title}: {info}",
                 severity="error",
@@ -2166,11 +2281,9 @@ class RoomScreen(Screen):
             return
         if ok:
             # Deliberately NOT recorded as _last_seen_event: the sync batch
-            # that delivers our event can carry another user's message that
-            # landed just before it, and pre-marking ours as seen would make
-            # refresh_messages skip that batch entirely, hiding the other
-            # message until something else bumps the room. The refresh this
-            # costs is cheap (cache-served, signature-compared).
+            # delivering our event can carry another user's message, and
+            # pre-marking ours as seen would make refresh_messages skip the
+            # batch. The extra refresh is cheap.
             if any(m.event_id == info for m in self.messages):
                 # The sync echo landed during the round-trip; drop the local
                 # copy instead of showing the message twice.
@@ -2193,9 +2306,8 @@ class RoomScreen(Screen):
             self._composing = reply is None
         await self._redraw()
         if not ok:
-            # Sending closed the composer, so the redraw above reopened it
-            # empty; refill it with the failed text. If the user already
-            # started a new draft during the round-trip, leave that one alone.
+            # The redraw above reopened the composer empty; refill it with
+            # the failed text unless a new draft was already started.
             try:
                 editor = self.query_one("#editor", ComposerArea)
                 if not editor.text:
@@ -2216,9 +2328,8 @@ class ThreadScreen(RoomScreen):
         self._thread_seen: tuple | None = None  # see refresh_messages
 
     def action_first_message(self) -> None:
-        # A thread is already loaded whole via /relations; "g" is a plain
-        # jump to its root, never the room-archive browse the base class
-        # would enter (that belongs to the room screen underneath).
+        # A thread is loaded whole via /relations; "g" is a plain jump to
+        # its root, never the base class's archive browse.
         if self.messages:
             self.selected = 0
             self._highlight()
@@ -2256,13 +2367,11 @@ class ThreadScreen(RoomScreen):
         return (rows, reacts)
 
     async def refresh_messages(self) -> None:
-        # The room screen reloads from the timeline cache; this screen's
-        # reload refetches the whole thread over /relations (seconds on a
-        # loaded homeserver) and used to be triggered by EVERY room event,
-        # nearly all of which have nothing to do with this thread. Only pay
-        # for the fetch when the local caches show evidence the thread
-        # changed; a quiet tick still advances the seen marker and the read
-        # receipt.
+        # Reloading here refetches the whole thread over /relations (seconds
+        # on a loaded homeserver), and nearly all room events have nothing
+        # to do with this thread. Only pay when the local caches show
+        # evidence it changed; a quiet tick still advances the seen marker
+        # and the read receipt.
         if not self.is_attached or not self._loaded:
             return
         latest = self.app.session.last_event_id.get(self.entry.room_id)
@@ -2331,6 +2440,10 @@ class ThreadScreen(RoomScreen):
             return False
         return super().check_action(action, parameters)
 
+    # "/" here searches the thread that is on screen, not the room archive:
+    # the room screen underneath already offers the whole-room search.
+    _archive_search = False
+
     def _fetch_older(self) -> None:
         # A thread is loaded whole via /relations; there is nothing older to
         # paginate at the room level from here.
@@ -2376,10 +2489,9 @@ class DownloadScreen(PickerScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="downloadbox"):
-            # escape(): the filename comes from the sender; unescaped, "[" in it
-            # is parsed as console markup (crash on "[/", spoofed styling, even
-            # a live [@click] action span). Truncated so a long name cannot blow
-            # out the dialog.
+            # escape(): the filename comes from the sender; unescaped "[" is
+            # parsed as console markup (crash, spoofed styling). Truncated so
+            # a long name cannot blow out the dialog.
             raw = (self.message.media_name or self.message.body or "file")[:120]
             name = escape(raw)
             size = _fmt_size(self.message.media_size)
@@ -2426,10 +2538,9 @@ class ActionScreen(PickerScreen):
     async def on_mount(self) -> None:
         lv = self.query_one("#actions", ListView)
         for label, action in self.actions:
-            # escape(): labels quote sender-controlled text (URLs, filenames),
-            # and unescaped a "[" in one is parsed as console markup (crash on
-            # "[/", spoofed styling). Truncated so a long one cannot blow out
-            # the dialog.
+            # escape(): labels quote sender-controlled text (URLs, filenames);
+            # unescaped "[" is parsed as console markup. Truncated to fit the
+            # dialog.
             item = ListItem(Label(escape(label[:200])))
             item.action = action
             await lv.append(item)
@@ -2442,12 +2553,10 @@ class ActionScreen(PickerScreen):
 
 class PreviewScreen(ModalScreen):
     """An image upload rendered in the terminal (space on an image message):
-    truecolor half-blocks (the default), or classic ASCII art built from
-    the configured ramp. "~" flips between the two styles, and the choice
-    is remembered in state.json; j/k walk to the room's next/previous image
-    without leaving the preview; Escape (or q) closes, dismissing with the
-    event id last shown so the timeline selection can follow. Each image is
-    fetched once, scaled to the window, and rescaled on every resize."""
+    truecolor half-blocks or ASCII art, "~" flips between them (remembered
+    in state.json). j/k walk the room's images; Escape or q closes,
+    dismissing with the event id last shown so the timeline selection can
+    follow."""
 
     BINDINGS = [
         ("escape", "cancel", "Close"),
@@ -2460,9 +2569,8 @@ class PreviewScreen(ModalScreen):
         ("k", "prev_image", "Previous image"),
         Binding("down", "next_image", "Next image", show=False),
         Binding("up", "prev_image", "Previous image", show=False),
-        # Two bindings share "~" like the room screen's t/c pairs:
-        # check_action enables the one whose label names the style currently
-        # on screen, so the footer reads as state.
+        # Same "~" pattern as the room screen: the enabled label names the
+        # style currently on screen.
         Binding("tilde", "mode_blocks", "Style: ascii"),
         Binding("tilde", "mode_ascii", "Style: blocks"),
     ]
@@ -2483,8 +2591,8 @@ class PreviewScreen(ModalScreen):
 
     @property
     def mode(self) -> str:
-        # 16-color-or-less terminals get no say: block art needs at least the
-        # 256-color palette to dither onto, so only the ramp is honest there.
+        # 16-color terminals get no say: block art needs at least the
+        # 256-color palette to dither onto.
         if self._depth() == "basic":
             return "ascii"
         mode = self.app.session.state.get("preview_mode")
@@ -2524,12 +2632,10 @@ class PreviewScreen(ModalScreen):
         message = self.message
         image, error = self._cache.get(message.event_id), ""
         if image is None:
-            # Ask the server for a thumbnail at twice what this window can
-            # show (half-blocks paint two pixel rows per cell): servers snap
-            # thumbnail requests to pre-generated buckets, and the headroom
-            # keeps a portrait photo out of a tiny bucket whose upscaled JPEG
-            # blocks would dominate the render. Encrypted media falls back to
-            # the full download inside fetch_preview_bytes.
+            # Ask for a thumbnail at twice the window size (half-blocks
+            # paint two pixel rows per cell): servers snap to pre-generated
+            # buckets, and the headroom keeps a portrait photo out of a tiny
+            # upscaled one. Encrypted media falls back to the full download.
             try:
                 ok, result = await self.app.session.fetch_preview_bytes(
                     message,
@@ -2540,12 +2646,9 @@ class PreviewScreen(ModalScreen):
             except Exception as exc:
                 ok, result = False, str(exc)
             if ok:
-                # The imports sit inside the try: a broken Pillow install
-                # must degrade to an error line in the popup, not crash the
-                # worker (and with it the app).
+                # Imports inside the try: a broken Pillow install must
+                # degrade to an error line, not crash the worker.
                 try:
-                    from io import BytesIO
-
                     from PIL import Image
 
                     image = Image.open(BytesIO(result))
@@ -2571,9 +2674,8 @@ class PreviewScreen(ModalScreen):
         box = self.query_one("#previewbox", Vertical)
         w = max(2, box.content_size.width)
         h = max(2, box.content_size.height - 1)  # minus the title line
-        # A render failure (an exotic image mode, a Pillow quirk) must land
-        # in the popup as text, never take down the app: this runs on plain
-        # UI paths like resize, outside any worker's safety net.
+        # A render failure must land in the popup as text: this runs on
+        # plain UI paths like resize, outside any worker's safety net.
         try:
             if self.mode == "blocks":
                 art.update(
@@ -2587,10 +2689,8 @@ class PreviewScreen(ModalScreen):
             art.update(Text(f"Preview failed: {exc}", style="bold red"))
 
     def on_resize(self, event) -> None:
-        # A cheap full re-render from the already-decoded image, deferred
-        # past the layout pass: this Resize arrives before the children have
-        # their new sizes, and measuring #previewbox now would rebuild the
-        # art against the stale geometry.
+        # Deferred past the layout pass: this Resize arrives before the
+        # children have their new sizes.
         self.call_after_refresh(self._render_art)
 
     def _image_index(self, delta: int) -> int | None:
@@ -2770,7 +2870,7 @@ class ReactionsScreen(ModalScreen):
         box = self.query_one("#reactors", VerticalScroll)
         if not detail:
             # The last reaction can be withdrawn between the footer offering
-            # the popup and Enter opening it.
+            # the popup and it opening.
             await box.mount(Static(Text("no reactions", style="dim italic")))
             return
         for key, senders in detail:
@@ -2976,13 +3076,16 @@ class CommandScreen(ModalScreen):
 
 
 class RoomSearchScreen(ModalScreen):
-    """"/" inside a room: accent-insensitive search over the loaded history
-    (including anything paged back this visit), newest hit first. The query
-    matches the message text, the sender's display name, or their matrix id,
-    so "agnes" finds what Ágnes said as well as messages that mention her.
-    Enter dismisses with the chosen message's event id; the room screen jumps
-    its selection there. Searches what is loaded, not the server: at IOI
-    scale that is the recent traffic being triaged."""
+    """"/" inside a room: accent-insensitive search over every message this
+    client holds for the room (full downloaded archive included), newest hit
+    first. The query matches message text, display name, or matrix id;
+    thread replies match too. Enter dismisses with the chosen event id and
+    the room screen jumps there. Local only, so the count line says when the
+    background download is still running."""
+
+    # Widgets are not virtualized: only the newest slice is mounted and the
+    # count line says what was clipped.
+    MAX_HITS = 100
 
     BINDINGS = [
         ("escape", "dismiss", "Close"),
@@ -2990,38 +3093,60 @@ class RoomSearchScreen(ModalScreen):
         Binding("up", "cursor_up", "Up", show=False),
     ]
 
-    def __init__(self, messages: list) -> None:
+    def __init__(
+        self, messages: list, downloading: bool = False, where: str = ""
+    ) -> None:
         super().__init__()
         self.messages = messages
+        self.downloading = downloading
+        self.where = where  # "ioi.ga", "thread in ioi.ga": shown on the border
+        # Fold every haystack once at open: refolding on each keystroke
+        # would make typing lag in a big room.
+        self._index = [
+            (
+                fold_text(f"{m.body or ''} {m.sender_name or ''} {m.sender or ''}"),
+                m,
+            )
+            for m in messages
+            if m.event_id
+        ]
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="searchbox"):
-            yield Input(
-                placeholder="Search messages and senders in loaded history…",
-                id="q",
+        with Vertical(id="searchbox") as box:
+            # The border names what is searched (this popup looks identical
+            # to the dashboard search). escape(): the room title comes from
+            # other users.
+            box.border_title = (
+                f"Search messages in {escape(self.where)}"
+                if self.where
+                else "Search messages"
             )
+            yield Input(placeholder="Search messages and senders…", id="q")
+            yield Static("", id="hitcount")
             yield ListView(id="results")
 
     def on_mount(self) -> None:
         self.query_one("#q", Input).focus()
+        self._set_count("")
+
+    def _set_count(self, status: str) -> None:
+        if self.downloading:
+            status += " · " if status else ""
+            status += "history still downloading"
+        self.query_one("#hitcount", Static).update(
+            f"[dim]{status}[/dim]" if status else ""
+        )
 
     async def on_input_changed(self, event: Input.Changed) -> None:
         q = fold_text(event.value.strip())
         lv = self.query_one("#results", ListView)
         await lv.clear()
         if not q:
+            self._set_count("")
             return
-        hits = [
-            m
-            for m in reversed(self.messages)
-            if m.event_id
-            and (
-                q in fold_text(m.body or "")
-                or q in fold_text(m.sender_name or "")
-                or q in fold_text(m.sender or "")
-            )
-        ]
-        for m in hits[:30]:
+        hits = [m for folded, m in reversed(self._index) if q in folded]
+        items = []
+        for m in hits[: self.MAX_HITS]:
             first_line = (m.body or "").strip().splitlines() or [""]
             # escape(): sender text; unescaped it is parsed as console markup.
             label = (
@@ -3030,7 +3155,12 @@ class RoomSearchScreen(ModalScreen):
             )
             item = ListItem(Label(label))
             item.event_id = m.event_id
-            await lv.append(item)
+            items.append(item)
+        await lv.extend(items)
+        if len(hits) > self.MAX_HITS:
+            self._set_count(f"newest {self.MAX_HITS} of {len(hits)} matches")
+        else:
+            self._set_count(f"{len(hits)} match" + ("" if len(hits) == 1 else "es"))
         if hits:
             lv.index = 0  # Enter jumps to the newest hit right away
 
@@ -3057,6 +3187,13 @@ class RoomSearchScreen(ModalScreen):
 
 
 class SearchScreen(ModalScreen):
+    """"/" on the dashboard: search people, rooms, and every locally held
+    message. With the cursor in Recent or Favourites the search is scoped to
+    that WHOLE section (the dashboard shows it truncated). Opening a message
+    hit opens its room and jumps to it."""
+
+    MAX_HITS = 30  # per group (rooms/people, then messages)
+
     BINDINGS = [
         ("escape", "dismiss", "Close"),
         # The Input keeps focus while these move the result highlight, so you
@@ -3065,27 +3202,86 @@ class SearchScreen(ModalScreen):
         Binding("up", "cursor_up", "Up", show=False),
     ]
 
+    def __init__(self, scope: str | None = None) -> None:
+        super().__init__()
+        self.scope = scope
+        self._msgs: list = []  # (folded haystack, entry, message), global only
+
     def compose(self) -> ComposeResult:
-        with Vertical(id="searchbox"):
-            yield Input(placeholder="Search people and rooms…", id="q")
+        placeholder = {
+            "favourites": "Search all favourites…",
+            "recent": "Search all recent rooms…",
+        }.get(self.scope, "Search people, rooms, and messages…")
+        with Vertical(id="searchbox") as box:
+            # The border names the scope: a scoped search must stay visibly
+            # different from the global and in-room ones.
+            box.border_title = {
+                "favourites": "Search all favourites",
+                "recent": "Search all recent rooms",
+            }.get(self.scope, "Search people, rooms & messages")
+            yield Input(placeholder=placeholder, id="q")
             yield ListView(id="results")
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         self.query_one("#q", Input).focus()
+        # Which rooms' messages this popup may match: all of them globally,
+        # only the section's rooms when scoped.
+        opened = self.app.session.state.get("last_opened_ts") or {}
+
+        def keep(e: Entry) -> bool:
+            if self.scope == "favourites":
+                return e.is_favourite
+            if self.scope == "recent":
+                return e.room_id in opened
+            return True
+        # One folded haystack per message, built once at open: refolding
+        # thousands of bodies per keystroke would make typing lag.
+        self._msgs = [
+            (
+                fold_text(
+                    f"{m.body or ''} {m.sender_name or ''} {m.sender or ''}"
+                ),
+                e,
+                m,
+            )
+            for e, m in self.app.session.message_index()
+            if m.event_id and keep(e)
+        ]
+        if self.scope:
+            await self._show_results("")  # the whole section, before typing
 
     async def on_input_changed(self, event: Input.Changed) -> None:
-        results = self.app.session.search(event.value)
+        await self._show_results(event.value)
+
+    async def _show_results(self, query: str) -> None:
+        results = self.app.session.search(query, self.scope)
         lv = self.query_one("#results", ListView)
         await lv.clear()
-        for e in results[:30]:
+        items = []
+        for e in results[: self.MAX_HITS]:
             tag = f"  ({e.unread})" if e.unread else ""
             kind = "person" if e.is_direct else "room"
             # escape(): titles come from other users; unescaped they are parsed
             # as console markup (crash on "[x", spoofed styling).
-            await lv.append(
+            items.append(
                 EntryItem(e, f"{escape(e.title)}{tag}  [dim]{kind}[/dim]")
             )
-        if results:
+        q = fold_text(query.strip())
+        if q:
+            # Message hits after the room/people hits, newest first, each
+            # naming its room so the mixed list stays readable.
+            hits = [(e, m) for folded, e, m in self._msgs if q in folded]
+            hits.sort(key=lambda pair: -pair[1].ts)
+            for e, m in hits[: self.MAX_HITS]:
+                first_line = (m.body or "").strip().splitlines() or [""]
+                label = (
+                    f"[dim]{_fmt_time(m.ts)}[/dim] {escape(e.title)}"
+                    f" · {escape(m.sender_name[:20])}: "
+                    f"{escape(first_line[0][:60])}"
+                )
+                items.append(MessageHitItem(e, m.event_id, label))
+        await lv.extend(items)
+        if items:
             lv.index = 0  # Enter opens the top hit right away
 
     def action_cursor_down(self) -> None:
@@ -3095,7 +3291,11 @@ class SearchScreen(ModalScreen):
         self.query_one("#results", ListView).action_cursor_up()
 
     def _open(self, item) -> None:
-        if isinstance(item, EntryItem):
+        if isinstance(item, MessageHitItem):
+            entry, event_id = item.entry, item.event_id
+            self.dismiss()
+            self.app.open_room(entry, jump_to=event_id)
+        elif isinstance(item, EntryItem):
             entry = item.entry
             self.dismiss()
             self.app.open_room(entry)
@@ -3144,7 +3344,7 @@ class LoadingScreen(Screen):
 
 class HomeScreen(Screen):
     BINDINGS = [
-        ("slash", "app.search", "Search"),
+        ("slash", "search", "Search"),
         # The four movement keys take one footer slot: "hjkl" reads as a unit,
         # so only this binding is shown and the rest stay live but unlisted.
         Binding("j", "down", "Select room", key_display="hjkl"),
@@ -3154,11 +3354,10 @@ class HomeScreen(Screen):
         Binding("tab", "focus_next_column", show=False),
         Binding("shift+tab", "focus_prev_column", show=False),
         # priority=True: the focused ListView binds the arrows (and enter)
-        # itself, which would stop the cursor dead at each list's edge; these
-        # route them through the same column-spilling _step as j/k, so the
-        # arrows behave exactly like j/k everywhere in the app. Same for
-        # Enter, which also puts "Open" in the footer (a focused widget's
-        # hidden binding otherwise outranks the screen's for display).
+        # itself, stopping the cursor at each list's edge; these route them
+        # through the same column-spilling _step as j/k. Enter also puts
+        # "Open" in the footer (a focused widget's hidden binding otherwise
+        # outranks the screen's for display).
         Binding("down", "down", show=False, priority=True),
         Binding("up", "up", show=False, priority=True),
         Binding("enter", "open_selected", "Open", priority=True),
@@ -3167,20 +3366,17 @@ class HomeScreen(Screen):
         # (spaces, invites, empty placeholders).
         Binding("f", "favourite_add", "Favourite"),
         Binding("f", "favourite_remove", "Unfavourite"),
-        # Two labels for one key, like "f" above but reading as state (the
-        # t/c/~ pattern in rooms): shown only on a highlighted space, the
-        # enabled one names whether that space's rooms are cached to disk,
-        # and pressing "c" flips it. Hidden entirely when [cache] messages is
-        # off in config.ini: the per-space toggle would do nothing.
+        # Two labels for one key, reading as state: shown only on a
+        # highlighted space, "c" flips whether its rooms are cached to disk.
+        # Hidden when [cache] messages is off: the toggle would do nothing.
         Binding("c", "cache_off", "Cache: on"),
         Binding("c", "cache_on", "Cache: off"),
-        # Vim's window-resize chord (Ctrl-W +/-) boiled down to a single
-        # key: with the cursor in Recent or Favourites, +/- grows/shrinks
-        # that section's row budget. check_action gates them to those lists
-        # and to what actually fits: neither section ever drops below
-        # MIN_SECTION_ROWS, and growth stops where it would squeeze the
-        # other section or run off the screen. "=" is the unshifted
-        # convenience alias for "+", as in vim's own maps.
+        # Download every room's full history without opening each room by
+        # hand. Hidden when [cache] messages is off: nothing would be kept.
+        Binding("S", "sync_all", "Sync all"),
+        # Vim's resize chord as single keys: in Recent or Favourites, +/-
+        # grows/shrinks that section's row budget, gated to what fits and
+        # never below MIN_SECTION_ROWS. "=" is the unshifted alias for "+".
         Binding("plus", "grow_section", "More rows"),
         Binding("equals_sign", "grow_section", show=False),
         Binding("minus", "shrink_section", "Fewer rows"),
@@ -3217,9 +3413,8 @@ class HomeScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Header()
         # VerticalScroll, not Vertical: a column whose stacked lists outgrow
-        # the terminal scrolls instead of clipping (a space with many rooms
-        # would otherwise push Favourites clean off the screen). Keyboard
-        # focus scrolls the focused list into view on its own.
+        # the terminal scrolls instead of clipping. Keyboard focus scrolls
+        # the focused list into view on its own.
         with Horizontal(id="columns"):
             with VerticalScroll(classes="column"):
                 yield Label("Spaces", classes="section")
@@ -3257,10 +3452,8 @@ class HomeScreen(Screen):
         return self.app.session.state.get("selected_space")
 
     def _label_for(self, e: Entry, is_selected_space: bool = False) -> str:
-        # Unread items render bold; the count is appended for unread items.
-        # A fixed two-cell marker slot keeps every title left-aligned: a "★"
-        # for favourites, a "◦" (U+25E6) for the currently chosen space, or two
-        # spaces so unmarked rows line up with the marked ones.
+        # A fixed two-cell marker slot keeps every title left-aligned: "✉"
+        # invite, "★" favourite, "◦" the chosen space, or two spaces.
         if e.is_invite:
             marker = "✉ "
         elif e.is_favourite:
@@ -3301,10 +3494,9 @@ class HomeScreen(Screen):
 
             async def fill(list_id: str, entries, selected_space=None) -> None:
                 lv = self.query_one(f"#{list_id}", ListView)
-                # Remember the highlighted room by id, not position: a refresh
-                # can reorder the list (a DM jumping to the top) and a
-                # positional restore would silently land the cursor on a
-                # different room.
+                # Remember the highlighted room by id, not position: a
+                # refresh can reorder the list, and a positional restore
+                # would land the cursor on a different room.
                 idx = lv.index
                 highlighted = None
                 if idx is not None:
@@ -3320,8 +3512,8 @@ class HomeScreen(Screen):
                     placeholder.disabled = True
                     await lv.append(placeholder)
                     return
-                # One batched mount: appending row by row awaited a mount per
-                # entry, ~300 ms of blocked event loop for a full dashboard.
+                # One batched mount: a mount await per entry blocks the
+                # event loop.
                 await lv.extend(
                     EntryItem(e, self._label_for(e, e.room_id == selected_space))
                     for e in entries
@@ -3390,8 +3582,8 @@ class HomeScreen(Screen):
         return 0
 
     def _entries_of(self, lv: ListView) -> list:
-        # Empty lists hold a single disabled "(none)" placeholder, so the row
-        # count is not the entry count; real entries always start at index 0.
+        # Empty lists hold a single disabled "(none)" placeholder; real
+        # entries always start at index 0.
         return [c for c in lv.children if isinstance(c, EntryItem)]
 
     def on_descendant_focus(self, event: textual.events.DescendantFocus) -> None:
@@ -3429,9 +3621,11 @@ class HomeScreen(Screen):
             if entry is None or not entry.is_space:
                 return False
             enabled = session.space_cache_enabled(entry.room_id)
-            # "cache_off" is the action that turns it off, so it is the one
-            # offered (labelled "Cache: on") while caching is enabled.
+            # "cache_off" turns it off, so it is the one offered (labelled
+            # "Cache: on") while caching is enabled.
             return enabled == (action == "cache_off")
+        if action == "sync_all":
+            return bool(self.app.session.cfg.cache_messages)
         if action in ("grow_section", "shrink_section"):
             section = self._resizable_section()
             if section is None:
@@ -3543,6 +3737,31 @@ class HomeScreen(Screen):
         if lv is not None:
             lv.action_select_cursor()
 
+    def action_search(self) -> None:
+        # From the Recent or Favourites list, "/" searches that whole
+        # section (the dashboard shows it truncated to a row budget);
+        # anywhere else it is the global people-rooms-and-messages search.
+        lv = self._focused_list()
+        scope = lv.id if lv is not None and lv.id in ("recent", "favourites") else None
+        self.app.push_screen(SearchScreen(scope))
+
+    def action_sync_all(self) -> None:
+        """"S": start the full-history download for every room at once, so
+        the local caches (and the global message search) end up covering
+        everything without opening each room by hand."""
+        n = self.app.session.backfill_all()
+        if n:
+            self.app.notify(
+                f"Downloading full history for {n} room"
+                + ("s" if n != 1 else "")
+                + " in the background.",
+                timeout=4,
+            )
+        else:
+            self.app.notify(
+                "Every room's history is already fully downloaded.", timeout=4
+            )
+
     def action_favourite_add(self) -> None:
         self.run_worker(self._toggle_favourite())
 
@@ -3608,9 +3827,8 @@ class HomeScreen(Screen):
             return
         entry = event.item.entry
         if entry.is_invite:
-            # In a worker, not on this pump: the join is a network round trip,
-            # and awaiting it here froze the whole dashboard (q included)
-            # whenever the connection was down.
+            # In a worker: the join is a network round trip and must not
+            # block the dashboard's keys.
             async def accept() -> None:
                 ok, msg = await self.app.session.accept_invite(entry.room_id)
                 self.app.notify(
@@ -3627,10 +3845,9 @@ class HomeScreen(Screen):
             self.run_worker(accept())
             return
         if entry.is_space:
-            # Selecting a space loads its rooms into the column below. Refetch
-            # its children first so newly added rooms show up without a
-            # restart; in a worker so its 15s network timeout cannot stall the
-            # dashboard's keys.
+            # Selecting a space loads its rooms into the column below.
+            # Refetch its children first so new rooms show up without a
+            # restart; in a worker so the network cannot stall the keys.
             self.app.session.state["selected_space"] = entry.room_id
             self.app.session.cfg.save_state(self.app.session.state)
 
@@ -3696,7 +3913,9 @@ class MatrixApp(App):
         border: round $accent;
         background: $panel;
     }
-    #searchbox #results { max-height: 20; }
+    /* height auto: a ListView is a ScrollView (height 1fr by default), which
+       inflated the popup to its max height even while empty. */
+    #searchbox #results { height: auto; max-height: 20; }
     #commandbox {
         dock: bottom;
         height: 1;
@@ -3792,11 +4011,9 @@ class MatrixApp(App):
     # commands are all covered by explicit bindings.
     ENABLE_COMMAND_PALETTE = False
     BINDINGS = [
-        # "q" deliberately NOT bound here: on the dashboard it quits
-        # (HomeScreen binds it), on every other page it goes back to the
-        # dashboard (RoomScreen binds it), and quitting from anywhere is
-        # ":q!" below. A global q made one keystroke while reading a room
-        # exit the whole app.
+        # "q" deliberately NOT bound here: the dashboard's q quits, a room's
+        # q goes home, and ":q!" quits from anywhere. A global q would make
+        # one keystroke while reading a room exit the whole app.
         Binding("ctrl+q", "noop", show=False),
         Binding("question_mark", "about", "About", show=False),
         # Hidden to keep the footer lean.
@@ -3867,8 +4084,7 @@ class MatrixApp(App):
         # Repaint the open room when its background member-list fetch lands
         # and raw @user:server ids can resolve to display names.
         self.session.on_members_loaded = self._on_members_loaded
-        # Likewise repaint the dashboard when a background name fetch lands
-        # (a DM peer's profile, a room's member list, a room's m.room.name).
+        # Likewise repaint the dashboard when a background name fetch lands.
         self.session.on_names_loaded = self.action_refresh_home
         self.fatal: str | None = None
         # Connection health for the footer's ConnStatus: monotonic time of the
@@ -3889,11 +4105,9 @@ class MatrixApp(App):
         try:
             ok, message = await self.session.connect(progress=loading.set_status)
         except Exception as exc:
-            # With max_timeouts set on the client, offline network calls raise
-            # instead of retrying forever inside nio; connect handles the ones
-            # it can name, and anything that escapes (a keys_upload raise, a
-            # transport error from the retry login) should end in the clean
-            # fatal-message exit, not a worker traceback over the terminal.
+            # With max_timeouts set, offline network calls raise instead of
+            # retrying forever inside nio; anything connect cannot name
+            # should end in the clean fatal exit, not a worker traceback.
             ok, message = False, f"could not connect: {exc}"
         if not ok:
             self.fatal = message
@@ -3902,11 +4116,9 @@ class MatrixApp(App):
         try:
             await self.session.initial_sync(progress=loading.set_status)
         except Exception as exc:
-            # initial_sync handles the failures it can name, but anything that
-            # escapes it (a transport error from one of the other calls, a
-            # raise from an event callback) would otherwise abort this worker
-            # and dump a traceback over the terminal instead of starting the
-            # app. The dashboard can open on cached data; sync_loop retries.
+            # Anything initial_sync cannot handle would abort this worker
+            # and dump a traceback instead of starting the app. The
+            # dashboard can open on cached data; sync_loop retries.
             self.notify(
                 f"Initial sync failed ({type(exc).__name__}); showing cached "
                 "data while the background sync retries.",
@@ -3930,26 +4142,22 @@ class MatrixApp(App):
 
     @work(exclusive=True, group="sync")
     async def sync_loop(self) -> None:
-        # The first request uses timeout=0 so it returns immediately instead
-        # of long-polling. That makes a forced refresh (ctrl+r restarts this
-        # exclusive worker) update the screen and the staleness clock right
-        # away rather than after up to 30s of empty long-poll.
+        # The first request uses timeout=0 so it returns immediately: a
+        # forced refresh (ctrl+r restarts this worker) updates right away
+        # instead of after up to 30s of empty long-poll.
         timeout = 0
         while True:
             try:
-                # The wait_for is the only bound on a half-open connection
-                # (network dropped without a TCP reset): timeout=0 makes nio
-                # pass NO HTTP timeout down to aiohttp, and even the long-poll
-                # request has no read timeout that covers a dead socket.
+                # The wait_for is the only bound on a half-open connection:
+                # nio passes no HTTP timeout that covers a dead socket.
                 resp = await asyncio.wait_for(
                     self.session.client.sync(timeout=timeout, full_state=False),
                     timeout=30 if timeout == 0 else timeout / 1000 + 30,
                 )
             except Exception:
-                # nio normally returns error *responses*, but event callbacks
-                # run inside sync() and an unexpected raise from one (or from
-                # the transport) would kill this worker, silently freezing
-                # every live update for the rest of the session.
+                # Event callbacks run inside sync(); an unexpected raise
+                # would kill this worker and silently freeze every live
+                # update for the rest of the session.
                 self.sync_ok = False
                 await asyncio.sleep(5)
                 continue
@@ -3957,30 +4165,26 @@ class MatrixApp(App):
             if isinstance(resp, SyncResponse):
                 self.sync_ok = True
                 self.last_sync_at = time.monotonic()
-                # An offline launch skips connect()'s startup keys_upload
-                # (the network was down); top up one-time keys on the first
-                # successful sync instead, or new senders could not open olm
-                # channels to this device for the whole session.
+                # An offline launch skipped the startup keys_upload; top up
+                # on the first good sync, or new senders could not open olm
+                # channels to this device.
                 if self.session.client.should_upload_keys:
                     try:
                         await self.session.client.keys_upload()
                     except Exception:
                         pass  # the next sync tick retries
                 self.session._record_room_timestamps(resp)
-                # Rooms added to (or removed from) a space arrive as
-                # m.space.child state, but the child map behind the Rooms
-                # column is read over raw state and so never updates itself.
-                # Refetch only the spaces this sync touched, so the column
-                # keeps up without polling the state endpoint every 30s.
+                # m.space.child changes never update the raw-state child map
+                # behind the Rooms column on their own; refetch only the
+                # spaces this sync touched.
                 for space_id in self.session.spaces_with_child_changes(resp):
                     await self.session.refresh_space_children(space_id)
                 self.action_refresh_home()
                 for screen in self.screen_stack:
                     if isinstance(screen, RoomScreen):
-                        # A worker, NOT call_later: refresh_messages awaits the
-                        # network, and call_later would run it on the App's own
-                        # message pump, where a stalled request blocks every
-                        # key event in the program (even ctrl+q). Exclusive per
+                        # A worker, NOT call_later: refresh_messages awaits
+                        # the network, and on the App's own pump a stalled
+                        # request blocks every key event. Exclusive per
                         # screen so a slow reload is superseded, not stacked.
                         screen.run_worker(
                             screen.refresh_messages(),
@@ -3988,9 +4192,9 @@ class MatrixApp(App):
                             exclusive=True,
                         )
             elif getattr(resp, "status_code", None) == "M_UNKNOWN_TOKEN":
-                # The server revoked our token (signed out elsewhere). Retrying
-                # can never succeed; drop the cached token and exit so the next
-                # launch logs in fresh with the Keychain password.
+                # Token revoked (signed out elsewhere): retrying can never
+                # succeed; drop the cached token and exit so the next launch
+                # logs in fresh.
                 self.session.cfg.clear_token()
                 self.fatal = (
                     "This session was signed out by the server. "
@@ -4004,11 +4208,10 @@ class MatrixApp(App):
                 self.sync_ok = False
                 await asyncio.sleep(5)
 
-    def open_room(self, entry: Entry) -> None:
+    def open_room(self, entry: Entry, jump_to: str | None = None) -> None:
         if entry.is_space:
-            # A space is not a room you read or post in (a RoomScreen would
-            # happily send a message into it); select it on the home screen
-            # instead. Reached from search results and the room= setting.
+            # A space is not a room you post in; select it on the home
+            # screen instead. Reached from search results and room=.
             async def select_space() -> None:
                 self.session.state["selected_space"] = entry.room_id
                 self.session.cfg.save_state(self.session.state)
@@ -4023,26 +4226,24 @@ class MatrixApp(App):
             self.run_worker(select_space())
             return
         screen = RoomScreen(entry)
-        # Rooms open in the view mode the last "t" toggle left behind, across
-        # restarts (state.json). Set here rather than in RoomScreen.__init__
-        # so ThreadScreen, which inherits it, always starts unthreaded (its
-        # replies would otherwise all render with the thread-reply indent).
+        # Rooms open in the view mode the last "t" toggle left behind
+        # (state.json). Set here rather than in RoomScreen.__init__ so
+        # ThreadScreen, which inherits it, always starts unthreaded.
         screen.threaded = bool(self.session.state.get("threaded_view"))
+        # A global-search message hit: once the initial load lands, the
+        # screen jumps its selection to this event (unfolding its thread or
+        # detaching into deep history as needed).
+        screen._jump_target = jump_to
         self.push_screen(screen)
-        # The dashboard row changes the moment the room opens (to the top of
-        # Recent, badge cleared): apply that and rebuild the home screen now,
-        # invisibly behind the room just pushed, so Esc back to it finds an
-        # unchanged signature and repaints nothing. Without this the reorder
-        # happened at resume, as a flicker in front of the user.
+        # Apply the dashboard reorder now, invisibly behind the room just
+        # pushed, so Esc back to it finds an unchanged signature and
+        # repaints nothing.
         self.session.note_opening(entry.room_id)
         for s in self.screen_stack:
             if isinstance(s, HomeScreen):
                 s.stale = False  # this rebuild covers anything deferred
                 s.run_worker(s.refresh_data())
                 break
-
-    def action_search(self) -> None:
-        self.push_screen(SearchScreen())
 
     def action_force_refresh(self) -> None:
         """ctrl+r: resync now. Restarting the exclusive sync worker cancels
@@ -4058,8 +4259,8 @@ class MatrixApp(App):
                 self.call_later(screen.refresh_data)
             elif isinstance(screen, RoomScreen):
                 screen._last_seen_event = None
-                # Same worker discipline as sync_loop: on the App pump this
-                # await froze the whole program while the network was down.
+                # Same worker discipline as sync_loop: this await must not
+                # run on the App pump.
                 screen.run_worker(
                     screen.refresh_messages(),
                     group="refresh_messages",
@@ -4070,10 +4271,9 @@ class MatrixApp(App):
     def action_refresh_home(self) -> None:
         for screen in self.screen_stack:
             if isinstance(screen, HomeScreen):
-                # Rebuilding the dashboard costs real time, and at peak the
-                # unread counts change on nearly every sync; while a room
-                # covers the dashboard, just note the staleness and rebuild
-                # once on resume instead of on every tick.
+                # Rebuilding costs real time and at peak the counts change
+                # on nearly every sync; while a room covers the dashboard,
+                # note the staleness and rebuild once on resume.
                 if screen is self.screen:
                     self.call_later(screen.refresh_data)
                 else:
@@ -4095,11 +4295,6 @@ async def _run_verify(cfg: Config) -> None:
     shows the emoji, and completes. matrix-nio can't initiate the modern
     request/ready handshake, but it can respond to one, so this is the path that
     works (and that makes Element share room keys with this device)."""
-    import logging
-    import os
-
-    from .client import MatrixSession
-
     if os.environ.get("MATRIXCLI_VERIFY_DEBUG"):
         log_path = os.path.abspath("matrixcli-verify.log")
         handler = logging.FileHandler(log_path, mode="w")
@@ -4135,13 +4330,10 @@ async def _run_verify(cfg: Config) -> None:
         line = "  ".join(f"{glyph} {name}" for glyph, name in emoji)
         print("\nCompare these emoji with Element:\n")
         print("    " + line + "\n")
-        # A bare input() here would freeze the asyncio loop, stalling the
-        # sync that must keep flushing and receiving to-device verification
-        # events while you decide. to_thread(input) is no good either: the
-        # worker thread stuck in input() cannot be cancelled and is joined
-        # at interpreter shutdown, so Ctrl+C at this prompt wedges the
-        # process until the user also presses Enter. Reading via the event
-        # loop's own readiness watcher keeps the prompt fully cancellable.
+        # A bare input() would freeze the asyncio loop (and the sync that
+        # must keep flowing), and to_thread(input) cannot be cancelled, so
+        # Ctrl+C would wedge until Enter. Reading via the event loop's own
+        # readiness watcher keeps the prompt fully cancellable.
         print("Do they match? [y/N] ", end="", flush=True)
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[str] = loop.create_future()
@@ -4178,10 +4370,6 @@ async def _run_import_keys(cfg: Config, infile: str) -> None:
     -> Security & Privacy -> Export E2E room keys). This is how the CLI gets
     history older than this device, since matrix-nio has no key-backup support.
     Prompts for the export passphrase (hidden input)."""
-    import getpass
-
-    from .client import MatrixSession
-
     path = Path(infile).expanduser()
     if not path.is_file():
         raise SystemExit(f"No such file: {path}")
@@ -4232,9 +4420,8 @@ def main() -> None:
     try:
         cfg = Config.load(Path(args.config).expanduser() if args.config else None)
     except (OSError, ValueError) as exc:
-        # OSError covers more than the missing-config case: a custom
-        # [storage] path can be unwritable or blocked by a same-named file,
-        # and those deserve the same clean message, not a traceback.
+        # OSError also covers an unwritable or blocked [storage] path; same
+        # clean message, not a traceback.
         raise SystemExit(str(exc))
 
     if not cfg.homeserver or "@you:" in cfg.user_id or not cfg.user_id:
@@ -4242,16 +4429,13 @@ def main() -> None:
             f"Edit {cfg.config_path} with your real homeserver and user id first."
         )
 
-    # Before anything touches the keyring or the store: a second live
-    # instance corrupts the shared crypto store and caches (last writer
-    # wins), so refuse to start while one is running.
+    # A second live instance corrupts the shared crypto store and caches
+    # (last writer wins); refuse to start while one is running.
     cfg.acquire_instance_lock()
 
-    # Probe the system keyring now: without a usable backend (common on a bare
-    # Linux box) every later credential access raises deep inside the running
-    # app; here it can still be a plain, actionable message.
-    import keyring.errors
-
+    # Probe the keyring now: without a usable backend every later credential
+    # access raises deep inside the app; here it can be an actionable
+    # message.
     try:
         cfg.load_token()
     except keyring.errors.KeyringError as exc:

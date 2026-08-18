@@ -13,6 +13,8 @@ room in the UI.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import logging
 import os
 import re
@@ -21,7 +23,7 @@ import unicodedata
 from collections import defaultdict, deque
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 _verify_log = logging.getLogger("matrixcli.verify")
 
@@ -55,6 +57,9 @@ from nio import (
     UnknownToDeviceEvent,
 )
 
+from nio.api import Api
+from nio.crypto import decrypt_attachment
+from nio.crypto.sas import Sas
 from nio.events.room_events import Event
 
 from .config import Config
@@ -64,24 +69,21 @@ TIMELINE_CAP = 200
 # The dashboard's Recent and Favourites sections never show fewer rows than
 # this, whatever +/- or a shrinking terminal ask for.
 MIN_SECTION_ROWS = 5
-# Minimum seconds between read-marker POSTs per room (see mark_read): at peak
-# an open busy room refreshes once per sync tick, and marking every tick sends
-# redundant m.fully_read updates to an already loaded server.
+# Minimum seconds between read-marker POSTs per room (see mark_read): a busy
+# open room refreshes every sync tick, and marking each tick spams the server.
 MARK_READ_INTERVAL = 2.0
-# Prefix of the placeholders _to_message renders in place of a message it could
-# not decrypt; edit folding checks it so an unreadable edit never displaces
-# readable text.
+# Prefix of the placeholders _to_message renders for undecryptable messages;
+# edit folding checks it so an unreadable edit never displaces readable text.
 UNDECRYPTABLE = "[encrypted"
 # Refuse to buffer/decrypt/write an attachment bigger than this. nio's download
 # reads the whole body into memory, so an unbounded one is a trivial OOM; the
 # sender also controls the advertised size, so both are checked.
 MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024
 
-# Control characters, C1 codes, DEL, and bidi overrides. Server-supplied strings
-# (message bodies, display names, filenames, room titles) are rendered straight
-# to the terminal; an unstripped ESC (0x1b) lets a remote sender emit OSC/CSI
-# sequences (clipboard writes via OSC 52, cursor moves that forge earlier lines,
-# title changes). Tab (0x09) and newline (0x0a) are kept.
+# Control characters, C1 codes, DEL, and bidi overrides. Server-supplied
+# strings are rendered straight to the terminal, and an unstripped ESC lets a
+# remote sender emit OSC/CSI sequences (clipboard writes, forged lines, title
+# changes). Tab and newline are kept.
 _UNSAFE_RE = re.compile(
     "[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]"
 )
@@ -114,8 +116,6 @@ def _sas_emoji(sas) -> list[tuple[str, str]]:
     final indices), scrambling the result so it never matches the peer's emoji.
     See the nio-compatibility note in ``verify_interactive``.
     """
-    from nio.crypto.sas import Sas
-
     indices = sas.established_sas.bytes(sas._extra_info).emoji_indices
     return [Sas.emoji[i] for i in indices]
 
@@ -244,7 +244,7 @@ def _edit_body(event, fallback: str) -> str:
     """The replacement text of an m.replace edit. Senders put it in
     m.new_content and duplicate it in body prefixed with "* " as a fallback for
     clients that do not understand edits; strip that prefix when it is all we
-    have (which is what made an edit look like a repeated message)."""
+    have."""
     src = getattr(event, "source", {}) or {}
     new_content = (src.get("content", {}) or {}).get("m.new_content") or {}
     body = new_content.get("body") if isinstance(new_content, dict) else None
@@ -308,8 +308,7 @@ def fold_edits(messages: list[Message]) -> list[Message]:
     targets = {m.event_id: m for m in messages if m.event_id and not m.replaces}
 
     def rewrites(m: Message) -> bool:
-        # Anyone in a room can send an m.replace pointing at anyone's message;
-        # only the original sender's own edits count, or a stranger could
+        # Only the original sender's own edits count, or a stranger could
         # rewrite what someone else said in front of us.
         target = targets.get(m.replaces)
         return target is not None and target.sender == m.sender
@@ -381,18 +380,14 @@ class MatrixSession:
         # from, and whether the very beginning of history has been reached.
         self.pagination_tokens: dict[str, str] = {}
         self.pagination_done: dict[str, bool] = {}
-        # Rooms whose initial /messages window was fetched and merged into
-        # the timeline cache this session. Reloads then serve the cache: live
-        # events keep it current via the sync callbacks, so refetching the
-        # same window (seconds per call on a slow homeserver) buys nothing.
+        # Rooms whose initial /messages window was fetched and merged this
+        # session; reloads then serve the cache (live events keep it current).
         # A gappy sync un-marks the room (see _record_room_timestamps).
         self.history_loaded: set[str] = set()
-        # Bumped per room every time a sync comes back "limited" (events were
-        # skipped, the cache has a hole). load_history snapshots it before its
-        # fetch: a bump seen afterwards means the merged window may already be
-        # stale, so the room must not be re-marked history_loaded; any bump at
-        # all means a full-looking cache can still hide a hole, so the
-        # size-based serve-from-cache shortcut is off for that room.
+        # Bumped per room whenever a sync comes back "limited" (the cache has
+        # a hole). load_history snapshots it before a fetch: a bump seen
+        # afterwards means the merged window may be stale, and any bump at all
+        # disables the size-based serve-from-cache shortcut for that room.
         self.gap_gen: dict[str, int] = {}
         # In-flight full member-list fetches by room id (see _fetch_members).
         # Holding the Task matters: asyncio keeps only weak references, so an
@@ -403,10 +398,9 @@ class MatrixSession:
         # open room screen so raw @user:server ids repaint as display names.
         self.on_members_loaded = None
         # user id -> display name from a /profile fetch, for DM titles when
-        # the member event never arrived this session (lazy-loaded resume
-        # syncs only deliver members who sent one of the timeline events).
-        # "" is cached for users whose profile fetch failed, so a missing
-        # name is not refetched on every dashboard rebuild.
+        # the member event never arrived this session (lazy-loaded syncs only
+        # deliver timeline senders). "" caches a failed fetch so it is not
+        # retried on every dashboard rebuild.
         self.profile_names: dict[str, str] = {}
         # In-flight profile fetches by user id (see _fetch_profile). Like
         # _member_fetches, holding the Task keeps it from being GC'd.
@@ -431,9 +425,8 @@ class MatrixSession:
         self._marker_time: dict[str, float] = {}
         self._marker_tasks: dict[str, asyncio.Task] = {}
         # Composer text stashed when an editor is cancelled, keyed by room id
-        # (":<root>"-suffixed for threads); refilled the next time a composer
-        # opens there. In-memory only: an Escape slip should not cost a
-        # paragraph, but drafts are not worth persisting to disk.
+        # (":<root>"-suffixed for threads); refilled on the next open there.
+        # In-memory only; drafts are not worth persisting to disk.
         self.drafts: dict[str, str] = {}
         # Encrypted on-disk mirror of timelines/reactions (see
         # _restore_timelines): dirty when the in-memory copy has moved past
@@ -442,14 +435,12 @@ class MatrixSession:
         self._cache_saved_at = 0.0
         self._cache_saving = False  # a threaded write is in flight
         self._cache_save_task: asyncio.Task | None = None
-        # Full-history archives: every message a room ever had, downloaded in
-        # the background while the room is (or was) open, event id -> Message,
-        # never evicted (unlike the TIMELINE_CAP'd live window). The token is
-        # the deepest /messages position reached so an unfinished download
-        # resumes there; "done" rooms reached the beginning of history;
-        # "stale" rooms may have a hole at the NEW end (a gappy sync or a
-        # restart from a mismatched token happened after they were archived),
-        # which the next backfill re-covers from the head.
+        # Full-history archives, event id -> Message, downloaded in the
+        # background and never evicted (unlike the TIMELINE_CAP'd live
+        # window). The token is the deepest /messages position reached, so an
+        # unfinished download resumes there; "done" rooms reached the start
+        # of history; "stale" rooms may have a hole at the NEW end, which the
+        # next backfill re-covers from the head.
         self.archives: dict[str, dict[str, Message]] = {}
         self.archive_tokens: dict[str, str] = {}
         self.archive_done: set[str] = set()
@@ -481,13 +472,10 @@ class MatrixSession:
         client_config = AsyncClientConfig(
             store_sync_tokens=True,
             encryption_enabled=True,
-            # nio's default max_timeouts=None retries a failed request FOREVER
-            # (backoff capped at 60s), so with the network down every call
-            # (sync, room_messages, room_send, join, read markers, key
-            # uploads...) neither returns nor raises, and every error handler
-            # in this file is unreachable. Cap the retries and the per-request
-            # time so an offline failure surfaces as an exception the UI can
-            # recover from, instead of freezing whatever awaited it.
+            # nio's default max_timeouts=None retries a failed request
+            # forever, so with the network down no call ever returns or
+            # raises. Cap the retries and per-request time so an offline
+            # failure surfaces as an exception the UI can recover from.
             request_timeout=30,
             max_timeouts=2,
             # Encrypt the on-disk Olm/Megolm store with a per-account random key
@@ -508,14 +496,11 @@ class MatrixSession:
         self.client.add_presence_callback(self._on_presence, PresenceEvent)
 
         # nio decrypts a /messages chunk in place before room_messages()
-        # returns (receive_response -> _handle_messages_response), and the
-        # decrypted event it substitutes rebuilds ``unsigned`` with only the
-        # transaction id: the server's m.relations aggregation (thread reply
-        # counts, the bundled newest edit) is dropped, exactly what
-        # _to_message reads. In encrypted rooms that undercounted every
-        # thread badge and left out-of-window edits unfolded. Save each
-        # wrapper's unsigned before nio's handler runs and graft it back onto
-        # the decrypted replacement (its own keys win on collision).
+        # returns, and the decrypted event it substitutes rebuilds
+        # ``unsigned`` with only the transaction id, dropping the server's
+        # m.relations aggregation (thread counts, the bundled newest edit)
+        # that _to_message reads. Save each wrapper's unsigned before nio's
+        # handler runs and graft it back on (its own keys win on collision).
         orig_handle = self.client._handle_messages_response
 
         def handle_messages(response) -> None:
@@ -571,10 +556,8 @@ class MatrixSession:
                 )
             except Exception:
                 # The store cannot be opened, almost always because it predates
-                # the per-account store key (it was encrypted with nio's old
-                # hardcoded default). It is unrecoverable with the new key, so
-                # discard the stale session and log in fresh: a new, properly
-                # keyed store is created and the user re-imports room keys.
+                # the per-account store key. Unrecoverable with the new key, so
+                # discard the stale session and log in fresh.
                 step("encryption store unreadable; resetting for a fresh login")
                 self.cfg.clear_token()
                 self._reset_store()
@@ -585,16 +568,11 @@ class MatrixSession:
                 try:
                     whoami = await self.client.whoami()
                 except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                    # A dead network (max_timeouts makes nio raise instead of
-                    # retrying forever inside itself) must not kill the
-                    # launch: the token, crypto store, and message cache on
-                    # disk are enough to read everything. The validation this
-                    # skips happens implicitly once connectivity returns: the
-                    # sync loop maps a revoked token to M_UNKNOWN_TOKEN and
-                    # exits cleanly, and it also runs the keys_upload that is
-                    # deliberately not attempted here (it would just raise
-                    # again). initial_sync's own retries then fail fast and
-                    # fall through to the cached dashboard.
+                    # A dead network must not kill the launch: the token,
+                    # crypto store, and message cache on disk are enough to
+                    # read everything. Once connectivity returns, the sync
+                    # loop catches a revoked token and runs the keys_upload
+                    # skipped here.
                     step(
                         "server unreachable "
                         f"({type(exc).__name__}); starting offline from cache"
@@ -713,8 +691,11 @@ class MatrixSession:
         hs = (self.cfg.homeserver or "").strip()
         if hs.startswith("https://"):
             return False
-        host = hs.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0]
-        return host not in ("localhost", "127.0.0.1", "::1", "[::1]")
+        try:
+            host = urlsplit(hs if "://" in hs else "//" + hs).hostname or ""
+        except ValueError:
+            host = ""
+        return host not in ("localhost", "127.0.0.1", "::1")
 
     def _reset_store(self) -> None:
         """Delete an unreadable crypto store and rebuild a fresh AsyncClient so
@@ -722,6 +703,8 @@ class MatrixSession:
         try:
             store = Path(self.cfg.store_path)
             for child in store.glob("*"):
+                if child.name == "instance.lock":
+                    continue  # this process holds the flock on it
                 if child.is_file():
                     child.unlink()
                 elif child.is_dir():
@@ -879,13 +862,22 @@ class MatrixSession:
             if restored:
                 arch = self.archives.setdefault(room_id, {})
                 arch.update({m.event_id: m for m in restored if m.event_id})
+        # Restore the archive bookkeeping only for rooms whose per-room file
+        # actually loaded: a corrupt or deleted archive with a surviving
+        # "done" flag (or depth token) would otherwise disable the
+        # re-download forever while browse/search silently show nothing.
         for room_id, tok in (payload.get("archive_tokens") or {}).items():
-            if isinstance(tok, str) and tok and self.cache_allowed(room_id):
+            if (
+                isinstance(tok, str)
+                and tok
+                and self.cache_allowed(room_id)
+                and room_id in self.archives
+            ):
                 self.archive_tokens[room_id] = tok
         self.archive_done.update(
             r
             for r in payload.get("archive_done") or []
-            if isinstance(r, str) and self.cache_allowed(r)
+            if isinstance(r, str) and self.cache_allowed(r) and r in self.archives
         )
         self.archive_stale.update(
             r
@@ -918,8 +910,21 @@ class MatrixSession:
             # The live window holds the freshest copy of overlapping events
             # (redaction marks, adopted server timestamps, live decrypts):
             # fold it into the archive so the disk copy inherits all of it.
+            # With one asymmetry: a readable archived body must never be
+            # displaced by a no-key placeholder or an emptied redaction
+            # tombstone, because a refetch cannot reproduce that text.
             for m in timeline:
-                if m.event_id and not m.pending and arch.get(m.event_id) != m:
+                if not m.event_id or m.pending:
+                    continue
+                old = arch.get(m.event_id)
+                if old is not None and old.body and not old.body.startswith(
+                    UNDECRYPTABLE
+                ):
+                    if m.body.startswith(UNDECRYPTABLE):
+                        m = replace(old, ts=m.ts, redacted_ts=m.redacted_ts or old.redacted_ts)
+                    elif m.redacted_ts and not m.body:
+                        m = replace(old, redacted_ts=m.redacted_ts)
+                if arch.get(m.event_id) != m:
                     arch[m.event_id] = m
                     self._archive_dirty.add(room_id)
         allowed = {
@@ -1005,12 +1010,16 @@ class MatrixSession:
     def _write_cache_files(
         self, payload: dict, archive_writes: list[tuple[str, dict | None]]
     ) -> None:
-        self.cfg.save_timeline_cache(payload)
+        # Archives first: the main payload carries the archive_done flags
+        # and depth tokens, so a crash between the two writes must leave the
+        # rows on disk without their bookkeeping (harmless, re-covered), not
+        # the bookkeeping without its rows (a permanent undetected gap).
         for room_id, room_payload in archive_writes:
             if room_payload is None:
                 self.cfg.clear_room_archive(room_id)
             else:
                 self.cfg.save_room_archive(room_id, room_payload)
+        self.cfg.save_timeline_cache(payload)
 
     def _save_timelines(self) -> None:
         if not self.cfg.cache_messages:
@@ -1063,11 +1072,9 @@ class MatrixSession:
                 self._cache_saving = False
             if self._cache_dirty:
                 # Dirtiness that landed during the write bounced off the
-                # _cache_saving guard above. The urgent case is a space
-                # cache opt-out: its purge promised the decrypted text
-                # leaves the disk now, and this in-flight write has just
-                # re-persisted the pre-toggle snapshot, so the purge must
-                # not wait for the next sync tick (which may never come).
+                # _cache_saving guard. The urgent case is a space cache
+                # opt-out: its purge must not wait for the next sync tick
+                # (which may never come).
                 self._maybe_save_timelines()
 
         self._cache_save_task = asyncio.create_task(write())
@@ -1078,21 +1085,16 @@ class MatrixSession:
                 progress(msg)
 
         # The DM map and our own display name are independent HTTP calls;
-        # fetch them alongside the sync instead of paying their latency
-        # (measured ~5 s on a loaded server) before it even starts. Both are
-        # awaited right after the sync; both are cosmetic-only on failure.
+        # fetch them alongside the sync instead of paying their latency first.
+        # Both are awaited right after the sync and are cosmetic on failure.
         direct_fetch = asyncio.ensure_future(self._refresh_direct_map())
         name_fetch = asyncio.ensure_future(self.client.get_displayname())
-        # lazy_load_members keeps any launch sync affordable: with full
-        # member state the server has to serialize every member of every
-        # room (the big IOI rooms put that at minutes of server-side work
-        # before the first byte arrives). Names still resolve: the server
-        # includes member events for timeline senders and each room's
-        # "heroes", which is what DM and group-name calculation needs. The
-        # full member list of a room is fetched in the background on first
-        # open (see _fetch_members), and nio itself fetches it before the
-        # first send in an encrypted room (members_synced stays False until
-        # a joined_members fetch, which room_send checks).
+        # lazy_load_members keeps launch syncs affordable: full member state
+        # makes the server serialize every member of every room. Names still
+        # resolve from timeline senders and each room's "heroes"; the full
+        # member list is fetched in the background on first open (see
+        # _fetch_members), and nio fetches it itself before the first send
+        # in an encrypted room.
         sync_filter = {
             "room": {
                 "timeline": {"limit": 10},
@@ -1101,19 +1103,14 @@ class MatrixSession:
             "presence": {"limit": 1000},
         }
         # Resuming from the stored token is the only affordable launch path
-        # on a loaded homeserver. Measured against matrix.ioinformatics.org:
-        # a from-scratch sync (no ``since``) is Synapse's slowest code path,
-        # 8 minutes wall clock while the server trickled 4.6MB for 86 rooms;
-        # even full_state=True on an incremental sync costs ~30 s of
-        # server-side state resolution; incremental without full_state took
-        # 2 s. So after the first run, sync incrementally and lean on what
-        # is persisted: recency and titles/badges from state.json
-        # (room_meta, maintained by dashboard()), the encrypted-room set
-        # from nio's own store (rooms absent from the in-memory map are
-        # re-registered before a send, see _ensure_room), and the space
-        # child map from its raw-state fetch. Quiet rooms then never enter
-        # client.rooms this session, which is fine: the dashboard serves
-        # them from room_meta and opening one fetches history via /messages.
+        # on a loaded homeserver: a from-scratch sync is Synapse's slowest
+        # code path (minutes of wall clock), and even full_state=True on an
+        # incremental sync costs tens of seconds of state resolution. So
+        # after the first run, sync incrementally and lean on persisted data:
+        # room_meta in state.json, nio's own encrypted-room set (see
+        # _ensure_room), and the space child map. Quiet rooms then never
+        # enter client.rooms this session, which is fine: the dashboard
+        # serves them from room_meta and opening one fetches via /messages.
         resume = bool(
             (self.client.next_batch or self.client.loaded_sync_token)
             and self.state.get("room_meta")
@@ -1121,12 +1118,10 @@ class MatrixSession:
         if resume:
             step("syncing new messages")
         else:
-            # First run (or a state file predating room_meta): one big
-            # seeding sync so ALL rooms get state, titles, and last-activity
-            # timestamps. Clear BOTH token fields: nio resolves the sync
-            # position as `next_batch or loaded_sync_token` (the latter
-            # restored by store_sync_tokens=True), so clearing only one
-            # would still resume and leave quiet rooms unranked.
+            # First run: one big seeding sync so ALL rooms get state, titles,
+            # and timestamps. Clear BOTH token fields: nio resolves the sync
+            # position as `next_batch or loaded_sync_token`, so clearing only
+            # one would still resume.
             self.client.next_batch = ""
             self.client.loaded_sync_token = ""
             step("syncing all rooms (first run, this can take a while)")
@@ -1135,21 +1130,17 @@ class MatrixSession:
         # order matters. After the token clearing above, so a non-resume
         # launch is seen as a token mismatch and gap-bumps the seeded rooms.
         self._restore_timelines(resume)
-        # Non-429 errors come back immediately as SyncError (nio only retries
-        # rate limits itself), and a connection that dies mid-response never
-        # becomes a response at all: nio lets the raw aiohttp error through
-        # (ClientPayloadError / ConnectionResetError), which is easy to hit
-        # on the big first-run sync. Retry a few times rather than killing
-        # the startup worker with a traceback or silently presenting an
-        # empty dashboard as "ready".
+        # nio only retries rate limits itself: other errors return as
+        # SyncError, and a connection dying mid-response raises the raw
+        # aiohttp error. Retry a few times rather than killing the startup
+        # worker or presenting an empty dashboard as "ready".
         resp = None
         for attempt in range(3):
             try:
-                # timeout=0 (and full_state=True) make nio pass literally no
-                # HTTP timeout down to aiohttp, so on a half-open connection
-                # this request would pend until TCP keepalive gives up (hours).
-                # The wait_for is the only real bound; generous on the big
-                # first-run sync, tight on the instant resume sync.
+                # timeout=0 makes nio pass no HTTP timeout down to aiohttp,
+                # so on a half-open connection this request would pend for
+                # hours. The wait_for is the only real bound; generous on the
+                # big first-run sync, tight on the resume sync.
                 resp = await asyncio.wait_for(
                     self.client.sync(
                         timeout=0 if resume else 30000,
@@ -1221,11 +1212,9 @@ class MatrixSession:
             for bucket in (meta, self.state["last_event_ts"], self.state["last_opened_ts"]):
                 if bucket.pop(room_id, None) is not None:
                     changed = True
-            # nio only drops a room from client.rooms on an explicit
-            # forget(), which this app never sends. Left in there, the
-            # dashboard rebuild running later in this same tick would
-            # snapshot the room right back into room_meta, resurrecting
-            # it on every future launch.
+            # nio only drops a room from client.rooms on an explicit forget(),
+            # which this app never sends; left in, the dashboard rebuild would
+            # snapshot the room right back into room_meta.
             self.client.rooms.pop(room_id, None)
             self.client.invited_rooms.pop(room_id, None)
         for room_id, joined in rooms.items():
@@ -1255,8 +1244,7 @@ class MatrixSession:
                     self.last_event_id[room_id] = event_id
             if events:
                 # Any timeline event moved the in-memory cache past the disk
-                # copy (messages via _on_message, reactions/redactions via
-                # their callbacks, all of which ran inside this sync).
+                # copy (the sync callbacks already ran).
                 self._cache_dirty = True
         if changed:
             self._persist_recency()
@@ -1280,22 +1268,6 @@ class MatrixSession:
         await self.client.close()
 
     # --- interactive SAS (emoji) device verification ----------------------
-
-    async def list_own_devices(self) -> list:
-        """Return this account's *other* OlmDevices (everything but this CLI
-        session). nio only queries keys for users it shares encrypted rooms
-        with, so our own user is usually untracked after a token restore; force
-        it into the key-query set before querying."""
-        await self.client.sync(timeout=10000)
-        if self.cfg.user_id not in self.client.olm.tracked_users:
-            self.client.olm.add_changed_users({self.cfg.user_id})
-        try:
-            await self.client.keys_query()
-        except LocalProtocolError:
-            pass  # nothing to query
-        await self.client.sync(timeout=10000)
-        devices = list(self.client.device_store.active_user_devices(self.cfg.user_id))
-        return [d for d in devices if d.device_id != self.client.device_id]
 
     async def prepare_verification(self) -> None:
         """Make our own devices' keys known (so nio can build the SAS object for
@@ -1348,8 +1320,6 @@ class MatrixSession:
         #      _sas_emoji() maps the indices directly; used in on_key.
         # (nio's _check_commitment has the same hex bug as #2 but is only reached
         # when nio *initiates*, which it cannot do here, so it never bites us.)
-        from nio.crypto.sas import Sas
-
         Sas._mac_normal = "hkdf-hmac-sha256.v2"
         Sas._mac_v1 = ["hkdf-hmac-sha256.v2"]
 
@@ -1462,11 +1432,6 @@ class MatrixSession:
             # requires, before the accept (which reads sas.commitment) goes out.
             sas = self.client.key_verifications.get(event.transaction_id)
             if sas is not None:
-                import base64
-                import hashlib
-
-                from nio.api import Api
-
                 raw = (
                     sas.pubkey.encode()
                     + Api.to_canonical_json(event.source["content"]).encode()
@@ -1565,7 +1530,6 @@ class MatrixSession:
                 getattr(event, "code", None),
                 getattr(event, "reason", None),
             )
-            # Ignore cancels for stale transactions or from a different sender.
             if not from_peer(event):
                 return
             done["result"] = f"the other device cancelled: {event.reason}"
@@ -1749,10 +1713,26 @@ class MatrixSession:
             if m.event_id and m.event_id == event.redacts:
                 timeline[i] = replace(m, redacted_ts=event.server_timestamp)
                 break
+        # Flag the archived copy too: a target older than the live window
+        # only exists there, and the backfill's never-overwrite guard means
+        # no refetch would ever mark it.
+        self._flag_archived_redaction(
+            room.room_id, event.redacts or "", event.server_timestamp
+        )
         # Nothing was appended, so the open room view has to be told to redraw
         # some other way; the latest-event id is what it watches.
         if event.event_id:
             self.last_event_id[room.room_id] = event.event_id
+
+    def _flag_archived_redaction(
+        self, room_id: str, target: str, ts: int
+    ) -> None:
+        arch = self.archives.get(room_id)
+        m = arch.get(target) if arch else None
+        if m is not None and not m.redacted_ts:
+            arch[target] = replace(m, redacted_ts=ts)
+            self._archive_dirty.add(room_id)
+            self._cache_dirty = True
 
     async def _refresh_direct_map(self) -> None:
         """Fetch the ``m.direct`` account-data event to learn which rooms are
@@ -1841,8 +1821,7 @@ class MatrixSession:
                     self.space_children[sid] = children
 
                 # In parallel: each space's raw state takes seconds on a
-                # loaded server, and sequential fetches made this scale with
-                # the number of spaces (~24 s of the launch for 4 spaces).
+                # loaded server.
                 await asyncio.gather(*(fetch(sid) for sid in spaces))
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
             return
@@ -1893,16 +1872,12 @@ class MatrixSession:
                 getattr(room, "name", None) or getattr(room, "canonical_alias", None)
             )
         ):
-            # Fallback for chats the other side never flagged in m.direct: any
-            # two-member room is treated as a DM, with the non-self member as
-            # the person. Never for rooms with a real name or alias; those are
-            # group rooms whatever their member map looks like. member_count
-            # can lag on first sync, so fall back to the users map as well,
-            # BUT under a lazy-loaded resume sync that map holds only the
-            # timeline senders, so a big room where exactly one other person
-            # spoke looks two-member here. With members unsynced, a snapshot
-            # that recorded the room as not-a-DM wins, and the full member
-            # list is fetched in the background to settle it either way.
+            # Chats the other side never flagged in m.direct: a two-member
+            # room with no name or alias is treated as a DM. Under a
+            # lazy-loaded resume sync the users map holds only timeline
+            # senders, so a big room can look two-member; with members
+            # unsynced a snapshot that says group wins, and the full member
+            # list is fetched in the background to settle it.
             others = [uid for uid in room.users if uid != self.cfg.user_id]
             member_count = room.member_count or len(room.users)
             if member_count == 2 and len(others) == 1:
@@ -1962,17 +1937,12 @@ class MatrixSession:
         for room in self.client.rooms.values():
             e = self._entry(room)
             snap = meta.get(e.room_id)
-            # A room that went live through a resumed (incremental) sync has
-            # no state this session: no m.room.name, no m.room.create, no
-            # tags. nio then invents a display name from the member "heroes"
-            # ("ALB-DL-..., ALB-TL-... and 316 others"), which must never
-            # displace a real title: only an actual room name/alias, or a
-            # resolved DM peer, outranks the snapshot. (members being loaded
-            # is NOT enough: the room may well have a proper name in state
-            # this session simply never fetched.) The same rule keeps the
-            # snapshot from being poisoned for the next launch, since the
-            # refresh below writes the backfilled entry. Unread counts stay
-            # live; the server sends them with every mention of the room.
+            # A room synced incrementally has no state this session, so nio
+            # invents a display name from the member "heroes", which must
+            # never displace a real title: only an actual room name/alias or
+            # a resolved DM peer outranks the snapshot. The same rule keeps
+            # the snapshot from being poisoned for the next launch. Unread
+            # counts stay live; the server sends them with every mention.
             if isinstance(snap, dict):
                 named = (
                     room.named_room_name()
@@ -1987,11 +1957,9 @@ class MatrixSession:
                     and not snap_title.startswith("!")
                 ):
                     e = replace(e, title=snap_title)
-                # The DM counterpart of the rescue above: a peer who sent
-                # none of this session's timeline events has no member event
-                # under lazy loading, so the title degrades to the bare
-                # @user:server id. A real name from an earlier session
-                # outranks that, and keeping it here also keeps the refresh
+                # DM counterpart: a peer with no member event this session
+                # degrades the title to the bare @user:server id; a real name
+                # from an earlier session outranks that and keeps the refresh
                 # below from overwriting the snapshot with the raw id.
                 if (
                     e.person
@@ -2018,12 +1986,10 @@ class MatrixSession:
                     or getattr(room, "canonical_alias", None)
                 )
             ):
-                # A live room with no name state this session: its title
-                # rests on the snapshot (which a session that misread the
-                # room may have poisoned) or on nio's heroes-based group
-                # name. Fetch m.room.name once to settle it from the server;
-                # confirmed DMs (m.direct, or two-member with full members)
-                # are skipped, they have no room name to find.
+                # A live room with no name state this session rests on the
+                # snapshot or on nio's heroes-based name; fetch m.room.name
+                # once to settle it. Confirmed DMs are skipped, they have no
+                # room name to find.
                 self._fetch_room_name(e.room_id)
             entries.append(e)
         live = {e.room_id for e in entries}
@@ -2048,9 +2014,9 @@ class MatrixSession:
             person = m.get("person") or None
             title = m.get("title") or rid
             if person and title == person:
-                # A snapshot poisoned before the DM rescue above existed
-                # stores the raw @user:server id; repair it from the profile
-                # cache (the fetch also heals the persisted snapshot).
+                # A poisoned snapshot stores the raw @user:server id; repair
+                # it from the profile cache (the fetch also heals the
+                # persisted snapshot).
                 self._fetch_profile(person)
                 title = self.profile_names.get(person) or title
             entries.append(
@@ -2304,16 +2270,71 @@ class MatrixSession:
             (e for e in self._all_entries() if e.room_id == ref), None
         )
 
-    def search(self, query: str) -> list[Entry]:
+    def search(self, query: str, scope: str | None = None) -> list[Entry]:
+        """Match people and rooms by title, person, or room id. ``scope``
+        narrows the candidates to one dashboard section, "favourites" or
+        "recent", covering the WHOLE section (the dashboard shows each
+        truncated to its row budget). A scoped search with an empty query
+        lists the full section, so "/" on Favourites is also the way to see
+        every favourite; the global search keeps returning nothing until
+        something is typed."""
         q = fold_text(query.strip())
-        if not q:
+        opened = self.state["last_opened_ts"]
+        entries = self._all_entries()
+        if scope == "favourites":
+            entries = [e for e in entries if e.is_favourite and not e.is_space]
+        elif scope == "recent":
+            entries = [e for e in entries if not e.is_space and opened.get(e.room_id)]
+        elif not q:
             return []
         out = []
-        for e in self._all_entries():
+        for e in entries:
             haystack = fold_text(f"{e.title} {e.person or ''} {e.room_id}")
-            if q in haystack:
+            if not q or q in haystack:
                 out.append(e)
-        out.sort(key=lambda e: (e.unread == 0, -e.last_ts, e.title.lower()))
+        # A scoped list keeps its section's own order, so it reads as the
+        # full version of what the dashboard shows truncated.
+        if scope == "recent":
+            out.sort(key=lambda e: -opened[e.room_id])
+        elif scope == "favourites":
+            out.sort(
+                key=lambda e: (
+                    e.unread == 0,
+                    -max(opened.get(e.room_id, 0), e.last_ts),
+                    e.title.lower(),
+                )
+            )
+        else:
+            out.sort(key=lambda e: (e.unread == 0, -e.last_ts, e.title.lower()))
+        return out
+
+    def message_index(self) -> list[tuple[Entry, Message]]:
+        """(room entry, message) for every message held locally in any
+        joined room: the full archives merged with the live windows, edits
+        folded. Feeds the dashboard's global search, so a query can find a
+        message without knowing which room it is in. Rooms that no longer
+        resolve to an entry (left since their cache was written) stay out."""
+        entries = {
+            e.room_id: e for e in self._all_entries() if not e.is_space
+        }
+        by_room: dict[str, dict[str, Message]] = {}
+        for room_id, arch in self.archives.items():
+            if room_id in entries:
+                by_room.setdefault(room_id, {}).update(arch)
+        for room_id, timeline in self.timelines.items():
+            if room_id not in entries:
+                continue
+            rows = by_room.setdefault(room_id, {})
+            for m in timeline:
+                if m.event_id and not m.pending:
+                    rows[m.event_id] = m
+        out: list[tuple[Entry, Message]] = []
+        for room_id, rows in by_room.items():
+            entry = entries[room_id]
+            for m in fold_edits(
+                sorted(rows.values(), key=lambda m: (m.ts, m.event_id))
+            ):
+                out.append((entry, m))
         return out
 
     # --- room view --------------------------------------------------------
@@ -2344,6 +2365,11 @@ class MatrixSession:
             # redacts an event too, and the timeline never showed that one, so
             # marking it would invent a deletion the user cannot have seen.
             if event.type not in ("m.room.message", "m.room.encrypted"):
+                return None
+            # Same for a deleted edit: it retracts the rewrite, and the edit
+            # never rendered as its own row (recognizable where the room
+            # version preserves m.relates_to through redaction).
+            if _edit_target(event):
                 return None
             # Deletion strips the content server-side: nothing but who did it
             # and when survives the fetch. Any text we received before that
@@ -2491,34 +2517,24 @@ class MatrixSession:
         trip); otherwise fetches /messages windows, paginating deeper while
         the result is starved of main-timeline messages, and merges them in."""
         cached = list(self.timelines.get(room_id, []))
-        # Startup syncs members lazily, so senders outside the last sync
-        # window would render as raw @user:server ids; worse, a resumed
-        # (incremental) launch never mentions a quiet room at all, leaving it
-        # out of client.rooms entirely, and nio's joined_members handler
-        # silently drops the response for a room it does not know. Register
-        # the room (same reason send() does) and kick the full member fetch
-        # off in the background: on a slow homeserver /joined_members takes
-        # seconds for a big room, and awaiting it here made every first open
-        # hang on it. Names repaint when it lands. This runs before the
-        # cache early-return so a reopen retries a fetch that failed.
+        # Startup syncs members lazily, and a resumed launch may not know the
+        # room at all (nio's joined_members handler silently drops responses
+        # for unknown rooms). Register the room and start the member fetch in
+        # the background; awaiting it would stall every first open. Runs
+        # before the cache early-return so a reopen retries a failed fetch.
         self._ensure_room(room_id)
         room = self.client.rooms[room_id]
         if not room.members_synced:
             self._fetch_members(room_id)
         # Serving a big cache without a fetch is only safe while no gappy
-        # sync ever punched a hole in it: after one, "len >= limit" would
-        # happily return history with the skipped chunk silently missing
-        # (history_loaded is discarded on the gap, but this size shortcut
-        # used to bypass that). history_loaded itself is re-added below only
-        # if no new gap appeared during the fetch, so it stays trustworthy.
+        # sync punched a hole in it; after one, "len >= limit" would return
+        # history with the skipped chunk silently missing. history_loaded is
+        # re-added below only if no new gap appeared during the fetch.
         gen = self.gap_gen.get(room_id, 0)
-        # Everything below counts the window in MAIN-timeline messages, not
-        # list entries or raw events: reactions and redactions never become
-        # Messages at all, and thread replies collapse out of the normal
-        # view. A burst of reaction/thread traffic (an active room during an
-        # event) can fill a whole raw window with them, and a plain [-limit:]
-        # slice can be all thread replies, either of which used to paint a
-        # busy room as "(no messages yet)".
+        # Count the window in MAIN-timeline messages, not raw events:
+        # reactions and redactions never become Messages, thread replies
+        # collapse out of the normal view, and a burst of either can fill a
+        # whole raw window.
         floor = limit // 2
 
         def window(msgs: list[Message]) -> list[Message]:
@@ -2781,14 +2797,11 @@ class MatrixSession:
         initial window ended, so repeated calls walk arbitrarily far back."""
         if self.pagination_done.get(room_id):
             return []
-        # Serve scroll-up from the local archive first: for a downloaded
-        # room this makes arbitrarily deep history instant and offline. The
-        # position is a count from the newest end, so the backfill worker
-        # prepending older rows underneath never shifts what was served; rows
-        # added at the NEW end mid-visit merely re-serve a batch the screen
-        # already knows (its event-id filter drops them). A batch straddling
-        # a stale room's head hole can miss events, but opening the room
-        # started the recovering walk that fills it (see start_backfill).
+        # Serve scroll-up from the local archive first: deep history becomes
+        # instant and offline. The position counts from the newest end, so
+        # the backfill worker prepending older rows never shifts what was
+        # served. A batch straddling a stale room's head hole can miss
+        # events; opening the room already started the walk that fills it.
         arch = self.archives.get(room_id)
         if arch:
             rows = sorted(arch.values(), key=lambda m: (m.ts, m.event_id))
@@ -2865,6 +2878,28 @@ class MatrixSession:
         task = asyncio.ensure_future(self._backfill(room_id))
         self._backfill_tasks[room_id] = task
         task.add_done_callback(reap)
+
+    def backfill_all(self) -> int:
+        """Kick off the full-history download for every joined room at once
+        (the same background walk opening a room starts), so the local
+        caches end up holding everything without visiting each room by
+        hand. The shared gate still serializes the walks: a loaded
+        homeserver sees one at a time. Returns how many rooms actually
+        needed downloading, so the caller can word its notification."""
+        pending = 0
+        for e in self._all_entries():
+            if e.is_space or e.is_invite:
+                continue
+            if not self.cache_allowed(e.room_id):
+                continue
+            if (
+                e.room_id in self.archive_done
+                and e.room_id not in self.archive_stale
+            ):
+                continue
+            pending += 1
+            self.start_backfill(e.room_id)
+        return pending
 
     async def _backfill(self, room_id: str) -> None:
         """Walk /messages backwards until the room's first event is reached,
@@ -3209,13 +3244,13 @@ class MatrixSession:
         except Exception as exc:
             return False, str(exc)
         if hasattr(resp, "event_id") and resp.event_id:
+            now = int(time.time() * 1000)
             timeline = self.timelines.get(room_id)
             for i, m in enumerate(timeline or ()):
                 if m.event_id == event_id:
-                    timeline[i] = replace(
-                        m, redacted_ts=int(time.time() * 1000)
-                    )
+                    timeline[i] = replace(m, redacted_ts=now)
                     break
+            self._flag_archived_redaction(room_id, event_id, now)
             self.last_event_id[room_id] = resp.event_id
             return True, resp.event_id
         return False, getattr(resp, "message", "delete failed")
@@ -3317,8 +3352,6 @@ class MatrixSession:
         if len(body) > MAX_DOWNLOAD_BYTES:
             return False, f"file too large ({len(body)} bytes)"
         if message.media_crypt:
-            from nio.crypto import decrypt_attachment
-
             c = message.media_crypt
             try:
                 body = decrypt_attachment(body, c["key"], c["sha256"], c["iv"])
@@ -3437,6 +3470,39 @@ class MatrixSession:
         ts = getattr(getattr(resp, "event", None), "server_timestamp", None)
         return ts if isinstance(ts, int) else None
 
+    async def fetch_fully_read(self, room_id: str) -> str | None:
+        """The room's ``m.fully_read`` marker straight from the server, or
+        None. Sync cannot be relied on to deliver it: room account data
+        older than the resume token is not re-sent (and matrix.ioinformatics
+        omits it from initial syncs too), so nio's room.fully_read_marker
+        stays None until the marker changes mid-session. The result is
+        written back onto the nio room so the next open skips the round
+        trip."""
+        url = (
+            f"{self.cfg.homeserver}/_matrix/client/v3/user/"
+            f"{quote(self.cfg.user_id, safe='')}/rooms/"
+            f"{quote(room_id, safe='')}/account_data/m.fully_read"
+        )
+        headers = {"Authorization": f"Bearer {self.client.access_token}"}
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    url, headers=headers, allow_redirects=False
+                ) as r:
+                    if r.status != 200:
+                        return None  # 404: the room was never marked read
+                    data = await r.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return None
+        event_id = data.get("event_id") if isinstance(data, dict) else None
+        if not isinstance(event_id, str) or not event_id:
+            return None
+        room = self.client.rooms.get(room_id)
+        if room is not None:
+            room.fully_read_marker = event_id
+        return event_id
+
     async def mark_read(self, room_id: str) -> None:
         """Move the room's read marker to its latest event. Called after
         every refresh of an open room, which at peak traffic is once per
@@ -3475,17 +3541,25 @@ class MatrixSession:
             event_id = self.last_event_id.get(room_id)
             if not event_id or self._marker_sent.get(room_id) == event_id:
                 return
-            # The receipt tracks the true latest event, but m.fully_read
-            # should name a message: last_event_id may be a reaction or
-            # redaction id (their callbacks bump it to trigger redraws), and
-            # a marker pointing at one is invisible to the unread divider on
-            # the next open, degrading it to the unread-count guess. Edits
-            # map to the message they rewrite, which is the row on screen.
+            # m.fully_read should name a MAIN-TIMELINE message: last_event_id
+            # may be a reaction or redaction id, and thread replies collapse
+            # out of the room view, so a marker at any of those is invisible
+            # to the unread divider on the next open. Edits map to the
+            # message they rewrite, unless that target is itself a thread
+            # reply.
+            rows = list(self.timelines.get(room_id) or ())
+            by_id = {m.event_id: m for m in rows if m.event_id}
             fully_read = event_id
-            for m in reversed(self.timelines.get(room_id) or ()):
-                if m.event_id and not m.pending:
-                    fully_read = m.replaces or m.event_id
-                    break
+            for m in reversed(rows):
+                if not m.event_id or m.pending:
+                    continue
+                if m.thread_root:
+                    continue  # collapsed out of the room view
+                target = by_id.get(m.replaces) if m.replaces else None
+                if target is not None and target.thread_root:
+                    continue  # an edit of a thread reply is just as invisible
+                fully_read = m.replaces or m.event_id
+                break
             try:
                 await self.client.room_read_markers(
                     room_id, fully_read_event=fully_read, read_event=event_id

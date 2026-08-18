@@ -137,7 +137,9 @@ class Config:
                 "password in the Keychain (see the comments in that file)."
             )
 
-        parser = configparser.ConfigParser()
+        # interpolation=None: with the default BasicInterpolation, a bare "%"
+        # in any value raises lazily at m.get() time, past the except below.
+        parser = configparser.ConfigParser(interpolation=None)
         try:
             parser.read(path)
         except configparser.Error as exc:
@@ -165,13 +167,11 @@ class Config:
         store_path.chmod(0o700)  # tighten if it pre-existed under a looser mode
         state_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Atomic writes use pid-suffixed *.tmp names; a crash between write
-        # and rename strands one, and nothing else ever deletes it. Only
+        # Sweep tmp files stranded by a crash between write and rename. Only
         # touch files at least an hour old: a fresh one may be another
-        # instance's in-flight write, and unlinking it would crash them.
-        # The patterns stay anchored to our own tmp naming because
-        # state_path/store_path are user-configurable, and a bare *.tmp
-        # glob over a shared directory would eat other apps' files.
+        # instance's in-flight write. The patterns stay anchored to our own
+        # tmp naming; a bare *.tmp glob over a user-configured, shared
+        # directory would eat other apps' files.
         cutoff = time.time() - 3600
         sweeps = [
             (state_path.parent, state_path.name + ".*.tmp"),
@@ -263,9 +263,16 @@ class Config:
         if not raw:
             return None
         try:
-            return json.loads(raw)
+            data = json.loads(raw)
         except (ValueError, TypeError):
             return None
+        # A malformed keyring entry must fall back to password login, not
+        # crash startup when the session indexes into it.
+        if not isinstance(data, dict) or not isinstance(
+            data.get("access_token"), str
+        ) or not isinstance(data.get("device_id"), str):
+            return None
+        return data
 
     def save_token(self, access_token: str, device_id: str) -> None:
         keyring.set_password(
@@ -429,6 +436,10 @@ class Config:
             return None
 
     def save_media_cache(self, key: str, data: bytes) -> None:
+        if len(data) > self.MEDIA_CACHE_MAX_BYTES:
+            # One over-cap blob would make the prune below evict everything,
+            # itself included; not worth caching at all.
+            return
         self._media_cache_dir.mkdir(mode=0o700, exist_ok=True)
         nonce = secrets.token_bytes(16)
         cipher = AES.new(self._timeline_cache_aes_key(), AES.MODE_GCM, nonce=nonce)

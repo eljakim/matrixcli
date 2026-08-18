@@ -95,9 +95,16 @@ directory. `poetry run matrix` from the project directory does the same thing.
 
 On the home screen:
 
-- `/`: search people and rooms (accent-insensitive: `agnes` finds `Ágnes`);
-  `↓`/`↑` move through the results while you keep typing, `Enter` opens the
-  highlighted hit
+- `/`: search people, rooms, and every locally held message in every room
+  (accent-insensitive: `agnes` finds `Ágnes`); `↓`/`↑` move through the
+  results while you keep typing, `Enter` opens the highlighted hit. Message
+  hits are listed after the room and people hits, newest first, each naming
+  its room; opening one opens that room and jumps straight to the message.
+  With the cursor in Recent or Favourites, the search is instead scoped to
+  that whole section: it opens already listing all of the section's rooms
+  (beyond the rows the dashboard has room for), and message hits are
+  limited to messages in those rooms. The popup's border always names the
+  active scope (as does the in-room message search, with the room's name)
 - `j` / `k` or `↓` / `↑`: move the selection down / up; `j` and `k` treat a
   column as one continuous list, so they roll on from Spaces into its Rooms,
   and from Invites through Recent into Favourites
@@ -114,6 +121,13 @@ On the home screen:
   growth stops where it would squeeze the other section or run off the
   screen; shrinking the terminal takes rows back automatically, and the
   sizes are remembered across sessions
+- `S`: sync everything: start the full-history download for every room at
+  once, so the local caches (and with them the global message search and
+  offline reading) end up covering all rooms without opening each one by
+  hand. It is the same background walk opening a room starts, run for all
+  rooms, one room at a time so the homeserver is not hammered; a
+  notification says how many rooms still needed downloading. Hidden when
+  `[cache] messages` is off, since nothing would be kept
 - `?`: about box
 - `q`: quit, from the home screen only; on any other page `q` returns
   straight to the home screen instead (`Ctrl+Q` and the `Ctrl+P` command
@@ -202,12 +216,16 @@ In a room:
 - `a`: react to the selected message: digits `1`-`9` send from a quick row
   instantly, `/` searches every emoji by Unicode name (`giraff` finds 🦒).
   Picking one you already sent takes it back; the quick row ticks those
-- `/`: search the loaded history of this room (accent-insensitive, newest
-  hit first). The query matches the message text, the sender's display
-  name, or their matrix id, so `agnes` finds what Ágnes said as well as
-  messages that mention her. `Enter` jumps the selection to the picked
-  message. It searches what has been loaded this visit, including anything
-  paged back, not the server's full archive.
+- `/`: search everything this client holds for the room (accent-insensitive,
+  newest hit first): the full downloaded history, not just what is on
+  screen, thread replies included. The query matches the message text, the
+  sender's display name, or their matrix id, so `agnes` finds what Ágnes
+  said as well as messages that mention her. `Enter` jumps the selection to
+  the picked message, unfolding its thread or detaching into deep history
+  (as `g` does; `G` returns to the live tail) when the hit is not in view.
+  The search is local: while a room's background download is still running,
+  the count line under the input says so, and older not-yet-fetched
+  messages cannot match yet.
 - `l` / `h`: unfold / fold the selected message's thread in place. `l` on a
   message with a `⤷ N replies` badge opens its replies inline (indented,
   fetched in full from the server); `l` again steps into the first reply.

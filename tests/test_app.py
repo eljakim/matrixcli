@@ -1,16 +1,23 @@
 import asyncio
+import html
+import re
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 
 from rich.text import Text
+from textual.app import App
+from textual.widgets import Label, ListView, Static
 
 from matrixcli.app import (
     DEFAULT_QUICK_REACTIONS,
     SENDER_COLORS,
     ActionScreen,
+    ComposerArea,
     DownloadScreen,
     HistoryScreen,
     HomeScreen,
+    MatrixApp,
     PreviewScreen,
     ReactionsScreen,
     RoomScreen,
@@ -144,9 +151,7 @@ class TestActionOpen:
     a file, browser for a link, a picker when a message offers several."""
 
     class Screen(RoomScreen):
-        # RoomScreen.app is a property that needs a running App; a plain
-        # attribute here shadows it, and the two side effects are recorded
-        # instead of performed.
+        # A plain attribute shadows RoomScreen.app, which needs a running App.
         app = SimpleNamespace(push_screen=lambda *a, **kw: None)
 
         def __init__(self, *a, **kw):
@@ -224,8 +229,7 @@ class TestActionOpen:
         assert isinstance(screen.pushed[0], HistoryScreen)
 
     def test_enter_and_shift_enter_do_not_compete(self):
-        # An edited message that also holds a link: Enter follows the link,
-        # Shift+Enter shows the versions. Neither has to guess.
+        # Enter follows the link, Shift+Enter shows the versions.
         screen = self.make_screen("fixed https://a.example", edited_ts=200)
         screen._open_selected()
         assert screen.opened == ["https://a.example"]
@@ -233,8 +237,7 @@ class TestActionOpen:
         assert isinstance(screen.pushed[0], HistoryScreen)
 
     def test_deleted_message_offers_only_its_kept_text(self):
-        # Nothing to download, and no following links out of text that was
-        # withdrawn; the kept copy is all there is.
+        # No links out of withdrawn text; the kept copy is all there is.
         screen = self.make_screen("see https://a.example", redacted_ts=400)
         assert screen._selected_actions() == []
         screen._open_selected()
@@ -274,8 +277,7 @@ class TestActionOpen:
         assert not any(plain.check_action(a, None) for a in cases)
 
     def test_enter_leaves_a_reactions_only_message_to_the_spacebar(self):
-        # The popup moved to the spacebar: Enter's footer must not promise
-        # it too, so no Enter label lights up on a reactions-only message.
+        # The popup lives on the spacebar; Enter must not promise it too.
         screen = self.make_screen("hot take", reactions=[("👍", 2)])
         for action in ("open_link", "open_download", "open_actions"):
             assert screen.check_action(action, None) is False
@@ -369,8 +371,7 @@ class TestPickerKeys:
 
 
 class TestComposerTitle:
-    """The docked composer's header line: it is the only thing naming the
-    message being replied to, now that the editor no longer sits under it."""
+    """The docked composer's header line names the message being replied to."""
 
     def msg(self, body="x", name="A"):
         return Message(
@@ -419,15 +420,12 @@ class TestFirstUnread:
         assert screen._first_unread_index() == 3
 
     def test_marker_ts_places_divider_after_the_read_horizon(self):
-        # The stored marker can be a reaction id, never a display row; its
-        # fetched timestamp still says exactly what had been read, and it
-        # wins over the count fallback (which would answer 1 here).
+        # A reaction-id marker's timestamp beats the count fallback.
         screen = self.make_screen(marker="$react", unread=4)
         assert screen._first_unread_index(marker_ts=2) == 3
 
     def test_marker_ts_newer_than_every_row_means_read(self):
-        # A thumbs-up (or an edit) after the last message must not flag an
-        # already-read message as new, even when a stale count says so.
+        # A reaction after the last message must not flag it unread.
         screen = self.make_screen(marker="$react", unread=2)
         assert screen._first_unread_index(marker_ts=9) is None
 
@@ -438,8 +436,7 @@ class TestFirstUnread:
         assert self.make_screen(n=0, marker="$x")._first_unread_index() is None
 
     def test_divider_anchored_at_open_does_not_drift(self):
-        # The count fallback is only meaningful against the opening snapshot;
-        # once anchored to an event id, later arrivals must not move it.
+        # Once anchored to an event id, later arrivals must not move it.
         screen = self.make_screen(unread=2)
         idx = screen._first_unread_index()
         screen._first_unread_event = screen.messages[idx].event_id
@@ -464,8 +461,7 @@ class TestThreadScreenUnread:
         return screen
 
     def test_room_unread_count_is_ignored(self):
-        # The room's unread count counts main-timeline events; applying it to
-        # a thread's reply list would place the divider at a meaningless spot.
+        # The room count covers main-timeline events, meaningless in a thread.
         assert self.make_screen(unread=3)._first_unread_index() is None
 
     def test_marker_inside_thread_places_divider(self):
@@ -475,9 +471,7 @@ class TestThreadScreenUnread:
         assert self.make_screen(marker="$4")._first_unread_index() is None
 
     def test_marker_ts_is_ignored_in_threads(self):
-        # A room-level marker timestamp says nothing about which thread
-        # replies were read; only a marker inside the thread places the
-        # divider (and _divider_ts_fallback stops the fetch upstream).
+        # A room-level marker timestamp says nothing about thread replies.
         screen = self.make_screen(marker="$gone")
         assert screen._first_unread_index(marker_ts=1) is None
         assert screen._divider_ts_fallback is False
@@ -541,8 +535,7 @@ class TestLoadMessagesDisplay:
         assert [m.event_id for m in out] == ["$root", "$a", "$main"]
 
     def test_threaded_view_keeps_orphan_replies_inline(self, monkeypatch):
-        # The reply's root is older than the loaded window: it must stay
-        # visible at its chronological position instead of being hidden.
+        # The root is outside the loaded window: the reply must stay visible.
         history = [
             msg("$main", 150),
             msg("$orphan", 200, root="$gone"),
@@ -639,8 +632,7 @@ class TestActionThread:
         assert pushed and pushed[0].root.event_id == "$root"
 
     def test_reply_opens_the_thread_it_belongs_to(self, monkeypatch):
-        # Threads do not nest: T on a reply must open the reply's thread, not
-        # start a spec-invalid thread rooted at the reply itself.
+        # Threads do not nest: T on a reply opens the reply's thread.
         history = [msg("$root", 100), msg("$reply", 200, root="$root")]
         screen, pushed, _ = self.make_screen(monkeypatch, history)
         screen.selected = 1
@@ -684,9 +676,7 @@ class TestPendingEcho:
         assert out[-1] is echo
 
     def test_splice_skips_echo_whose_sync_copy_already_arrived(self):
-        # The sync echo can outrun the /send response; until the response
-        # swaps in the real id, the echo and the arrived event are the same
-        # message and must not render twice.
+        # The sync copy can outrun /send; the message must not render twice.
         screen = RoomScreen(make_entry())
         echo = self.msg("~local.1", pending=True, ts=1000)
         screen._pending.append(echo)
@@ -710,8 +700,7 @@ class TestPendingEcho:
         assert out[-1] is echo
 
     def test_splice_skips_echo_already_in_list(self):
-        # After confirmation swaps in the real event id, a reload that already
-        # contains the sync echo must not duplicate the message.
+        # A reload already holding the confirmed event must not duplicate it.
         screen = RoomScreen(make_entry())
         echo = self.msg("$real", pending=True)
         screen._pending.append(echo)
@@ -719,8 +708,7 @@ class TestPendingEcho:
         assert len(out) == 1
 
     def test_thread_latest_skips_pending_echoes(self):
-        # A provisional "~local." id must never leave the client as the
-        # thread reply-fallback event id.
+        # A "~local." id must never leave the client as the reply fallback.
         root = self.msg("$root")
         screen = ThreadScreen(make_entry(), root)
         screen.messages = [
@@ -738,15 +726,10 @@ class TestPendingEcho:
 
 class TestAppChrome:
     def test_command_palette_disabled(self):
-        from matrixcli.app import MatrixApp
-
         assert MatrixApp.ENABLE_COMMAND_PALETTE is False
 
     def test_ctrl_q_neutralized_quit_keys_and_about_bound(self):
-        # Quitting is q on the home screen or the ":q!" command; a global q
-        # would make one keystroke while reading a room exit the whole app,
-        # so the app level must NOT bind it.
-        from matrixcli.app import HomeScreen, MatrixApp, RoomScreen
+        # A global q would let one keystroke in a room quit the whole app.
 
         def keymap(bindings):
             actions = {}
@@ -780,24 +763,18 @@ class TestConnStatus:
         assert self.render(None, True).plain == ""
 
     def test_fresh_sync_shows_dot_and_age(self):
-        import time
-
         text = self.render(time.monotonic() - 5, True)
         assert text.plain.startswith("● ")
         assert text.plain.endswith("5s")
         assert "offline" not in text.plain
 
     def test_failed_sync_shows_offline(self):
-        import time
-
         text = self.render(time.monotonic() - 5, False)
         assert "offline" in text.plain
         assert text.plain.endswith("5s")
 
     def test_silently_hung_poll_counts_as_offline(self):
-        # No error was raised, but nothing has synced within STALE_AFTER: a
-        # dropped network hangs the long-poll without failing it.
-        import time
+        # A dropped network hangs the long-poll without failing it.
 
         text = self.render(time.monotonic() - 120, True)
         assert "offline" in text.plain
@@ -866,8 +843,7 @@ class TestEditedMessages:
             event_id="$d", redacted_ts=400,
         )
         screen = self.screen(monkeypatch, [deleted])
-        # The text is not on screen, but Shift+Enter can still show it: we
-        # received it before the deletion and the server no longer has it.
+        # We got the text before the deletion; the server no longer has it.
         assert self.body_cell(screen, 0) == "this message has been deleted *"
         assert screen.check_action("open_details", None) is True
 
@@ -881,8 +857,7 @@ class TestEditedMessages:
         assert screen.check_action("open_details", None) is False
 
     def test_an_edit_or_deletion_alone_still_triggers_a_redraw(self, monkeypatch):
-        # Both rewrite a message in place, leaving the list of event ids
-        # untouched; a signature of ids alone would skip the redraw.
+        # A signature of event ids alone would skip the redraw.
         screen = self.screen(monkeypatch, self.history())
         before = screen._signature(screen.messages)
         edited = [replace(screen.messages[0], edited_ts=999), screen.messages[1]]
@@ -950,10 +925,7 @@ class TestComposerPanel:
 
     def run(self, steps):
         """Open a room in a headless app and hand it to `steps`."""
-        from textual.app import App
         from textual.containers import Vertical
-
-        from matrixcli.app import ComposerArea, MatrixApp
 
         history = [
             Message(
@@ -968,6 +940,7 @@ class TestComposerPanel:
             client=SimpleNamespace(rooms={}),
             last_event_id={},
             load_history=lambda room_id, limit=40, cached_only=False: _async(list(history)),
+            fetch_fully_read=lambda room_id: _async(None),
             mark_read=lambda room_id: _async(None),
             start_backfill=lambda room_id: None,
             reset_pagination=lambda room_id: None,
@@ -1031,8 +1004,7 @@ class TestComposerPanel:
                 await pilot.press("shift+enter")
             await pilot.press("y")
             await pilot.pause()
-            # The cursor sits on line 10 of a five-row box: the box scrolled
-            # rather than the draft running off the bottom of the screen.
+            # Line 10 in a five-row box: the box scrolled, not the screen.
             return {
                 "rows": editor.size.height,
                 "lines": editor.document.line_count,
@@ -1134,8 +1106,7 @@ class TestMessageRendering:
         assert cells[-1] == "the reply"
 
     def test_reply_quote_falls_back_to_the_fallback_text(self, monkeypatch):
-        # Target outside the loaded window: what the sender's text fallback
-        # said is all we have.
+        # Target outside the loaded window: the fallback text is all we have.
         screen = self.screen(monkeypatch)
         m = Message(sender="@b:hs", sender_name="Bob", body="the reply", ts=2,
                     event_id="$r", reply_to="$gone", reply_name="Alice",
@@ -1270,8 +1241,6 @@ class TestSendResilience:
     the send runs as an app worker."""
 
     def test_send_survives_leaving_the_room_and_failure_is_reported(self):
-        from textual.app import App
-
         gate = asyncio.Event()
         done = {}
         notices = []
@@ -1287,6 +1256,7 @@ class TestSendResilience:
             client=SimpleNamespace(rooms={}),
             last_event_id={},
             load_history=lambda room_id, limit=40, cached_only=False: _async([]),
+            fetch_fully_read=lambda room_id: _async(None),
             mark_read=lambda room_id: _async(None),
             start_backfill=lambda room_id: None,
             reset_pagination=lambda room_id: None,
@@ -1329,11 +1299,7 @@ class TestRoomFlows:
     """Headless end-to-end checks of the newer room behaviours: draft stash,
     edit/delete of own messages, in-room search, date dividers."""
 
-    def run(self, steps, history=None):
-        from textual.app import App
-
-        from matrixcli.app import ComposerArea, MatrixApp
-
+    def run(self, steps, history=None, fully_read=None):
         calls = {"edits": [], "redacts": []}
         default_history = [
             Message(sender="@me:hs", sender_name="Me", body="mine", ts=1786400000000,
@@ -1364,6 +1330,11 @@ class TestRoomFlows:
             reaction_summary=lambda room_id, event_id: [],
             send_edit=send_edit,
             redact=redact,
+            timelines={},
+            archive_rows=lambda room_id: [],
+            cache_allowed=lambda room_id: False,
+            archive_done=set(),
+            fetch_fully_read=lambda room_id: _async(fully_read),
         )
 
         class RoomApp(App):
@@ -1506,6 +1477,125 @@ class TestRoomFlows:
         # The matrix id works when only the account name is known.
         assert search("carol") == "$by-id"
 
+    def test_slash_search_finds_collapsed_thread_replies(self):
+        # Collapsed thread replies stay searchable; jumping unfolds the thread.
+        root = Message(sender="@a:hs", sender_name="A", body="root here",
+                       ts=1786400000000, event_id="$root")
+        reply = Message(sender="@b:hs", sender_name="B", body="flag inside thread",
+                        ts=1786400001000, event_id="$reply", thread_root="$root")
+
+        async def steps(pilot, app, screen, session, calls, composer_area):
+            session.timelines["!a:hs"] = [root, reply]
+            await pilot.press("slash")
+            await pilot.pause()
+            # The popup's border names the room being searched.
+            box = app.screen.query_one("#searchbox")
+            assert str(box.border_title) == "Search messages in general"
+            for ch in "flag":
+                await pilot.press(ch)
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            return (
+                screen.messages[screen.selected].event_id,
+                "$root" in screen.expanded,
+            )
+
+        selected, expanded = self.run(steps, history=[root, reply])
+        assert selected == "$reply"
+        assert expanded
+
+    def test_slash_search_reaches_archived_history(self):
+        # An archived hit detaches into browse mode, like walking there with "g".
+        old = Message(sender="@a:hs", sender_name="A", body="the flag debate",
+                      ts=1786000000000, event_id="$old")
+        recent = Message(sender="@b:hs", sender_name="B", body="hello now",
+                         ts=1786500000000, event_id="$now")
+
+        async def steps(pilot, app, screen, session, calls, composer_area):
+            session.archive_rows = lambda room_id: [old, recent]
+            session.cache_allowed = lambda room_id: True
+            await pilot.press("slash")
+            await pilot.pause()
+            for ch in "debate":
+                await pilot.press(ch)
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            detached = screen._browse is not None
+            landed = screen.messages[screen.selected].event_id
+            # "G" reattaches to the live tail.
+            await pilot.press("G")
+            await pilot.pause()
+            await app.workers.wait_for_complete()
+            return detached, landed, screen._browse is None
+
+        detached, landed, reattached = self.run(steps, history=[recent])
+        assert detached
+        assert landed == "$old"
+        assert reattached
+
+    def test_open_with_jump_target_lands_on_the_archived_hit(self):
+        # Opening a room from a global-search message hit jumps straight to
+        # the event, even when it is older than the loaded window.
+
+        old = Message(sender="@a:hs", sender_name="A", body="the flag debate",
+                      ts=1786000000000, event_id="$old")
+        recent = Message(sender="@b:hs", sender_name="B", body="hello now",
+                         ts=1786500000000, event_id="$now")
+        session = SimpleNamespace(
+            cfg=SimpleNamespace(user_id="@me:hs"),
+            my_name="Me",
+            client=SimpleNamespace(rooms={}),
+            last_event_id={},
+            load_history=lambda room_id, limit=40, cached_only=False: _async(
+                [recent]
+            ),
+            mark_read=lambda room_id: _async(None),
+            start_backfill=lambda room_id: None,
+            reset_pagination=lambda room_id: None,
+            drafts={},
+            reaction_summary=lambda room_id, event_id: [],
+            timelines={},
+            archive_rows=lambda room_id: [old, recent],
+            cache_allowed=lambda room_id: True,
+            archive_done=set(),
+            fetch_fully_read=lambda room_id: _async(None),
+        )
+
+        class JumpApp(App):
+            CSS = MatrixApp.CSS
+
+            def on_mount(self):
+                self.session = session
+                self.last_sync_at = None
+                self.sync_ok = True
+                screen = RoomScreen(make_entry())
+                screen._jump_target = "$old"
+                return self.push_screen(screen)
+
+        async def go():
+            app = JumpApp()
+            async with app.run_test(size=(90, 24)) as pilot:
+                await pilot.pause()
+                await app.workers.wait_for_complete()
+                s = app.screen
+                return s.messages[s.selected].event_id, s._browse is not None
+
+        assert asyncio.run(go()) == ("$old", True)
+
+    def test_divider_uses_the_fetched_marker_when_sync_has_none(self):
+        # nio knows no read marker after a resumed sync; the screen fetches it.
+        async def steps(pilot, app, screen, session, calls, composer_area):
+            await app.workers.wait_for_complete()
+            return screen._opened_read_marker, screen._first_unread_event
+
+        marker, first_unread = self.run(steps, fully_read="$mine")
+        assert marker == "$mine"
+        assert first_unread == "$theirs"
+
     def test_q_leaves_the_room_instead_of_quitting(self):
         async def steps(pilot, app, screen, session, calls, composer_area):
             await pilot.press("q")
@@ -1542,11 +1632,7 @@ class TestRoomFlows:
         assert exited is False
 
     def test_first_message_of_a_day_keeps_its_name_header(self):
-        # The name header is suppressed on a same-sender run; a divider must
-        # break the run, or the first message of a day (or of the unread
-        # block) renders attributed to nobody.
-        import html
-        import re
+        # A divider must break a same-sender run, or the message shows no name.
 
         two_days = [
             Message(sender="@a:hs", sender_name="Antonia", body="yesterday",
@@ -1564,11 +1650,7 @@ class TestRoomFlows:
         assert text.count("Antonia") == 2
 
     def test_absurd_timestamp_does_not_crash_the_render(self):
-        # origin_server_ts is whatever a federated server sent; a value
-        # outside localtime's range must degrade to a blank stamp, not tear
-        # the whole room down with an OSError mid-render.
-        import html
-        import re
+        # A ts outside localtime's range must blank the stamp, not raise.
 
         weird = [
             Message(sender="@a:hs", sender_name="A", body="fine",
@@ -1587,9 +1669,6 @@ class TestRoomFlows:
         assert "--:--" in text
 
     def test_day_change_inserts_a_divider(self):
-        import html
-        import re
-
         two_days = [
             Message(sender="@a:hs", sender_name="A", body="yesterday", ts=1786400000000,
                     event_id="$1"),
@@ -1605,9 +1684,8 @@ class TestRoomFlows:
         text = self.run(steps, history=two_days)
         assert "── new ──" not in text  # unrelated divider, sanity
         # One divider, carrying the second day's date.
-        import time as _time
 
-        stamp = _time.strftime("%a %d %b %Y", _time.localtime(1786500000000 / 1000))
+        stamp = time.strftime("%a %d %b %Y", time.localtime(1786500000000 / 1000))
         assert f"── {stamp} ──" in text
 
 
@@ -1632,9 +1710,6 @@ class TestHomeKeys:
     def walk(self, keys, **kw):
         """Press keys on a freshly mounted HomeScreen; return the (list id,
         highlighted index) the cursor sits on after each one."""
-        from textual.app import App
-        from textual.widgets import ListView
-
         data = self.dashboard(**kw)
         session = SimpleNamespace(
             cfg=SimpleNamespace(
@@ -1682,9 +1757,7 @@ class TestHomeKeys:
         ]
 
     def test_arrow_keys_walk_the_column_like_j_and_k(self):
-        # The focused ListView binds the arrows itself, which would stop the
-        # cursor dead at each list's edge; the priority bindings route them
-        # through the same column-spilling _step as j/k.
+        # Priority bindings route the arrows through the same _step as j/k.
         assert self.walk(["down", "down", "down", "up", "up"]) == [
             ("recent", 1),
             ("favourites", 0),
@@ -1696,13 +1769,198 @@ class TestHomeKeys:
     def test_l_and_h_step_between_columns_and_wrap(self):
         assert self.walk("lhh") == [("dms", 0), ("recent", 0), ("spaces", 0)]
 
+    def test_slash_scopes_search_to_recent_and_favourites(self):
+        # "/" is scoped on Recent/Favourites, global anywhere else.
+
+        from matrixcli.app import SearchScreen
+
+        data = self.dashboard()
+        calls = []
+        session = SimpleNamespace(
+            cfg=SimpleNamespace(
+                user_id="@me:hs",
+                save_state=lambda state: None,
+                cache_messages=True,
+            ),
+            state={},
+            dashboard=lambda selected_space: data,
+            space_cache_enabled=lambda space_id: True,
+            section_rows=lambda section: 5,
+            search=lambda q, scope=None: calls.append((q, scope)) or [],
+            message_index=lambda: [],
+        )
+
+        class HomeApp(App):
+            def on_mount(self):
+                self.session = session
+                return self.push_screen(HomeScreen())
+
+        async def run():
+            scopes = []
+            app = HomeApp()
+            async with app.run_test() as pilot:
+                for keys in [["slash"], ["j", "j", "slash"], ["h", "slash"]]:
+                    for key in keys:
+                        await pilot.press(key)
+                    await pilot.pause()
+                    assert isinstance(app.screen, SearchScreen)
+                    scopes.append(
+                        (
+                            app.screen.scope,
+                            str(app.screen.query_one("#searchbox").border_title),
+                        )
+                    )
+                    await pilot.press("escape")
+                    await pilot.pause()
+            return scopes, calls
+
+        scopes, searched = asyncio.run(run())
+        # Focus starts on Recent; jj lands on Favourites; h moves to Spaces.
+        # The border names the scope; the placeholder vanishes once typing starts.
+        assert scopes == [
+            ("recent", "Search all recent rooms"),
+            ("favourites", "Search all favourites"),
+            (None, "Search people, rooms & messages"),
+        ]
+        # The scoped screens listed their whole section before any typing;
+        # the global one waits for input.
+        assert searched == [("", "recent"), ("", "favourites")]
+
+    def test_global_search_finds_messages_and_opens_the_room_there(self):
+        from matrixcli.app import MessageHitItem
+
+        hit_entry = make_entry(room_id="!ga:hs", title="ioi.ga")
+        hit = Message(sender="@a:hs", sender_name="A", body="capture the flag",
+                      ts=1786400000000, event_id="$hit")
+        data = self.dashboard()
+        opened = []
+        session = SimpleNamespace(
+            cfg=SimpleNamespace(
+                user_id="@me:hs",
+                save_state=lambda state: None,
+                cache_messages=True,
+            ),
+            state={},
+            dashboard=lambda selected_space: data,
+            space_cache_enabled=lambda space_id: True,
+            section_rows=lambda section: 5,
+            search=lambda q, scope=None: [],
+            message_index=lambda: [(hit_entry, hit)],
+        )
+
+        class HomeApp(App):
+            def on_mount(self):
+                self.session = session
+                return self.push_screen(HomeScreen())
+
+            def open_room(self, entry, jump_to=None):
+                opened.append((entry.room_id, jump_to))
+
+        async def run():
+            app = HomeApp()
+            async with app.run_test() as pilot:
+                await pilot.press("h")  # off Recent, so the search is global
+                await pilot.press("slash")
+                await pilot.pause()
+                for ch in "flag":
+                    await pilot.press(ch)
+                await pilot.pause()
+
+                rows = list(app.screen.query_one("#results", ListView).children)
+                assert len(rows) == 1 and isinstance(rows[0], MessageHitItem)
+                await pilot.press("enter")
+                await pilot.pause()
+            return opened
+
+        # Enter on a message hit opens its room and jumps to the event.
+        assert asyncio.run(run()) == [("!ga:hs", "$hit")]
+
+    def test_scoped_search_matches_messages_in_the_sections_rooms(self):
+        from matrixcli.app import MessageHitItem
+
+        recent_entry = make_entry(room_id="!ga:hs", title="ioi.ga")
+        other_entry = make_entry(room_id="!x:hs", title="elsewhere")
+        in_recent = Message(sender="@a:hs", sender_name="A", body="flag one",
+                            ts=1786400000000, event_id="$in")
+        outside = Message(sender="@b:hs", sender_name="B", body="flag two",
+                          ts=1786400001000, event_id="$out")
+        data = self.dashboard()
+        session = SimpleNamespace(
+            cfg=SimpleNamespace(
+                user_id="@me:hs",
+                save_state=lambda state: None,
+                cache_messages=True,
+            ),
+            state={"last_opened_ts": {"!ga:hs": 1}},
+            dashboard=lambda selected_space: data,
+            space_cache_enabled=lambda space_id: True,
+            section_rows=lambda section: 5,
+            search=lambda q, scope=None: [],
+            message_index=lambda: [
+                (recent_entry, in_recent),
+                (other_entry, outside),
+            ],
+        )
+
+        class HomeApp(App):
+            def on_mount(self):
+                self.session = session
+                return self.push_screen(HomeScreen())
+
+        async def run():
+            app = HomeApp()
+            async with app.run_test() as pilot:
+                await pilot.press("slash")  # focus starts on Recent: scoped
+                await pilot.pause()
+                for ch in "flag":
+                    await pilot.press(ch)
+                await pilot.pause()
+                rows = list(app.screen.query_one("#results", ListView).children)
+                return [
+                    (type(r).__name__, getattr(r, "event_id", None))
+                    for r in rows
+                ]
+
+        # Only the hit from a recently opened room shows; "flag two" lives
+        # in a room outside the scope.
+        assert asyncio.run(run()) == [("MessageHitItem", "$in")]
+
+    def test_sync_all_starts_the_backfill_for_every_room(self):
+        data = self.dashboard()
+        calls = []
+        session = SimpleNamespace(
+            cfg=SimpleNamespace(
+                user_id="@me:hs",
+                save_state=lambda state: None,
+                cache_messages=True,
+            ),
+            state={},
+            dashboard=lambda selected_space: data,
+            space_cache_enabled=lambda space_id: True,
+            section_rows=lambda section: 5,
+            backfill_all=lambda: calls.append(True) or 3,
+        )
+
+        class HomeApp(App):
+            def on_mount(self):
+                self.session = session
+                return self.push_screen(HomeScreen())
+
+        async def run():
+            app = HomeApp()
+            async with app.run_test() as pilot:
+                await pilot.press("S")
+                await pilot.pause()
+            return calls
+
+        assert asyncio.run(run()) == [True]
+
     def test_h_returns_to_the_row_you_left_the_column_on(self):
         # Down to Favourites, out to DMs and back: Favourites, not the top.
         assert self.walk("jjlh")[-1] == ("favourites", 0)
 
     def test_f_follows_the_highlighted_row(self):
         # Rooms offer Favourite, favourites offer Unfavourite, spaces neither.
-        from textual.app import App
 
         data = self.dashboard()
         data["favourites"] = [
@@ -1764,9 +2022,7 @@ class TestHomeKeys:
         assert self.walk("l", dms=()) == [("spaces", 0)]
 
     def test_other_rooms_join_the_left_column(self):
-        # With orphan rooms present, j rolls off the bottom of Rooms into the
-        # Other rooms section; when there are none the section is hidden and
-        # the walk stops at the bottom of Rooms.
+        # Orphan rooms join below Rooms; without any the section is hidden.
         assert self.walk("hjjjj", others=["Weoi"]) == [
             ("spaces", 0),
             ("spaces", 1),
@@ -1783,8 +2039,6 @@ class TestSectionRows:
     fits, clamped back down when the terminal shrinks, and persisted."""
 
     def run_home(self, steps, state=None):
-        from textual.app import App
-
         def rooms(names, **kw):
             return [make_entry(room_id=f"!{n}:hs", title=n, **kw) for n in names]
 
@@ -1898,11 +2152,6 @@ class TestOpenRoomRefresh:
     Recent list must not reorder in front of the user."""
 
     def test_recent_reorders_behind_the_room_not_on_return(self):
-        from textual.app import App
-        from textual.widgets import ListView
-
-        from matrixcli.app import MatrixApp
-
         opened = []
         st = {"last_opened_ts": {"!Chat1:hs": 2, "!Chat2:hs": 1}}
 
@@ -1943,6 +2192,7 @@ class TestOpenRoomRefresh:
             client=SimpleNamespace(rooms={}),
             last_event_id={},
             load_history=lambda room_id, limit=40, cached_only=False: _async([]),
+            fetch_fully_read=lambda room_id: _async(None),
             mark_read=lambda room_id: _async(None),
             start_backfill=lambda room_id: None,
             reset_pagination=lambda room_id: None,
@@ -1965,7 +2215,7 @@ class TestOpenRoomRefresh:
                 await pilot.pause()
                 home = app.screen
                 await pilot.press("j")  # highlight Chat2 (second row)
-                await pilot.press("enter")  # open it
+                await pilot.press("enter")
                 await pilot.pause()
                 await app.workers.wait_for_complete()
                 covered_sig = home._last_signature
@@ -1994,9 +2244,6 @@ class TestBrowseHistory:
     walks forward; G reattaches to the live tail."""
 
     def run(self, steps, archive_size=5, window_size=2, no_archive=False):
-        from textual.app import App
-        from matrixcli.app import MatrixApp
-
         rows = [
             Message(
                 sender="@a:hs", sender_name="A", body=f"old{i}", ts=1000 + i,
@@ -2015,6 +2262,7 @@ class TestBrowseHistory:
             load_history=lambda room_id, limit=40, cached_only=False: _async(
                 list(history)
             ),
+            fetch_fully_read=lambda room_id: _async(None),
             mark_read=lambda room_id: _async(None),
             start_backfill=lambda room_id: None,
             reset_pagination=lambda room_id: None,
@@ -2238,9 +2486,6 @@ class TestPreviewScreen:
         import io
 
         from PIL import Image
-        from textual.app import App
-
-        from matrixcli.app import MatrixApp, PreviewScreen
 
         buf = io.BytesIO()
         Image.new("RGB", (32, 16), (200, 30, 30)).save(buf, format="PNG")
@@ -2273,6 +2518,7 @@ class TestPreviewScreen:
             client=SimpleNamespace(rooms={}),
             last_event_id={},
             load_history=lambda room_id, limit=40, cached_only=False: _async(list(history)),
+            fetch_fully_read=lambda room_id: _async(None),
             mark_read=lambda room_id: _async(None),
             start_backfill=lambda room_id: None,
             reset_pagination=lambda room_id: None,
@@ -2301,8 +2547,6 @@ class TestPreviewScreen:
 
     def test_space_opens_toggles_persists_and_closes(self):
         async def steps(pilot, app, preview_cls, state):
-            from textual.widgets import Static
-
             await pilot.press("space")
             await pilot.pause()  # popup mounts, fetch worker starts
             await pilot.pause()  # worker lands and renders
@@ -2337,8 +2581,6 @@ class TestPreviewScreen:
 
     def test_j_k_walk_the_images_and_selection_follows(self):
         async def steps(pilot, app, preview_cls, state):
-            from textual.widgets import Label
-
             def title():
                 # startswith: on a non-truecolor console the title carries a
                 # dim "256-color terminal" suffix after the filename.
@@ -2372,8 +2614,6 @@ class TestPreviewScreen:
 
     def test_window_resize_rescales_the_art(self):
         async def steps(pilot, app, preview_cls, state):
-            from textual.widgets import Static
-
             await pilot.press("space")
             await pilot.pause()
             await pilot.pause()
@@ -2397,8 +2637,6 @@ class TestPreviewScreen:
         monkeypatch.setattr(app_module, "_color_depth", lambda system: "basic")
 
         async def steps(pilot, app, preview_cls, state):
-            from textual.widgets import Label, Static
-
             state["preview_mode"] = "blocks"  # a remembered choice cannot win
             await pilot.press("space")
             await pilot.pause()
@@ -2429,8 +2667,6 @@ class TestPreviewScreen:
         monkeypatch.setattr(app_module, "_block_art", boom)
 
         async def steps(pilot, app, preview_cls, state):
-            from textual.widgets import Static
-
             await pilot.press("space")
             await pilot.pause()
             await pilot.pause()
