@@ -25,9 +25,11 @@ import subprocess
 import sys
 import time
 import unicodedata
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import keyring.errors
 
@@ -51,6 +53,7 @@ from textual.widgets import (
     ListView,
     Rule,
     Static,
+    Switch,
     TextArea,
 )
 
@@ -151,11 +154,32 @@ def _version() -> str:
         return ""
 
 
-def _safe_localtime(ts_ms: int):
-    """localtime of a server timestamp, or None when out of range:
-    origin_server_ts comes off the wire, and one absurd value must not crash
-    the render."""
+# Timezone override for every rendered timestamp, set from the settings
+# screen ("timezone" in state.json); None renders in the system's local time.
+_display_tz: ZoneInfo | None = None
+
+
+def _set_display_timezone(name: str) -> bool:
+    """Point every rendered timestamp at an IANA zone (empty resets to the
+    system's local time). False when the name is not a known zone."""
+    global _display_tz
+    if not name:
+        _display_tz = None
+        return True
     try:
+        _display_tz = ZoneInfo(name)
+    except Exception:
+        return False
+    return True
+
+
+def _safe_localtime(ts_ms: int):
+    """localtime of a server timestamp (in the configured display timezone,
+    if any), or None when out of range: origin_server_ts comes off the wire,
+    and one absurd value must not crash the render."""
+    try:
+        if _display_tz is not None:
+            return datetime.fromtimestamp(ts_ms / 1000, _display_tz).timetuple()
         return time.localtime(ts_ms / 1000)
     except (OverflowError, OSError, ValueError):
         return None
@@ -344,10 +368,47 @@ def _block_art(img, max_w: int, max_h: int, dither: bool = False) -> Content:
 STALE_AFTER = 45.0
 
 
+def _set_terminal_title(app, text: str) -> None:
+    """Put text in the terminal window's own titlebar (OSC 2); Textual has
+    no API for it, so the escape goes straight to the driver. Printable
+    characters only: room names come from the homeserver and must not
+    smuggle their own escape sequences (the same worry as client._clean)."""
+    driver = getattr(app, "_driver", None)
+    if driver is None:
+        return
+    safe = "".join(ch for ch in text if ch.isprintable())[:120]
+    try:
+        driver.write(f"\x1b]2;{safe}\x07")
+    except Exception:
+        pass  # a title is cosmetic; never let it take the app down
+
+
+def _refresh_terminal_title(app, base: str | None = None) -> None:
+    """Recompute the terminal titlebar: the current page's name, prefixed
+    with the total unread count as "(N) " when the settings screen has the
+    counter on. Screens pass their base text on resume; the sync loop calls
+    with no base to update just the count in place."""
+    if base is not None:
+        app._title_base = base
+    text = getattr(app, "_title_base", "matrixcli")
+    session = getattr(app, "session", None)
+    if (
+        session is not None
+        and getattr(session, "get_setting", None) is not None
+        and session.get_setting("titlebar_unread", True)
+    ):
+        unread = session.total_unread()
+        if unread:
+            text = f"({unread}) {text}"
+    _set_terminal_title(app, text)
+
+
 class ConnStatus(Static):
     """Connectivity indicator in the footer's bottom-right corner: a green
     dot plus the age of the last successful sync, or a red "offline" marker
-    with the same age (how stale the screen is). Re-rendered on a 1s timer."""
+    with the same age (how stale the screen is). Re-rendered on a 1s timer.
+    Also vim's showcmd corner: digits of a half-typed count ("10" of "10j")
+    show here while they are pending (see VimCount)."""
 
     def on_mount(self) -> None:
         # layout=True: the text width changes as the age grows, and the
@@ -355,10 +416,13 @@ class ConnStatus(Static):
         self.set_interval(1.0, lambda: self.refresh(layout=True))
 
     def render(self) -> Text:
+        count = getattr(self.app, "pending_count", "")
+        lead = ((count + " ", "bold"),) if count else ()
         last = getattr(self.app, "last_sync_at", None)
         ok = getattr(self.app, "sync_ok", True)
         if last is None:
-            return Text("")  # still starting up; nothing meaningful to show
+            # Still starting up; only the count, if any, means anything yet.
+            return Text.assemble(*lead)
         age = max(0.0, time.monotonic() - last)
         if age < 60:
             age_str = f"{int(age)}s"
@@ -367,8 +431,8 @@ class ConnStatus(Static):
         else:
             age_str = f"{int(age // 3600)}h"
         if ok and age <= STALE_AFTER:
-            return Text.assemble(("● ", "green"), (age_str, "dim"))
-        return Text.assemble(("✗ offline ", "bold red"), (age_str, "red"))
+            return Text.assemble(*lead, ("● ", "green"), (age_str, "dim"))
+        return Text.assemble(*lead, ("✗ offline ", "bold red"), (age_str, "red"))
 
 
 class StatusFooter(Footer):
@@ -469,7 +533,45 @@ class ComposerArea(TextArea):
         self.post_message(self.Cancelled())
 
 
-class RoomScreen(Screen):
+class VimCount:
+    """Vim-style count prefix, mixed into the screens with a j/k list. Typed
+    digits accumulate (shown in the footer's right corner, like showcmd) and
+    the next motion consumes them, so "10j" moves ten rows. Any key outside
+    COUNT_KEYS drops the pending count, as vim does. Digits reach on_key
+    before any binding fires, and never while an Input/TextArea is focused
+    (it consumes them as text), so typing numbers into a draft is safe."""
+
+    COUNT_KEYS: tuple = ()
+
+    _count = ""
+
+    def on_key(self, event: textual.events.Key) -> None:
+        # A bare leading 0 is not a count in vim either.
+        if event.key.isdigit() and (self._count or event.key != "0"):
+            self._count += event.key
+            self._show_count()
+            event.stop()
+            event.prevent_default()
+        elif self._count and event.key not in self.COUNT_KEYS:
+            self._count = ""
+            self._show_count()
+
+    def _take_count(self) -> int | None:
+        """The pending count, consumed; None when none was typed."""
+        if not self._count:
+            return None
+        n = int(self._count)
+        self._count = ""
+        self._show_count()
+        return n
+
+    def _show_count(self) -> None:
+        self.app.pending_count = self._count
+        for status in self.query(ConnStatus):
+            status.refresh(layout=True)
+
+
+class RoomScreen(VimCount, Screen):
     BINDINGS = [
         ("escape", "back", "Back"),
         # Straight to the dashboard, however deep the page stack is; only
@@ -484,6 +586,19 @@ class RoomScreen(Screen):
         # message and reattaches to the live tail.
         Binding("g", "first_message", "First", show=False),
         Binding("G", "last_message", "Last", show=False),
+        # More of vim's motions: Ctrl+D/U and Ctrl+F/B page by window
+        # height, Ctrl+O/Ctrl+I walk the jumplist left behind by long jumps
+        # (g, G, :N, u, search), and "{"/"}" step between sender blocks.
+        Binding("ctrl+d", "half_page_down", "Half page down", show=False),
+        Binding("ctrl+u", "half_page_up", "Half page up", show=False),
+        Binding("ctrl+f", "page_down", "Page down", show=False),
+        Binding("ctrl+b", "page_up", "Page up", show=False),
+        Binding("ctrl+o", "jump_back", "Jump back", show=False),
+        # Most terminals send Ctrl+I as a plain Tab; bind both spellings.
+        Binding("ctrl+i", "jump_forward", "Jump forward", show=False),
+        Binding("tab", "jump_forward", "Jump forward", show=False),
+        Binding("left_curly_bracket", "prev_block", "Prev sender", show=False),
+        Binding("right_curly_bracket", "next_block", "Next sender", show=False),
         # Gated by check_action to the messages they can actually act on, so
         # the footer only offers them when there is a thread to unfold/fold.
         ("l", "expand", "Unfold thread"),
@@ -528,6 +643,12 @@ class RoomScreen(Screen):
         Binding("tilde", "ids_on", "Show: names"),
         Binding("tilde", "ids_off", "Show: ids"),
     ]
+
+    # Keys whose actions read a typed count; any other key drops it.
+    COUNT_KEYS = (
+        "j", "k", "down", "up", "g", "G",
+        "left_curly_bracket", "right_curly_bracket",
+    )
 
     def __init__(self, entry: Entry) -> None:
         super().__init__()
@@ -579,6 +700,12 @@ class RoomScreen(Screen):
         # In-flight local echoes, spliced back into every reload so a sync
         # cannot drop them before the server confirms (see _finish_send).
         self._pending: list = []
+        # Vim's jumplist: positions left behind by g/G/:N/u/search jumps,
+        # as (event_id, thread_root, was_browsing) spots. Ctrl+O walks back
+        # through them, Ctrl+I (Tab) forward; _jump_pos == len(_jumps) means
+        # we are at the newest position, past every recorded spot.
+        self._jumps: list[tuple] = []
+        self._jump_pos = 0
         # _redraw is reached from workers, this screen's own handlers, and
         # app-level sync callbacks; the lock keeps rebuilds from interleaving.
         self._redraw_lock = asyncio.Lock()
@@ -686,6 +813,10 @@ class RoomScreen(Screen):
                 continue
             messages.append(p)
         return messages
+
+    def on_screen_resume(self) -> None:
+        # The terminal window's own titlebar names the room being read.
+        _refresh_terminal_title(self.app, f"{self.entry.title} - matrixcli")
 
     async def on_mount(self) -> None:
         self.title = self.entry.title
@@ -1048,7 +1179,11 @@ class RoomScreen(Screen):
                     lambda: tl.scroll_to(y=scroll_y, animate=False)
                 )
             else:
-                self._highlight()
+                self._highlight(scroll=False)
+                # Freshly mounted rows have no geometry yet, so an immediate
+                # scroll_visible is a no-op and the old offset would survive
+                # (":1" landing mid-window); snap once layout has settled.
+                self.call_after_refresh(self._highlight)
             await self._sync_composer()
 
     def _composer_title(self) -> str:
@@ -1138,6 +1273,7 @@ class RoomScreen(Screen):
         self.run_worker(self._redraw())
 
     def action_down(self) -> None:
+        n = self._take_count() or 1  # "10j" moves ten
         if not self.messages:
             return
         if self._browse is not None and self.selected >= len(self.messages) - 1:
@@ -1147,16 +1283,17 @@ class RoomScreen(Screen):
                 self._extend_browse(), group="browse", exclusive=True
             )
             return
-        self.selected = min(self.selected + 1, len(self.messages) - 1)
+        self.selected = min(self.selected + n, len(self.messages) - 1)
         self._highlight()
 
     def action_up(self) -> None:
+        n = self._take_count() or 1  # "10k" moves ten
         if not self.messages:
             return
         if self.selected == 0:
             self._fetch_older()
             return
-        self.selected -= 1
+        self.selected = max(0, self.selected - n)
         self._highlight()
 
     # Archived history loaded per chunk: widgets are not virtualized, so
@@ -1167,7 +1304,13 @@ class RoomScreen(Screen):
         """g: jump to the room's first message. With archived history this
         detaches from the live tail and browses the archive from the very
         beginning; without any (download not started, caching off, thread
-        view) it falls back to the first loaded message."""
+        view) it falls back to the first loaded message. A count makes it
+        absolute: "10g" goes to message 10, like ":10"."""
+        n = self._take_count()
+        self._push_jump()
+        if n is not None:
+            self.run_worker(self._goto_index(n), group="browse", exclusive=True)
+            return
         if self._browse is None:
             rows = self.app.session.archive_rows(self.entry.room_id)
             if rows:
@@ -1191,12 +1334,187 @@ class RoomScreen(Screen):
 
     def action_last_message(self) -> None:
         """G: the newest message. From browse mode this reattaches to the
-        live tail; otherwise it just jumps there."""
+        live tail; otherwise it just jumps there. A count makes it vim's
+        goto-line: "10G" goes to message 10."""
+        n = self._take_count()
+        self._push_jump()
+        if n is not None:
+            self.run_worker(self._goto_index(n), group="browse", exclusive=True)
+            return
         if self._browse is not None:
             self.run_worker(self._exit_browse(), group="browse", exclusive=True)
             return
         if self.messages:
             self.selected = len(self.messages) - 1
+            self._highlight()
+
+    def goto_message(self, n: int) -> None:
+        """":N" from the command line: jump to the N-th message."""
+        self._push_jump()
+        self.run_worker(self._goto_index(n), group="browse", exclusive=True)
+
+    async def _goto_index(self, n: int) -> None:
+        """The N-th message (1-based) of everything held for this room,
+        browsing the archive as "g" does; past the end it lands on the
+        newest message and reattaches to the live tail, like "G"."""
+        rows = (
+            self._browse
+            if self._browse is not None
+            else self.app.session.archive_rows(self.entry.room_id)
+        )
+        if not rows:
+            # Nothing archived (caching off): count within what is loaded.
+            if self.messages:
+                self.selected = max(0, min(n - 1, len(self.messages) - 1))
+                self._highlight()
+            return
+        if n >= len(rows):
+            if self._browse is not None:
+                await self._exit_browse()
+            elif self.messages:
+                self.selected = len(self.messages) - 1
+                self._highlight()
+            return
+        m = rows[max(0, n - 1)]
+        await self._land_on_event(m.event_id, m.thread_root, rows)
+
+    def _push_jump(self) -> None:
+        """Remember the current position before a long jump; Ctrl+O returns
+        here. A new jump discards the forward (Ctrl+I) tail, as in vim."""
+        if not self.messages or self.selected >= len(self.messages):
+            return
+        m = self.messages[self.selected]
+        del self._jumps[self._jump_pos:]
+        if not self._jumps or self._jumps[-1][0] != m.event_id:
+            self._jumps.append(
+                (m.event_id, m.thread_root, self._browse is not None)
+            )
+        self._jump_pos = len(self._jumps)
+
+    def action_jump_back(self) -> None:
+        if self._jump_pos == 0:
+            return
+        if self._jump_pos == len(self._jumps):
+            # Leaving the newest position: record it so Ctrl+I can return.
+            if self.messages and self.selected < len(self.messages):
+                m = self.messages[self.selected]
+                if self._jumps[-1][0] != m.event_id:
+                    self._jumps.append(
+                        (m.event_id, m.thread_root, self._browse is not None)
+                    )
+        self._jump_pos -= 1
+        self.run_worker(
+            self._restore_jump(self._jumps[self._jump_pos]),
+            group="browse",
+            exclusive=True,
+        )
+
+    def action_jump_forward(self) -> None:
+        if self._jump_pos >= len(self._jumps) - 1:
+            return
+        self._jump_pos += 1
+        self.run_worker(
+            self._restore_jump(self._jumps[self._jump_pos]),
+            group="browse",
+            exclusive=True,
+        )
+
+    async def _restore_jump(self, spot: tuple) -> None:
+        event_id, thread_root, was_browsing = spot
+        if not was_browsing and self._browse is not None:
+            # The spot was on the live tail: reattach before looking for it.
+            await self._exit_browse()
+        idx = next(
+            (i for i, m in enumerate(self.messages) if m.event_id == event_id),
+            None,
+        )
+        if idx is not None:
+            self.selected = idx
+            self._highlight()
+            return
+        await self._land_on_event(event_id, thread_root)
+
+    def action_half_page_down(self) -> None:
+        self._page(0.5)
+
+    def action_half_page_up(self) -> None:
+        self._page(-0.5)
+
+    def action_page_down(self) -> None:
+        self._page(1.0)
+
+    def action_page_up(self) -> None:
+        self._page(-1.0)
+
+    def _page(self, factor: float) -> None:
+        """Ctrl+D/U/F/B: move the selection about half or a whole window.
+        Messages vary in height, so the target is resolved through widget
+        geometry rather than a fixed row count."""
+        if not self.messages or isinstance(self.focused, TextArea):
+            return
+        lines = sorted(self.query(MessageLine), key=lambda l: l.virtual_region.y)
+        current = next(
+            (l for l in lines if l.msg_index == self.selected), None
+        )
+        if current is None:
+            return
+        tl = self.query_one("#timeline", VerticalScroll)
+        delta = int(tl.container_size.height * factor)
+        target_y = current.virtual_region.y + delta
+        if delta > 0:
+            below = [l for l in lines if l.msg_index > self.selected]
+            pick = next(
+                (l for l in below if l.virtual_region.y >= target_y),
+                below[-1] if below else None,
+            )
+        else:
+            above = [l for l in lines if l.msg_index < self.selected]
+            pick = next(
+                (l for l in reversed(above) if l.virtual_region.y <= target_y),
+                above[0] if above else None,
+            )
+        if pick is None:
+            # Already at the edge: fall back to j/k, which page in more
+            # history (or the next browse chunk) when there is any.
+            (self.action_down if delta > 0 else self.action_up)()
+            return
+        self.selected = pick.msg_index
+        self._highlight()
+
+    def action_prev_block(self) -> None:
+        """"{": the start of the current sender's run of messages, then the
+        start of the run above. Vim's paragraph motion, for chat."""
+        if not self.messages:
+            return
+        i = self.selected
+        for _ in range(self._take_count() or 1):
+            if i == 0:
+                break
+            i -= 1
+            while i > 0 and self.messages[i].sender == self.messages[i - 1].sender:
+                i -= 1
+        if i != self.selected:
+            self.selected = i
+            self._highlight()
+
+    def action_next_block(self) -> None:
+        """"}": the first message of the next sender's run."""
+        if not self.messages:
+            return
+        i = self.selected
+        for _ in range(self._take_count() or 1):
+            j = i + 1
+            while (
+                j < len(self.messages)
+                and self.messages[j].sender == self.messages[j - 1].sender
+            ):
+                j += 1
+            if j >= len(self.messages):
+                i = len(self.messages) - 1
+                break
+            i = j
+        if i != self.selected:
+            self.selected = i
             self._highlight()
 
     async def _apply_browse(self, select: int) -> None:
@@ -1482,6 +1800,7 @@ class RoomScreen(Screen):
         if first_unread is None:
             self.app.notify("No unread messages.", timeout=4)
             return
+        self._push_jump()  # "u" is a jump: Ctrl+O comes back here
         self.selected = first_unread
         self._highlight()
 
@@ -1935,38 +2254,52 @@ class RoomScreen(Screen):
         )
 
     async def _jump_to_hit(self, hit, corpus: list) -> None:
-        """Land the selection on a hit the display list does not contain:
-        unfold its thread and reload; if still not visible, detach into
-        archive browse mode (as "g" does) with the window grown just far
-        enough to cover it. "G" reattaches as usual."""
-        if hit.thread_root:
-            self.expanded.add(hit.thread_root)
-        await self._reload_view(keep=hit.event_id)
+        self._push_jump()
+        await self._land_on_event(hit.event_id, hit.thread_root, corpus)
+
+    async def _land_on_event(
+        self, event_id: str, thread_root: str | None, corpus: list | None = None
+    ) -> None:
+        """Land the selection on a message the display list may not contain
+        (a search hit, a ":N" target, a jumplist spot): unfold its thread
+        and reload; if still not visible, detach into archive browse mode
+        (as "g" does) with the window grown just far enough to cover it.
+        "G" reattaches as usual."""
+        if thread_root:
+            self.expanded.add(thread_root)
+        await self._reload_view(keep=event_id)
         if (
             self.messages
             and self.selected < len(self.messages)
-            and self.messages[self.selected].event_id == hit.event_id
+            and self.messages[self.selected].event_id == event_id
         ):
             return
-        rows = self._browse or corpus
+        rows = (
+            self._browse
+            or corpus
+            or self.app.session.archive_rows(self.entry.room_id)
+        )
         pos = next(
-            (i for i, m in enumerate(rows) if m.event_id == hit.event_id), None
+            (i for i, m in enumerate(rows) if m.event_id == event_id), None
         )
         if pos is None:
             return  # gone from the snapshot being browsed: nowhere to land
-        # A bounded window ending at the hit: a deep hit in a big room must
-        # not mount thousands of rows in one go. "k" at the top grows it.
+        # A bounded window around the hit: a deep hit in a big room must not
+        # mount thousands of rows in one go, but the page below the landing
+        # spot must be filled too (":1" showing a single message until "j"
+        # extends it reads as broken). "k" at the top and "j" at the bottom
+        # grow it chunk by chunk as usual.
         self._browse = rows
-        self._browse_upto = min(len(rows), pos + 1)
-        start = max(0, self._browse_upto - self.BROWSE_CHUNK)
-        if hit.thread_root:
+        start = max(0, pos + 1 - self.BROWSE_CHUNK // 2)
+        self._browse_upto = min(len(rows), start + self.BROWSE_CHUNK)
+        if thread_root:
             # The reply renders under its root; keep the root in the window
             # even when the thread is longer than a whole chunk.
             root_pos = next(
                 (
                     i
                     for i, m in enumerate(rows)
-                    if m.event_id == hit.thread_root
+                    if m.event_id == thread_root
                 ),
                 None,
             )
@@ -1979,17 +2312,17 @@ class RoomScreen(Screen):
             return
         self.messages = messages
         idx = next(
-            (i for i, m in enumerate(messages) if m.event_id == hit.event_id),
+            (i for i, m in enumerate(messages) if m.event_id == event_id),
             None,
         )
-        if idx is None and hit.thread_root:
+        if idx is None and thread_root:
             # The reply itself cannot render (its root is missing from the
             # browsed rows); settle for the closest visible position.
             idx = next(
                 (
                     i
                     for i, m in enumerate(messages)
-                    if m.event_id == hit.thread_root
+                    if m.event_id == thread_root
                 ),
                 None,
             )
@@ -2327,11 +2660,37 @@ class ThreadScreen(RoomScreen):
         self.root = root
         self._thread_seen: tuple | None = None  # see refresh_messages
 
+    def on_screen_resume(self) -> None:
+        _refresh_terminal_title(
+            self.app, f"Thread in {self.entry.title} - matrixcli"
+        )
+
     def action_first_message(self) -> None:
         # A thread is loaded whole via /relations; "g" is a plain jump to
         # its root, never the base class's archive browse.
+        n = self._take_count()
+        self._push_jump()
+        if n is not None:
+            self.run_worker(self._goto_index(n))
+            return
         if self.messages:
             self.selected = 0
+            self._highlight()
+
+    async def _goto_index(self, n: int) -> None:
+        # The whole thread is already loaded: ":N" is a plain index jump.
+        if self.messages:
+            self.selected = max(0, min(n - 1, len(self.messages) - 1))
+            self._highlight()
+
+    async def _land_on_event(self, event_id, thread_root, corpus=None) -> None:
+        # No archive browsing inside a thread; land only on what is here.
+        idx = next(
+            (i for i, m in enumerate(self.messages) if m.event_id == event_id),
+            None,
+        )
+        if idx is not None:
+            self.selected = idx
             self._highlight()
 
     async def on_mount(self) -> None:
@@ -3055,11 +3414,112 @@ class AboutScreen(ModalScreen):
         yield Static(text, id="aboutbox")
 
 
+class SettingsScreen(ModalScreen):
+    """":settings" (or ":set"): account and app settings. The display name
+    saves to the homeserver; the email addresses are read-only (changing
+    them needs a validation mail the server may not even send, so that
+    stays in Element); the titlebar unread counter and the timezone live
+    in state.json and apply immediately on save."""
+
+    BINDINGS = [
+        ("escape", "dismiss", "Cancel"),
+        Binding("ctrl+s", "save", "Save"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        session = self.app.session
+        with Vertical(id="settingsbox"):
+            yield Label("Settings", id="settingstitle")
+            yield Label("Display name")
+            yield Input(
+                value=session.my_name or "", id="set_name", compact=True
+            )
+            yield Label("Email addresses", classes="settingslabel")
+            yield Static(Text("fetching...", style="dim"), id="set_emails")
+            with Horizontal(id="set_unread_row"):
+                yield Switch(
+                    value=bool(session.get_setting("titlebar_unread", True)),
+                    id="set_unread",
+                )
+                yield Label("Unread count in the terminal titlebar")
+            yield Label(
+                "Timezone (IANA name; empty = system)",
+                classes="settingslabel",
+            )
+            yield Input(
+                value=str(session.get_setting("timezone", "") or ""),
+                placeholder="Europe/Amsterdam",
+                id="set_tz",
+                compact=True,
+            )
+            yield Static(
+                Text("Enter or Ctrl+S saves - Esc cancels", style="dim"),
+                id="settingshint",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#set_name", Input).focus()
+        self.run_worker(self._load_emails())
+
+    async def _load_emails(self) -> None:
+        emails = await self.app.session.fetch_email_addresses()
+        if not self.is_attached:
+            return
+        if emails is None:
+            text = Text("could not fetch (offline?)", style="dim")
+        elif not emails:
+            text = Text("none on this account", style="dim")
+        else:
+            text = Text("\n".join(emails))
+        self.query_one("#set_emails", Static).update(text)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.action_save()
+
+    def action_save(self) -> None:
+        self.run_worker(self._save())
+
+    async def _save(self) -> None:
+        session = self.app.session
+        tz_name = self.query_one("#set_tz", Input).value.strip()
+        if not _set_display_timezone(tz_name):
+            self.app.notify(
+                f"Unknown timezone: {tz_name}",
+                severity="warning", timeout=4, markup=False,
+            )
+            return
+        session.set_setting("timezone", tz_name)
+        session.set_setting(
+            "titlebar_unread",
+            bool(self.query_one("#set_unread", Switch).value),
+        )
+        name = self.query_one("#set_name", Input).value.strip()
+        if name and name != session.my_name:
+            if await session.set_display_name(name):
+                session.my_name = name
+            else:
+                self.app.notify(
+                    "The server rejected the display name change.",
+                    severity="warning", timeout=4,
+                )
+                return
+        # Timestamps may now render in another zone: force-rebuild every
+        # open room (an unchanged signature would keep the old widgets).
+        for scr in self.app.screen_stack:
+            if isinstance(scr, RoomScreen):
+                scr._drawn_sig = None
+                scr.run_worker(scr._redraw())
+        _refresh_terminal_title(self.app)
+        self.app.notify("Settings saved.", timeout=3)
+        self.dismiss(None)
+
+
 class CommandScreen(ModalScreen):
     """":" anywhere outside a text editor: a one-line vim-style command
     entry docked at the bottom, dismissing with the typed command on Enter
     (None on Escape). The app interprets the result: "q!" quits
-    unconditionally, "q" closes the page like the q key."""
+    unconditionally, "q" closes the page like the q key, and a bare number
+    jumps to that message in the open room (":1" = the oldest)."""
 
     BINDINGS = [("escape", "dismiss", "Cancel")]
 
@@ -3342,7 +3802,7 @@ class LoadingScreen(Screen):
         self.query_one("#loadingsteps", Static).update(lines)
 
 
-class HomeScreen(Screen):
+class HomeScreen(VimCount, Screen):
     BINDINGS = [
         ("slash", "search", "Search"),
         # The four movement keys take one footer slot: "hjkl" reads as a unit,
@@ -3383,6 +3843,9 @@ class HomeScreen(Screen):
         ("q", "app.quit", "Quit"),
     ]
 
+    # Keys whose actions read a typed count; any other key drops it.
+    COUNT_KEYS = ("j", "k", "down", "up")
+
     # The three visual columns, each a top-to-bottom stack of lists. "j"/"k"
     # walk a whole column as if it were one list (spilling from the bottom of
     # one into the top of the next), "h"/"l" step between columns.
@@ -3406,6 +3869,7 @@ class HomeScreen(Screen):
         self.stale = False
 
     def on_screen_resume(self) -> None:
+        _refresh_terminal_title(self.app, "matrixcli")
         if self.stale:
             self.stale = False
             self.run_worker(self.refresh_data())
@@ -3730,6 +4194,9 @@ class HomeScreen(Screen):
         self.refresh_bindings()  # flip the footer label with the state
 
     def action_open_selected(self) -> None:
+        # Enter is a priority binding, so on_key never saw it: drop any
+        # half-typed count instead of carrying it into the room.
+        self._take_count()
         # The priority Enter binding bypasses the focused ListView's own
         # select action; delegate back to it (on_list_view_selected guards
         # against placeholder rows).
@@ -3769,10 +4236,14 @@ class HomeScreen(Screen):
         self.run_worker(self._toggle_favourite())
 
     def action_down(self) -> None:
-        self._step(1)
+        # Stepping one row at a time keeps the column-spilling logic in one
+        # place; the cap keeps a wild count ("999999j") from spinning.
+        for _ in range(min(self._take_count() or 1, 999)):
+            self._step(1)
 
     def action_up(self) -> None:
-        self._step(-1)
+        for _ in range(min(self._take_count() or 1, 999)):
+            self._step(-1)
 
     def _step(self, delta: int) -> None:
         lv = self._focused_list()
@@ -3957,7 +4428,21 @@ class MatrixApp(App):
        line would spill one cell onto a blank row and stripe the picture. */
     #previewart { width: auto; height: auto; text-wrap: nowrap; }
     #reactionsbox #reactors { height: auto; max-height: 20; }
-    AboutScreen, ConfirmScreen { align: center middle; }
+    AboutScreen, ConfirmScreen, SettingsScreen { align: center middle; }
+    #settingsbox {
+        width: 60%;
+        max-width: 70;
+        height: auto;
+        padding: 1 2;
+        border: round $accent;
+        background: $panel;
+    }
+    #settingstitle { text-style: bold; padding: 0 0 1 0; }
+    #settingsbox .settingslabel { padding: 1 0 0 0; }
+    #settingsbox Input { background: $boost; }
+    #set_unread_row { height: auto; padding: 1 0 0 0; align-vertical: middle; }
+    #set_unread_row Label { padding: 1 0 0 1; }
+    #settingshint { padding: 1 0 0 0; }
     #confirmbox {
         width: auto;
         max-width: 70%;
@@ -4031,6 +4516,7 @@ class MatrixApp(App):
         ):
             self.pop_screen()
 
+
     def action_command_line(self) -> None:
         def when_entered(cmd) -> None:
             if not cmd:
@@ -4044,6 +4530,19 @@ class MatrixApp(App):
                     self.exit()
                 else:
                     self.action_go_home()
+            elif cmd.isdigit():
+                # ":N" jumps to message N in the open room; past-the-end
+                # numbers land on the newest message, like "G".
+                if isinstance(self.screen, RoomScreen):
+                    self.screen.goto_message(int(cmd))
+                else:
+                    self.notify(
+                        "':<number>' jumps to a message inside a room",
+                        severity="warning", timeout=4,
+                    )
+            elif cmd in ("settings", "set"):
+                if not isinstance(self.screen, SettingsScreen):
+                    self.push_screen(SettingsScreen())
             else:
                 self.notify(
                     f"Not a command: {cmd}", severity="warning", timeout=4,
@@ -4092,6 +4591,9 @@ class MatrixApp(App):
         # the most recent sync attempt succeeded.
         self.last_sync_at: float | None = None
         self.sync_ok = True
+        # Digits of a vim count being typed, mirrored into the footer's
+        # ConnStatus corner (see VimCount).
+        self.pending_count = ""
 
     async def on_mount(self) -> None:
         await self.push_screen(LoadingScreen())
@@ -4113,6 +4615,9 @@ class MatrixApp(App):
             self.fatal = message
             self.exit()
             return
+        # The saved timezone override applies to every timestamp rendered
+        # from here on; an unknown zone name falls back to system local.
+        _set_display_timezone(str(self.session.get_setting("timezone", "") or ""))
         try:
             await self.session.initial_sync(progress=loading.set_status)
         except Exception as exc:
@@ -4180,6 +4685,7 @@ class MatrixApp(App):
                 for space_id in self.session.spaces_with_child_changes(resp):
                     await self.session.refresh_space_children(space_id)
                 self.action_refresh_home()
+                _refresh_terminal_title(self)  # unread count may have moved
                 for screen in self.screen_stack:
                     if isinstance(screen, RoomScreen):
                         # A worker, NOT call_later: refresh_messages awaits

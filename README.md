@@ -20,7 +20,10 @@ Unread counts show in yellow; rooms where you were mentioned add a red `(N!)`
 badge. Columns taller than the terminal scroll.
 
 Plus a search overlay (`/`) over all people and rooms, and a per-room view to
-read history and send messages, which updates live as messages arrive.
+read history and send messages, which updates live as messages arrive. The
+terminal window's own titlebar follows along, naming the room (or thread)
+being read and prefixing the total unread count as `(N)` (switchable in
+`:settings`).
 
 ## Install
 
@@ -107,7 +110,8 @@ On the home screen:
   active scope (as does the in-room message search, with the room's name)
 - `j` / `k` or `↓` / `↑`: move the selection down / up; `j` and `k` treat a
   column as one continuous list, so they roll on from Spaces into its Rooms,
-  and from Invites through Recent into Favourites
+  and from Invites through Recent into Favourites. A typed count repeats
+  the motion (`5j`), as in a room
 - `l` / `h` (or `tab` / `shift+tab`): move to the next / previous column,
   landing back on the list you last used there
 - `Enter`: open the selected room or DM (on a space: list its rooms; on an
@@ -134,7 +138,16 @@ On the home screen:
   palette are disabled)
 - `:`: vim-style command line (works on any page when no editor is
   focused): `:q!` quits immediately from anywhere, `:q` closes the current
-  page like the `q` key, `Esc` cancels
+  page like the `q` key, a bare number inside a room jumps to that message
+  (see the room keys below), `:settings` (or `:set`) opens the settings
+  screen, `Esc` cancels
+- `:settings`: account and app settings. Your display name (saved to the
+  homeserver), the email addresses on the account (read-only; changing them
+  needs a validation mail, so that stays in Element), whether the terminal
+  titlebar shows the total unread count, and a timezone override for every
+  displayed timestamp (an IANA name like `Europe/Amsterdam`; empty uses the
+  system zone). The last two persist in `state.json`; `Enter` or `Ctrl+S`
+  saves, `Esc` cancels
 
 Pending invitations appear in an `Invites` section (marked `✉`) above
 Favourites whenever there are any; `Enter` accepts.
@@ -146,7 +159,27 @@ In a room:
   fetches older history, all the way back to the room's first message. A dim
   `── Tue 12 Aug 2026 ──` divider marks every change of day, and reactions
   show as a dim `👍 3` line under the message they apply to. Messages that
-  mention you get a red timestamp and a red `@` marker
+  mention you get a red timestamp and a red `@` marker. A typed count
+  repeats the motion, as in vim: `10j` moves ten messages down (the pending
+  digits show in the footer's right corner, and any other key cancels them)
+- `g` / `G`: the room's first / newest message. `g` detaches from the live
+  tail and browses the downloaded archive from the very beginning (loaded a
+  chunk at a time as you move); `G` jumps to the newest message and
+  reattaches to the live tail. With a count both become vim's goto-line:
+  `10G` (or `10g`) goes to message 10, counted from the room's first
+- `:` + a number: the same jump from the command line: `:1` is the oldest
+  message, `:10000` the ten-thousandth, and a number past the end lands on
+  the newest, like `G`
+- `Ctrl+D` / `Ctrl+U`: half a window down / up; `Ctrl+F` / `Ctrl+B` a whole
+  window. Measured against what is actually on screen, so tall messages
+  count for their height
+- `{` / `}`: previous / next sender block, vim's paragraph motion for chat:
+  `{` jumps to the first message of the current speaker's run, then run by
+  run upward; `}` to the first message of the next speaker's run
+- `Ctrl+O` / `Ctrl+I` (or `Tab`): walk back / forward through the jumplist,
+  as in vim. Every long jump (`g`, `G`, `:N`, `u`, a search hit) records
+  where you were; `Ctrl+O` returns there, however deep in the archive that
+  was, and `Ctrl+I` re-runs the jump
 - `u`: jump to the first unread message; messages that arrived after you last
   opened the room sit below a red `── new ──` divider
 - `Enter`: act on what the selected message says. The bottom bar names what it

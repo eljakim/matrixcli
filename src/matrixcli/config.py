@@ -307,6 +307,7 @@ class Config:
             "room_meta",
             "space_children",
             "cache_spaces",
+            "settings",
         ):
             if not isinstance(state.get(key), dict):
                 state[key] = {}

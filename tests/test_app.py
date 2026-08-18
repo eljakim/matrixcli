@@ -25,10 +25,14 @@ from matrixcli.app import (
     _ascii_art,
     _block_art,
     _emoji_names,
+    SettingsScreen,
     _find_urls,
     _fmt_time,
     _is_image,
+    _refresh_terminal_title,
     _sender_color,
+    _set_display_timezone,
+    _set_terminal_title,
 )
 from matrixcli.client import Entry, Message
 
@@ -2385,6 +2389,367 @@ class TestBrowseHistory:
 
         # Still the 5 archived rows: the live reload did not clobber the view.
         assert self.run(steps) == {"count": 5, "browsing": True}
+
+
+class TestVimMotions:
+    """Typed counts (10j, 5G), :N jumps, {/} sender blocks, Ctrl+D paging,
+    and the Ctrl+O/Ctrl+I jumplist."""
+
+    def run(self, steps, archive_size=30, window_size=20, senders=None):
+        def sender_of(i):
+            return senders(i) if senders else "@a:hs"
+
+        rows = [
+            Message(
+                sender=sender_of(i),
+                sender_name=sender_of(i),
+                body=f"m{i}",
+                ts=1000 + i,
+                event_id=f"$a{i}",
+            )
+            for i in range(archive_size)
+        ]
+        history = rows[-window_size:]
+        session = SimpleNamespace(
+            cfg=SimpleNamespace(user_id="@me:hs"),
+            my_name="Me",
+            client=SimpleNamespace(rooms={}),
+            last_event_id={},
+            load_history=lambda room_id, limit=40, cached_only=False: _async(
+                list(history)
+            ),
+            fetch_fully_read=lambda room_id: _async(None),
+            mark_read=lambda room_id: _async(None),
+            start_backfill=lambda room_id: None,
+            reset_pagination=lambda room_id: None,
+            archive_rows=lambda room_id: list(rows),
+            archive_done={"!a:hs"},
+            drafts={},
+            reaction_summary=lambda room_id, event_id: [],
+        )
+
+        class RoomApp(App):
+            CSS = MatrixApp.CSS
+
+            def on_mount(self):
+                self.session = session
+                self.last_sync_at = None
+                self.sync_ok = True
+                self.pending_count = ""
+                return self.push_screen(RoomScreen(make_entry()))
+
+        async def go():
+            app = RoomApp()
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.pause()
+                return await steps(pilot, app.screen)
+
+        return asyncio.run(go())
+
+    def test_count_repeats_j_and_k(self):
+        async def steps(pilot, screen):
+            screen.selected = 0
+            screen._highlight()
+            await pilot.press("1", "0")
+            pending = screen.app.pending_count
+            await pilot.press("j")
+            down = screen.selected
+            await pilot.press("4", "k")
+            return pending, down, screen.selected, screen.app.pending_count
+
+        assert self.run(steps) == ("10", 10, 6, "")
+
+    def test_stray_key_cancels_a_pending_count(self):
+        async def steps(pilot, screen):
+            screen.selected = 0
+            screen._highlight()
+            # "x" is unbound: it must drop the half-typed count.
+            await pilot.press("1", "0", "x", "j")
+            return screen.selected
+
+        assert self.run(steps) == 1
+
+    def test_goto_message_number_browses_the_archive(self):
+        async def steps(pilot, screen):
+            screen.goto_message(5)
+            await pilot.pause()
+            return (
+                screen.messages[screen.selected].event_id,
+                screen._browse is not None,
+            )
+
+        # ":5" is 1-based: the fifth archived message.
+        assert self.run(steps) == ("$a4", True)
+
+    def test_goto_opens_a_window_around_the_target(self):
+        from textual.containers import VerticalScroll
+
+        async def steps(pilot, screen):
+            # Start scrolled to the live tail, as a real room opens.
+            tl = screen.query_one("#timeline", VerticalScroll)
+            screen.goto_message(1)
+            await pilot.pause()
+            await pilot.pause()  # the deferred post-layout scroll snap
+            first = (
+                screen.messages[screen.selected].event_id,
+                len(screen.messages),
+                tl.scroll_y,
+            )
+            screen.goto_message(250)
+            await pilot.pause()
+            mid = (
+                screen.messages[screen.selected].event_id,
+                screen.messages[0].event_id,
+                screen.messages[-1].event_id,
+            )
+            return first, mid
+
+        # ":1" must fill the page below the first message (a whole chunk),
+        # not show one lone row, and the view must snap to the top (the
+        # pre-jump scroll offset must not survive the rebuild); a jump
+        # outside the open window re-centers it, with context both ways.
+        first, mid = self.run(steps, archive_size=300, window_size=20)
+        assert first == ("$a0", 200, 0)
+        assert mid == ("$a249", "$a150", "$a299")
+
+    def test_goto_past_the_end_lands_on_the_newest(self):
+        async def steps(pilot, screen):
+            screen.goto_message(10_000_000_000_000)
+            await pilot.pause()
+            return (
+                screen.messages[screen.selected].event_id,
+                screen._browse is not None,
+            )
+
+        assert self.run(steps) == ("$a29", False)
+
+    def test_count_G_is_goto_and_bare_G_returns(self):
+        async def steps(pilot, screen):
+            await pilot.press("5", "G")
+            await pilot.pause()
+            at_five = screen.messages[screen.selected].event_id
+            await pilot.press("G")
+            await pilot.pause()
+            return (
+                at_five,
+                screen.messages[screen.selected].event_id,
+                screen._browse is not None,
+            )
+
+        assert self.run(steps) == ("$a4", "$a29", False)
+
+    def test_brace_motions_walk_sender_blocks(self):
+        async def steps(pilot, screen):
+            # Loaded window is $a10..$a29; blocks change every 3 messages.
+            await pilot.press("left_curly_bracket")
+            first = screen.messages[screen.selected].event_id
+            await pilot.press("left_curly_bracket")
+            second = screen.messages[screen.selected].event_id
+            await pilot.press("right_curly_bracket")
+            third = screen.messages[screen.selected].event_id
+            await pilot.press("2", "left_curly_bracket")
+            fourth = screen.messages[screen.selected].event_id
+            return first, second, third, fourth
+
+        out = self.run(steps, senders=lambda i: f"@{'ab'[(i // 3) % 2]}:hs")
+        # From $a29: block start $a27, previous block $a24, } back to $a27,
+        # then a count of 2 up to $a21.
+        assert out == ("$a27", "$a24", "$a27", "$a21")
+
+    def test_ctrl_d_and_u_page_by_window(self):
+        async def steps(pilot, screen):
+            screen.selected = 0
+            screen._highlight()
+            await pilot.press("ctrl+d")
+            down = screen.selected
+            await pilot.press("ctrl+u")
+            return down, screen.selected
+
+        down, back = self.run(steps)
+        # Half a 24-row window: several messages, and Ctrl+U undoes it.
+        assert down >= 3
+        assert back <= 1
+
+    def test_jumplist_walks_back_and_forward(self):
+        async def steps(pilot, screen):
+            await pilot.press("g")
+            await pilot.pause()
+            at_start = screen.messages[screen.selected].event_id
+            await pilot.press("ctrl+o")
+            await pilot.pause()
+            returned = (
+                screen.messages[screen.selected].event_id,
+                screen._browse is not None,
+            )
+            await pilot.press("ctrl+i")
+            await pilot.pause()
+            forward = (
+                screen.messages[screen.selected].event_id,
+                screen._browse is not None,
+            )
+            return at_start, returned, forward
+
+        assert self.run(steps) == (
+            "$a0",
+            ("$a29", False),
+            ("$a0", True),
+        )
+
+
+class TestTerminalTitle:
+    def test_writes_sanitized_osc2(self):
+        writes = []
+        app = SimpleNamespace(_driver=SimpleNamespace(write=writes.append))
+        _set_terminal_title(app, "gen\x1b]0;evil\x07eral")
+        # Control characters from a hostile room name are stripped; the rest
+        # lands inside a single OSC 2 sequence.
+        assert writes == ["\x1b]2;gen]0;evileral\x07"]
+
+    def test_no_driver_is_a_no_op(self):
+        _set_terminal_title(SimpleNamespace(), "anything")
+
+
+class TestTitlebarUnread:
+    def app(self, writes, unread, enabled=True):
+        session = SimpleNamespace(
+            get_setting=lambda key, default=None: enabled,
+            total_unread=lambda: unread,
+        )
+        return SimpleNamespace(
+            _driver=SimpleNamespace(write=writes.append), session=session
+        )
+
+    def test_counter_prefixes_the_base_title(self):
+        writes = []
+        _refresh_terminal_title(self.app(writes, 3), "general - matrixcli")
+        assert writes == ["\x1b]2;(3) general - matrixcli\x07"]
+
+    def test_zero_unread_shows_no_counter(self):
+        writes = []
+        _refresh_terminal_title(self.app(writes, 0), "general - matrixcli")
+        assert writes == ["\x1b]2;general - matrixcli\x07"]
+
+    def test_setting_off_shows_no_counter(self):
+        writes = []
+        _refresh_terminal_title(
+            self.app(writes, 3, enabled=False), "general - matrixcli"
+        )
+        assert writes == ["\x1b]2;general - matrixcli\x07"]
+
+    def test_sync_refresh_reuses_the_last_base(self):
+        writes = []
+        app = self.app(writes, 0)
+        _refresh_terminal_title(app, "general - matrixcli")
+        app.session.total_unread = lambda: 7
+        # The sync loop passes no base: only the count is recomputed.
+        _refresh_terminal_title(app)
+        assert writes[-1] == "\x1b]2;(7) general - matrixcli\x07"
+
+
+class TestDisplayTimezone:
+    def test_override_applies_to_rendered_times(self):
+        try:
+            assert _set_display_timezone("UTC") is True
+            assert _fmt_time(12 * 3600 * 1000) == "12:00"
+            assert _set_display_timezone("Asia/Tokyo") is True
+            assert _fmt_time(12 * 3600 * 1000) == "21:00"
+        finally:
+            _set_display_timezone("")
+
+    def test_unknown_zone_is_rejected_and_keeps_the_old_one(self):
+        try:
+            _set_display_timezone("UTC")
+            assert _set_display_timezone("Not/AZone") is False
+            assert _fmt_time(12 * 3600 * 1000) == "12:00"
+        finally:
+            _set_display_timezone("")
+
+
+class TestSettingsScreen:
+    def run(self, steps, emails=None, set_name_ok=True):
+        calls = {"set": [], "name": []}
+
+        def set_display_name(name):
+            calls["name"].append(name)
+            return _async(set_name_ok)
+
+        session = SimpleNamespace(
+            cfg=SimpleNamespace(user_id="@me:hs"),
+            my_name="Old Name",
+            get_setting=lambda key, default=None: default,
+            set_setting=lambda key, value: calls["set"].append((key, value)),
+            fetch_email_addresses=lambda: _async(emails),
+            set_display_name=set_display_name,
+            total_unread=lambda: 0,
+        )
+
+        class SettingsApp(App):
+            CSS = MatrixApp.CSS
+
+            def on_mount(self):
+                self.session = session
+                return self.push_screen(SettingsScreen())
+
+        async def go():
+            app = SettingsApp()
+            async with app.run_test(size=(80, 30)) as pilot:
+                await pilot.pause()
+                try:
+                    return await steps(pilot, app)
+                finally:
+                    _set_display_timezone("")
+
+        return asyncio.run(go()), calls
+
+    def test_save_persists_toggle_and_timezone_and_closes(self):
+        async def steps(pilot, app):
+            from textual.widgets import Input, Switch
+
+            app.screen.query_one("#set_tz", Input).value = "UTC"
+            app.screen.query_one("#set_unread", Switch).value = False
+            await pilot.press("enter")
+            await pilot.pause()
+            return isinstance(app.screen, SettingsScreen)
+
+        still_open, calls = self.run(steps)
+        assert still_open is False
+        assert ("timezone", "UTC") in calls["set"]
+        assert ("titlebar_unread", False) in calls["set"]
+        assert calls["name"] == []  # unchanged name: no server call
+
+    def test_unknown_timezone_keeps_the_screen_open(self):
+        async def steps(pilot, app):
+            from textual.widgets import Input
+
+            app.screen.query_one("#set_tz", Input).value = "Nope/Nope"
+            await pilot.press("enter")
+            await pilot.pause()
+            return isinstance(app.screen, SettingsScreen)
+
+        still_open, calls = self.run(steps)
+        assert still_open is True
+        assert calls["set"] == []
+
+    def test_display_name_change_hits_the_server(self):
+        async def steps(pilot, app):
+            from textual.widgets import Input
+
+            app.screen.query_one("#set_name", Input).value = "New Name"
+            await pilot.press("enter")
+            await pilot.pause()
+            return app.session.my_name
+
+        my_name, calls = self.run(steps)
+        assert calls["name"] == ["New Name"]
+        assert my_name == "New Name"
+
+    def test_emails_are_listed_read_only(self):
+        async def steps(pilot, app):
+            await pilot.pause()
+            return str(app.screen.query_one("#set_emails", Static).render())
+
+        text, _ = self.run(steps, emails=["a@x.org", "b@y.org"])
+        assert "a@x.org" in text and "b@y.org" in text
 
 
 class TestImagePreview:

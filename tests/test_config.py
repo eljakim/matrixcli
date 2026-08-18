@@ -88,6 +88,7 @@ class TestState:
             "room_meta": {},
             "space_children": {},
             "cache_spaces": {},
+            "settings": {},
         }
 
     def test_roundtrip(self, cfg):
@@ -99,7 +100,7 @@ class TestState:
             "selected_space": "!s:hs",
         }
         cfg.save_state(state)
-        assert cfg.load_state() == {**state, "cache_spaces": {}}
+        assert cfg.load_state() == {**state, "cache_spaces": {}, "settings": {}}
         assert not list(cfg.state_path.parent.glob("*.tmp"))
 
     def test_corrupt_file_falls_back_to_defaults(self, cfg):
@@ -110,6 +111,7 @@ class TestState:
             "room_meta": {},
             "space_children": {},
             "cache_spaces": {},
+            "settings": {},
         }
 
     def test_non_dict_json_falls_back_to_defaults(self, cfg):
@@ -120,6 +122,7 @@ class TestState:
             "room_meta": {},
             "space_children": {},
             "cache_spaces": {},
+            "settings": {},
         }
 
     def test_missing_keys_are_added(self, cfg):

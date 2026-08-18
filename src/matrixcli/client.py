@@ -43,6 +43,7 @@ from nio import (
     MegolmEvent,
     MessageDirection,
     PresenceEvent,
+    ProfileSetDisplayNameResponse,
     ReactionEvent,
     RedactedEvent,
     RedactionEvent,
@@ -3502,6 +3503,58 @@ class MatrixSession:
         if room is not None:
             room.fully_read_marker = event_id
         return event_id
+
+    def total_unread(self) -> int:
+        """Unread notifications summed across every joined room (spaces
+        carry none), for the terminal titlebar counter."""
+        return sum(
+            room.unread_notifications or 0
+            for room in self.client.rooms.values()
+        )
+
+    def get_setting(self, key: str, default=None):
+        """One in-app setting (the settings screen's fields), from the
+        "settings" dict in state.json."""
+        return (self.state.get("settings") or {}).get(key, default)
+
+    def set_setting(self, key: str, value) -> None:
+        self.state.setdefault("settings", {})[key] = value
+        self.cfg.save_state(self.state)
+
+    async def set_display_name(self, name: str) -> bool:
+        """PUT the account's global display name; True on success."""
+        try:
+            resp = await self.client.set_displayname(name)
+        except Exception:
+            return False
+        return isinstance(resp, ProfileSetDisplayNameResponse)
+
+    async def fetch_email_addresses(self) -> list[str] | None:
+        """The account's email 3PIDs via GET /account/3pid (nio has no API
+        for it). None means the fetch failed; [] means none are bound."""
+        url = f"{self.cfg.homeserver}/_matrix/client/v3/account/3pid"
+        headers = {"Authorization": f"Bearer {self.client.access_token}"}
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    url, headers=headers, allow_redirects=False
+                ) as r:
+                    if r.status != 200:
+                        return None
+                    data = await r.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return None
+        pids = data.get("threepids") if isinstance(data, dict) else None
+        if not isinstance(pids, list):
+            return None
+        return [
+            str(p["address"])
+            for p in pids
+            if isinstance(p, dict)
+            and p.get("medium") == "email"
+            and p.get("address")
+        ]
 
     async def mark_read(self, room_id: str) -> None:
         """Move the room's read marker to its latest event. Called after

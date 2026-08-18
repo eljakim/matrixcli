@@ -3594,3 +3594,56 @@ class TestArchivePreservation:
         assert "!a:hs" in session._archive_dirty
 
 
+
+class TestAccountSettings:
+    def test_total_unread_sums_every_room(self, session, fake_room):
+        session.client.rooms.update(
+            {
+                "!a:hs": fake_room("!a:hs", unread=2),
+                "!b:hs": fake_room("!b:hs", unread=3),
+                "!quiet:hs": fake_room("!quiet:hs"),
+            }
+        )
+        assert session.total_unread() == 5
+
+    def test_settings_roundtrip_persists_to_state(self, session, cfg):
+        assert session.get_setting("titlebar_unread", True) is True
+        session.set_setting("titlebar_unread", False)
+        session.set_setting("timezone", "UTC")
+        assert session.get_setting("titlebar_unread") is False
+        assert cfg.load_state()["settings"] == {
+            "titlebar_unread": False,
+            "timezone": "UTC",
+        }
+
+    def test_fetch_email_addresses_keeps_only_emails(self, session, monkeypatch):
+        fake = TestRefreshSpaceChildren.FakeHttp(
+            {
+                "threepids": [
+                    {"medium": "email", "address": "a@x.org"},
+                    {"medium": "msisdn", "address": "+31600000000"},
+                    {"medium": "email", "address": "b@y.org"},
+                    "junk",
+                ]
+            }
+        )
+        monkeypatch.setattr(
+            "matrixcli.client.aiohttp.ClientSession", lambda **kw: fake
+        )
+        assert asyncio.run(session.fetch_email_addresses()) == [
+            "a@x.org",
+            "b@y.org",
+        ]
+        assert fake.urls == [
+            "https://example.org/_matrix/client/v3/account/3pid"
+        ]
+
+    def test_fetch_email_addresses_offline_returns_none(
+        self, session, monkeypatch
+    ):
+        class Boom:
+            def __init__(self, **kw):
+                raise aiohttp.ClientError("no network")
+
+        monkeypatch.setattr("matrixcli.client.aiohttp.ClientSession", Boom)
+        assert asyncio.run(session.fetch_email_addresses()) is None
