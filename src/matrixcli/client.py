@@ -457,6 +457,8 @@ class MatrixSession:
         # nicety and must never compete with itself for a loaded homeserver.
         self._backfill_gate = asyncio.Semaphore(1)
         self._backfill_tasks: dict[str, asyncio.Task] = {}
+        # Room whose walk currently holds the gate, for the sync-all popup.
+        self.backfill_active: str | None = None
         # Image-preview bytes by mxc url, so j/k and reopened previews never
         # refetch this session; bounded FIFO (thumbnails are ~50 KB each).
         # The encrypted on-disk layer (cfg.save_media_cache) persists them
@@ -2873,6 +2875,8 @@ class MatrixSession:
 
         def reap(task: asyncio.Task) -> None:
             self._backfill_tasks.pop(room_id, None)
+            if self.backfill_active == room_id:
+                self.backfill_active = None
             if not task.cancelled():
                 task.exception()  # retrieve it, or asyncio logs a warning
 
@@ -2902,6 +2906,23 @@ class MatrixSession:
             self.start_backfill(e.room_id)
         return pending
 
+    def backfill_remaining(self) -> int:
+        """Rooms with a history walk still queued or running, so the
+        sync-all popup can show progress."""
+        return len(self._backfill_tasks)
+
+    def cancel_backfills(self) -> None:
+        """Stop every queued or running history walk (Escape in the
+        sync-all popup). Nothing is lost: each room resumes from its
+        persisted token the next time it opens or the next full sync."""
+        for task in list(self._backfill_tasks.values()):
+            task.cancel()
+
+    def room_title(self, room_id: str) -> str:
+        """A room's display name as the dashboard would show it."""
+        room = self.client.rooms.get(room_id)
+        return _clean(getattr(room, "display_name", "")) or room_id
+
     async def _backfill(self, room_id: str) -> None:
         """Walk /messages backwards until the room's first event is reached,
         filling the archive. Everything _to_message yields is kept: normal
@@ -2914,6 +2935,7 @@ class MatrixSession:
         below that point is known contiguous, so an already-done room stops
         there instead of re-fetching its entire history."""
         async with self._backfill_gate:
+            self.backfill_active = room_id
             arch = self.archives.setdefault(room_id, {})
             recover = room_id in self.archive_stale and room_id in self.archive_done
             start = "" if room_id in self.archive_stale else (

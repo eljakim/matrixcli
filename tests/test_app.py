@@ -21,6 +21,7 @@ from matrixcli.app import (
     PreviewScreen,
     ReactionsScreen,
     RoomScreen,
+    SyncAllScreen,
     ThreadScreen,
     _ascii_art,
     _block_art,
@@ -1929,10 +1930,9 @@ class TestHomeKeys:
         # in a room outside the scope.
         assert asyncio.run(run()) == [("MessageHitItem", "$in")]
 
-    def test_sync_all_starts_the_backfill_for_every_room(self):
+    def _sync_all_session(self, calls, remaining):
         data = self.dashboard()
-        calls = []
-        session = SimpleNamespace(
+        return SimpleNamespace(
             cfg=SimpleNamespace(
                 user_id="@me:hs",
                 save_state=lambda state: None,
@@ -1942,8 +1942,17 @@ class TestHomeKeys:
             dashboard=lambda selected_space: data,
             space_cache_enabled=lambda space_id: True,
             section_rows=lambda section: 5,
-            backfill_all=lambda: calls.append(True) or 3,
+            backfill_all=lambda: calls.append("start") or len(remaining),
+            backfill_remaining=lambda: len(remaining),
+            backfill_active="!a:hs",
+            archives={"!a:hs": {"$1": object(), "$2": object()}},
+            room_title=lambda rid: "Room A",
+            cancel_backfills=lambda: calls.append("cancel"),
         )
+
+    def test_sync_all_opens_the_progress_popup_and_escape_stops_it(self):
+        calls = []
+        session = self._sync_all_session(calls, remaining=["!a:hs", "!b:hs"])
 
         class HomeApp(App):
             def on_mount(self):
@@ -1955,9 +1964,40 @@ class TestHomeKeys:
             async with app.run_test() as pilot:
                 await pilot.press("S")
                 await pilot.pause()
+                assert isinstance(app.screen, SyncAllScreen)
+                status = str(app.screen.query_one("#syncstatus").render())
+                assert "Room A" in status
+                assert "1 of 2" in status
+                await pilot.press("escape")
+                await pilot.pause()
+                assert isinstance(app.screen, HomeScreen)
             return calls
 
-        assert asyncio.run(run()) == [True]
+        assert asyncio.run(run()) == ["start", "cancel"]
+
+    def test_sync_all_popup_shows_completed_and_any_key_closes(self):
+        calls = []
+        session = self._sync_all_session(calls, remaining=[])
+
+        class HomeApp(App):
+            def on_mount(self):
+                self.session = session
+                return self.push_screen(HomeScreen())
+
+        async def run():
+            app = HomeApp()
+            async with app.run_test() as pilot:
+                await pilot.press("S")
+                await pilot.pause()
+                assert isinstance(app.screen, SyncAllScreen)
+                status = str(app.screen.query_one("#syncstatus").render())
+                assert "already fully downloaded" in status
+                await pilot.press("x")
+                await pilot.pause()
+                assert isinstance(app.screen, HomeScreen)
+            return calls
+
+        assert asyncio.run(run()) == ["start"]
 
     def test_h_returns_to_the_row_you_left_the_column_on(self):
         # Down to Favourites, out to DMs and back: Favourites, not the top.

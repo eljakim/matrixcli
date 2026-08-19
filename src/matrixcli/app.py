@@ -3414,6 +3414,81 @@ class AboutScreen(ModalScreen):
         yield Static(text, id="aboutbox")
 
 
+class SyncAllScreen(ModalScreen):
+    """"S" on the dashboard: downloads every room's full history, showing
+    which room is being walked and how far along the whole run is. Escape
+    stops the download and closes; once the last room finishes the box says
+    Completed and any key closes it. The dashboard stays live underneath
+    (action_refresh_home refreshes it behind this popup)."""
+
+    BINDINGS = [("escape", "close", "Stop")]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._total = 0
+        self._done = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="syncbox"):
+            yield Label("Full sync", id="synctitle")
+            yield Static("", id="syncstatus")
+            yield Static("", id="synchint")
+
+    def on_mount(self) -> None:
+        # Count from the task table, not backfill_all's return: a walk a
+        # room screen started earlier is still part of this run.
+        session = self.app.session
+        session.backfill_all()
+        self._total = session.backfill_remaining()
+        self._timer = self.set_interval(0.5, self._tick)
+        self._tick()
+
+    def _tick(self) -> None:
+        session = self.app.session
+        remaining = session.backfill_remaining()
+        status = self.query_one("#syncstatus", Static)
+        hint = self.query_one("#synchint", Static)
+        if remaining == 0:
+            self._done = True
+            self._timer.stop()
+            status.update(
+                Text(
+                    "Completed"
+                    if self._total
+                    else "Every room's history was already fully downloaded.",
+                    style="bold",
+                )
+            )
+            hint.update(Text("Press any key to close.", style="dim"))
+            return
+        text = Text()
+        current = max(1, self._total - remaining + 1)
+        text.append(f"Downloading room {current} of {self._total}\n\n")
+        rid = session.backfill_active
+        if rid:
+            text.append(session.room_title(rid), style="bold")
+            text.append(
+                f"\n{len(session.archives.get(rid, {}))} messages archived",
+                style="dim",
+            )
+        else:
+            text.append("Waiting for the next room...", style="dim")
+        status.update(text)
+        hint.update(Text("Esc stops the sync and closes.", style="dim"))
+
+    def on_key(self, event: textual.events.Key) -> None:
+        # Completed: any key closes (Escape included, before its binding).
+        if self._done:
+            event.stop()
+            event.prevent_default()
+            if self.is_current:
+                self.dismiss()
+
+    def action_close(self) -> None:
+        self.app.session.cancel_backfills()
+        self.dismiss()
+
+
 class SettingsScreen(ModalScreen):
     """":settings" (or ":set"): account and app settings. The display name
     saves to the homeserver; the email addresses are read-only (changing
@@ -4215,19 +4290,9 @@ class HomeScreen(VimCount, Screen):
     def action_sync_all(self) -> None:
         """"S": start the full-history download for every room at once, so
         the local caches (and the global message search) end up covering
-        everything without opening each room by hand."""
-        n = self.app.session.backfill_all()
-        if n:
-            self.app.notify(
-                f"Downloading full history for {n} room"
-                + ("s" if n != 1 else "")
-                + " in the background.",
-                timeout=4,
-            )
-        else:
-            self.app.notify(
-                "Every room's history is already fully downloaded.", timeout=4
-            )
+        everything without opening each room by hand. The popup starts the
+        run, shows its progress, and Escape there stops it."""
+        self.app.push_screen(SyncAllScreen())
 
     def action_favourite_add(self) -> None:
         self.run_worker(self._toggle_favourite())
@@ -4428,7 +4493,19 @@ class MatrixApp(App):
        line would spill one cell onto a blank row and stripe the picture. */
     #previewart { width: auto; height: auto; text-wrap: nowrap; }
     #reactionsbox #reactors { height: auto; max-height: 20; }
-    AboutScreen, ConfirmScreen, SettingsScreen { align: center middle; }
+    AboutScreen, ConfirmScreen, SettingsScreen, SyncAllScreen {
+        align: center middle;
+    }
+    #syncbox {
+        width: 60;
+        max-width: 80%;
+        height: auto;
+        padding: 1 2;
+        border: round $accent;
+        background: $panel;
+    }
+    #synctitle { text-style: bold; padding: 0 0 1 0; }
+    #synchint { padding: 1 0 0 0; }
     #settingsbox {
         width: 60%;
         max-width: 70;
@@ -4779,8 +4856,9 @@ class MatrixApp(App):
             if isinstance(screen, HomeScreen):
                 # Rebuilding costs real time and at peak the counts change
                 # on nearly every sync; while a room covers the dashboard,
-                # note the staleness and rebuild once on resume.
-                if screen is self.screen:
+                # note the staleness and rebuild once on resume. The sync-all
+                # popup is see-through, so the dashboard stays live under it.
+                if screen is self.screen or isinstance(self.screen, SyncAllScreen):
                     self.call_later(screen.refresh_data)
                 else:
                     screen.stale = True
