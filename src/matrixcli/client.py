@@ -26,6 +26,11 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 _verify_log = logging.getLogger("matrixcli.verify")
+# NullHandler so a swallowed-callback report never reaches logging's
+# lastResort stderr handler and paints over the running TUI. The verify log
+# attaches its own FileHandler to the child logger, so it is unaffected.
+_log = logging.getLogger("matrixcli")
+_log.addHandler(logging.NullHandler())
 
 import aiohttp
 
@@ -73,6 +78,12 @@ MIN_SECTION_ROWS = 5
 # Minimum seconds between read-marker POSTs per room (see mark_read): a busy
 # open room refreshes every sync tick, and marking each tick spams the server.
 MARK_READ_INTERVAL = 2.0
+
+# A room's archive file is rewritten whole, so a 100k-message room costs tens
+# of MB of JSON + AES-GCM per save. Once its backfill is done the only thing
+# that dirties it is new head messages, which the main cache's live window
+# also holds and re-folds in at the next save, so those rewrites can wait.
+ARCHIVE_SAVE_INTERVAL = 600.0
 # Prefix of the placeholders _to_message renders for undecryptable messages;
 # edit folding checks it so an unreadable edit never displaces readable text.
 UNDECRYPTABLE = "[encrypted"
@@ -90,11 +101,14 @@ _UNSAFE_RE = re.compile(
 )
 
 
-def _clean(text: str | None) -> str:
+def _clean(text) -> str:
     """Strip terminal-control and bidi-override characters from an untrusted
-    server string before it can reach the renderer."""
-    if not text:
-        return text or ""
+    server string before it can reach the renderer. Anything that is not a
+    string reads as "": nio schema-checks only some content fields, so a
+    hostile event can carry an int or a dict where the spec says string, and
+    re.sub would raise TypeError out of a sync callback."""
+    if not isinstance(text, str) or not text:
+        return ""
     return _UNSAFE_RE.sub("", text)
 
 
@@ -173,13 +187,25 @@ def _media_info(event) -> dict:
     the event content; it is captured here so download can decrypt."""
     if not isinstance(event, (RoomMessageMedia, RoomEncryptedMedia)):
         return {}
-    content = (getattr(event, "source", {}) or {}).get("content", {}) or {}
-    info = content.get("info") or {}
+    source = getattr(event, "source", {}) or {}
+    content = source.get("content") if isinstance(source, dict) else None
+    content = content if isinstance(content, dict) else {}
+    info = content.get("info")
+    info = info if isinstance(info, dict) else {}
+    # nio schema-checks url and body on media events but nothing under info,
+    # so size/mimetype/filename are whatever the sender put there. A string
+    # size reaches _fmt_size during the timeline render, where it raises.
+    size = info.get("size", 0)
+    if not isinstance(size, int) or isinstance(size, bool):
+        size = 0
+    name = content.get("filename")
+    if not isinstance(name, str) or not name:
+        name = getattr(event, "body", "") or ""
     out = {
         "media_url": event.url or "",
-        "media_name": _clean(content.get("filename") or getattr(event, "body", "") or ""),
-        "media_size": info.get("size", 0) or 0,
-        "media_mime": _clean(info.get("mimetype") or ""),
+        "media_name": _clean(name),
+        "media_size": size,
+        "media_mime": _clean(info.get("mimetype")),
     }
     if isinstance(event, RoomEncryptedMedia):
         out["media_crypt"] = {
@@ -203,8 +229,11 @@ def _thread_info(event) -> tuple[str, int]:
     root = ""
     if isinstance(relates, dict) and relates.get("rel_type") == "m.thread":
         root = relates.get("event_id") or ""
-    unsigned = src.get("unsigned", {}) or {}
-    relations = unsigned.get("m.relations") or {}
+    # nio's megolm-decrypted schema constrains only type and content, so
+    # unsigned is whatever the sender put there; .get on a str would raise
+    # straight out of the sync callback and abort the whole batch.
+    unsigned = src.get("unsigned")
+    relations = unsigned.get("m.relations") if isinstance(unsigned, dict) else None
     thread = relations.get("m.thread") if isinstance(relations, dict) else None
     count = thread.get("count", 0) or 0 if isinstance(thread, dict) else 0
     return root, count
@@ -249,12 +278,15 @@ def _edit_body(event, fallback: str) -> str:
     src = getattr(event, "source", {}) or {}
     new_content = (src.get("content", {}) or {}).get("m.new_content") or {}
     body = new_content.get("body") if isinstance(new_content, dict) else None
-    if body:
+    if isinstance(body, str) and body:
         return body
     return fallback[2:] if fallback.startswith("* ") else fallback
 
 
-_REPLY_FALLBACK_RE = re.compile(r"<(@[^:>]+:[^>]+)> ?(.*)")
+# Anchored, and every quantifier bounded. An unanchored search with an
+# unbounded [^:>]+ is retried at every offset, so a body of "<@a:" x 16000
+# costs seconds of blocking CPU on the sync loop before failing to match.
+_REPLY_FALLBACK_RE = re.compile(r">\s*<(@[^:>\s]{1,255}:[^>\s]{1,255})>\s?(.*)")
 
 
 def _reply_target(event) -> str:
@@ -292,7 +324,7 @@ def _strip_reply_fallback(body: str) -> tuple[str, str, str]:
         # Nothing but the quote block: the fallback assumption failed, keep
         # the text rather than render an empty message.
         return body, "", ""
-    match = _REPLY_FALLBACK_RE.search(lines[0])
+    match = _REPLY_FALLBACK_RE.match(lines[0])
     sender = match.group(1) if match else ""
     snippet = (match.group(2) if match else lines[0].lstrip("> ")).strip()
     if not snippet and i > 1:
@@ -446,10 +478,16 @@ class MatrixSession:
         self.archive_tokens: dict[str, str] = {}
         self.archive_done: set[str] = set()
         self.archive_stale: set[str] = set()
+        # Rooms present in client.rooms only because _ensure_room registered a
+        # bare MatrixRoom for them. Their unread/highlight counters are nio
+        # defaults (0), not server truth, so the dashboard must keep serving
+        # those two fields from the persisted snapshot until a real sync lands.
+        self._placeholder_rooms: set[str] = set()
         # Rooms whose archive moved past its on-disk file (one encrypted file
         # per room, see Config.save_room_archive); only these are rewritten
         # on a save, so a quiet save never re-serializes every big room.
         self._archive_dirty: set[str] = set()
+        self._archive_saved_at: dict[str, float] = {}
         # How many archive rows load_older has served this visit, per room,
         # counted from the newest end; reset when the room screen reopens.
         self._archive_served: dict[str, int] = {}
@@ -492,9 +530,27 @@ class MatrixSession:
             store_path=str(self.cfg.store_path),
             config=client_config,
         )
-        self.client.add_event_callback(self._on_message, RoomMessage)
-        self.client.add_event_callback(self._on_reaction, ReactionEvent)
-        self.client.add_event_callback(self._on_redaction, RedactionEvent)
+        # Guarded: nio dispatches event callbacks with no try/except and sets
+        # next_batch *before* running them, so one raise discards every
+        # remaining event in that sync response permanently, including the
+        # timeline.limited flag _record_room_timestamps needs to notice the
+        # cache gap it just created.
+        def guarded(callback):
+            async def run(room, event) -> None:
+                try:
+                    await callback(room, event)
+                except Exception:
+                    _log.exception(
+                        "dropping unhandled event %s",
+                        getattr(event, "event_id", ""),
+                    )
+            return run
+
+        self.client.add_event_callback(guarded(self._on_message), RoomMessage)
+        self.client.add_event_callback(guarded(self._on_reaction), ReactionEvent)
+        self.client.add_event_callback(
+            guarded(self._on_redaction), RedactionEvent
+        )
         self.client.add_room_account_data_callback(self._on_tags, TagEvent)
         self.client.add_presence_callback(self._on_presence, PresenceEvent)
 
@@ -518,9 +574,10 @@ class MatrixSession:
                 if not u or isinstance(e, MegolmEvent):
                     continue  # nothing saved, or the event stayed encrypted
                 merged = dict(u)
-                merged.update(
-                    (getattr(e, "source", None) or {}).get("unsigned") or {}
-                )
+                own = (getattr(e, "source", None) or {}).get("unsigned")
+                # dict.update on a str raises ValueError, out through nio's
+                # receive_response and past load_history's network-only guard.
+                merged.update(own if isinstance(own, dict) else {})
                 e.source["unsigned"] = merged
 
         self.client._handle_messages_response = handle_messages
@@ -747,17 +804,34 @@ class MatrixSession:
         """Whether this room's messages may be persisted to disk. Global
         switch first ([cache] messages in config.ini); then any space the
         room belongs to that was toggled off in-app wins over everything
-        (privacy-first for rooms in several spaces). Spaceless rooms and DMs
-        follow the global switch alone."""
+        (privacy-first for rooms in several spaces). Membership is read from
+        both link directions, exactly as the dashboard resolves a space's
+        rooms, so "off" covers every room shown under that space. Spaceless
+        rooms and DMs follow the global switch alone."""
         if not self.cfg.cache_messages:
             return False
-        overrides = self.state.get("cache_spaces") or {}
-        for space_id, allowed in overrides.items():
-            if allowed is False and (
-                room_id == space_id
-                or room_id in self.space_children.get(space_id, ())
+        blocked = {
+            space_id
+            for space_id, allowed in (self.state.get("cache_spaces") or {}).items()
+            if allowed is False
+        }
+        if not blocked:
+            return True
+        # Every way a space can claim a room, matching what the dashboard
+        # lists under it. Checking this room's own parents (rather than
+        # scanning all rooms for a pointer at the space) keeps this O(opt-outs),
+        # which matters because _timeline_payload calls it per cached room.
+        for space_id in blocked:
+            if room_id == space_id or room_id in self.space_children.get(
+                space_id, ()
             ):
                 return False
+            space = self.client.rooms.get(space_id)
+            if room_id in (getattr(space, "children", None) or ()):
+                return False
+        room = self.client.rooms.get(room_id)
+        if blocked & set(getattr(room, "parents", None) or ()):
+            return False
         return True
 
     def space_cache_enabled(self, space_id: str) -> bool:
@@ -927,6 +1001,17 @@ class MatrixSession:
                         m = replace(old, ts=m.ts, redacted_ts=m.redacted_ts or old.redacted_ts)
                     elif m.redacted_ts and not m.body:
                         m = replace(old, redacted_ts=m.redacted_ts)
+                    elif old.edited_ts > m.edited_ts:
+                        # The archived copy carries a server-bundled edit the
+                        # live one never saw. Backfill never overwrites an
+                        # existing archive row, so letting the staler body
+                        # win here loses that edit for good.
+                        m = replace(
+                            m,
+                            body=old.body,
+                            edited_ts=old.edited_ts,
+                            original_body=old.original_body or m.original_body,
+                        )
                 if arch.get(m.event_id) != m:
                     arch[m.event_id] = m
                     self._archive_dirty.add(room_id)
@@ -981,16 +1066,34 @@ class MatrixSession:
             },
         }
 
-    def _pending_archive_writes(self) -> list[tuple[str, dict | None]]:
+    def _pending_archive_writes(
+        self, force: bool = False
+    ) -> list[tuple[str, dict | None]]:
         """What the per-room archive files need to catch up with memory:
         (room_id, payload) rewrites for dirty allowed rooms, (room_id, None)
         deletions for rooms the policy no longer allows. Untouched rooms do
-        not appear, so a save's cost scales with what changed."""
+        not appear, so a save's cost scales with what changed. A fully
+        backfilled room's rewrite is held back to ARCHIVE_SAVE_INTERVAL
+        unless ``force`` (the flush from close()); it stays dirty until then.
+        Deletions are never held back."""
         writes: list[tuple[str, dict | None]] = []
+        now = time.monotonic()
         for room_id, arch in self.archives.items():
             if not self.cache_allowed(room_id):
                 writes.append((room_id, None))
             elif room_id in self._archive_dirty and arch:
+                if (
+                    not force
+                    and room_id in self.archive_done
+                    and room_id not in self.archive_stale
+                    and now - self._archive_saved_at.get(room_id, 0.0)
+                    < ARCHIVE_SAVE_INTERVAL
+                ):
+                    # Backfill is finished for this room, so archive_tokens
+                    # and archive_done cannot drift out of step with the file
+                    # while we wait: the deferred rows are head messages the
+                    # live window carries too.
+                    continue
                 writes.append(
                     (
                         room_id,
@@ -1024,15 +1127,18 @@ class MatrixSession:
                 self.cfg.save_room_archive(room_id, room_payload)
         self.cfg.save_timeline_cache(payload)
 
-    def _save_timelines(self) -> None:
+    def _save_timelines(self, force: bool = False) -> None:
         if not self.cfg.cache_messages:
             return  # global off: nothing is ever written
         payload = self._timeline_payload()
-        writes = self._pending_archive_writes()
+        writes = self._pending_archive_writes(force)
         try:
             self._write_cache_files(payload, writes)
-        except OSError:
+        except Exception:
             return  # disk trouble: stay dirty and let a later save retry
+        for room_id, room_payload in writes:
+            if room_payload is not None:
+                self._archive_saved_at[room_id] = time.monotonic()
         self._archive_dirty.difference_update(r for r, _ in writes)
         self._cache_dirty = False
         self._cache_saved_at = time.monotonic()
@@ -1064,13 +1170,20 @@ class MatrixSession:
         async def write() -> None:
             try:
                 await asyncio.to_thread(self._write_cache_files, payload, writes)
-            except OSError:
+            except Exception:
                 # Retry on a later tick; re-dirty exactly what was pending.
+                # Catching Exception, not OSError: the dirty flags were
+                # already cleared above, so any other failure here would
+                # leave the state claiming "saved" with nothing on disk.
                 # The debounce stamp also moves forward so the recheck below
                 # cannot hot-loop against a persistently failing disk.
                 self._cache_dirty = True
                 self._archive_dirty.update(r for r, p in writes if p is not None)
                 self._cache_saved_at = time.monotonic()
+            else:
+                for room_id, room_payload in writes:
+                    if room_payload is not None:
+                        self._archive_saved_at[room_id] = time.monotonic()
             finally:
                 self._cache_saving = False
             if self._cache_dirty:
@@ -1220,7 +1333,51 @@ class MatrixSession:
             # snapshot the room right back into room_meta.
             self.client.rooms.pop(room_id, None)
             self.client.invited_rooms.pop(room_id, None)
+            # Purge the cached history too. Without this the room's decrypted
+            # messages stay in the main cache and in store/archive/<sha>.cache
+            # forever: it has no Entry any more, so it is unreachable from the
+            # dashboard and the per-space "c" opt-out can never reach it, and
+            # _restore_timelines faithfully reloads it every launch.
+            for store in (
+                self.timelines,
+                self.archives,
+                self.reactions,
+                self.last_event_id,
+                self.archive_tokens,
+            ):
+                if store.pop(room_id, None) is not None:
+                    self._cache_dirty = True
+            # Keyed by reaction event id, so it has to be filtered by room.
+            for event_id, row in list(self._reaction_events.items()):
+                if row and row[0] == room_id:
+                    del self._reaction_events[event_id]
+                    self._cache_dirty = True
+            self.gap_gen.pop(room_id, None)
+            self.archive_done.discard(room_id)
+            self.archive_stale.discard(room_id)
+            self.history_loaded.discard(room_id)
+            self._archive_dirty.discard(room_id)
+            self._placeholder_rooms.discard(room_id)
+            self._archive_saved_at.pop(room_id, None)
+            self.cfg.clear_room_archive(room_id)
+            # Drop the room both as a space (its child map) and as a child of
+            # any space still joined, so it stops being counted as "in a
+            # space" by the dashboard.
+            mirror = self.state.get("space_children") or {}
+            if self.space_children.pop(room_id, None) is not None:
+                changed = True
+            mirror.pop(room_id, None)
+            for sid, kids in self.space_children.items():
+                if room_id in kids:
+                    kids.discard(room_id)
+                    stale = mirror.get(sid)
+                    if isinstance(stale, list) and room_id in stale:
+                        stale.remove(room_id)
+                    changed = True
         for room_id, joined in rooms.items():
+            # Server truth has arrived for this room, so it is no longer a
+            # placeholder standing in for the snapshot.
+            self._placeholder_rooms.discard(room_id)
             # A "limited" timeline means the server skipped events between
             # the last sync and this window: the cache is missing a chunk,
             # so the next open must refetch instead of serving the cache.
@@ -1256,6 +1413,20 @@ class MatrixSession:
     async def close(self) -> None:
         for task in list(self._backfill_tasks.values()):
             task.cancel()
+        # Every other background task too: left pending, one mid-flight
+        # request wakes up to a closed aiohttp session after the TUI has
+        # already restored the terminal, and refresh_space_children does not
+        # catch the RuntimeError that raises, so it prints over the shell.
+        for registry in (
+            self._marker_tasks,
+            self._member_fetches,
+            self._profile_fetches,
+            self._name_fetches,
+        ):
+            for task in list(registry.values()):
+                task.cancel()
+        if self._space_refresh is not None:
+            self._space_refresh.cancel()
         # A threaded cache write may be mid-file; let it finish (or fail)
         # before the final flush, or two writers would race on the tmp file.
         # The write task can also chain a follow-up save (dirtiness that
@@ -1266,8 +1437,8 @@ class MatrixSession:
                 await self._cache_save_task
             except Exception:
                 pass
-        if self._cache_dirty:
-            self._save_timelines()
+        if self._cache_dirty or self._archive_dirty:
+            self._save_timelines(force=True)
         await self.client.close()
 
     # --- interactive SAS (emoji) device verification ----------------------
@@ -1663,6 +1834,26 @@ class MatrixSession:
         by_key.setdefault(key, set()).add(sender)
         self._reaction_events[event_id] = (room_id, target, key, sender)
 
+    def _drop_reaction_vote(
+        self, room_id: str, target: str, key: str, sender: str
+    ) -> None:
+        """Subtract one vote, and prune whatever it emptied. Without the
+        pruning every removed reaction leaves an empty sender set (and every
+        emptied message an empty dict) in the aggregate for the life of the
+        session, and each one is re-serialized into the cache on every save."""
+        by_target = self.reactions.get(room_id)
+        by_key = by_target.get(target) if by_target else None
+        senders = by_key.get(key) if by_key else None
+        if senders is None:
+            return
+        senders.discard(sender)
+        if not senders:
+            del by_key[key]
+        if not by_key:
+            del by_target[target]
+        if not by_target:
+            del self.reactions[room_id]
+
     def reaction_summary(self, room_id: str, event_id: str) -> list[tuple[str, int]]:
         """(key, count) pairs for one message, most-used first."""
         by_key = self.reactions.get(room_id, {}).get(event_id) or {}
@@ -1708,9 +1899,7 @@ class MatrixSession:
         noted = self._reaction_events.pop(event.redacts or "", None)
         if noted is not None:
             room_id, target, key, sender = noted
-            senders = self.reactions.get(room_id, {}).get(target, {}).get(key)
-            if senders is not None:
-                senders.discard(sender)
+            self._drop_reaction_vote(room_id, target, key, sender)
         timeline = self.timelines.get(room.room_id)
         for i, m in enumerate(timeline or ()):
             if m.event_id and m.event_id == event.redacts:
@@ -1973,6 +2162,17 @@ class MatrixSession:
                     e = replace(e, title=snap_title)
                 if snap.get("is_space") and not e.is_space:
                     e = replace(e, is_space=True)
+                if e.room_id in self._placeholder_rooms:
+                    # A placeholder reports 0/0 because nio never filled it
+                    # in. Taking that as live would not just show the wrong
+                    # badge: the snapshot refresh below writes it back to
+                    # state.json, losing the count for good (sync never
+                    # re-sends it for a quiet room).
+                    e = replace(
+                        e,
+                        unread=int(snap.get("unread") or 0),
+                        highlights=int(snap.get("highlights") or 0),
+                    )
                 if snap.get("is_favourite") and not (room.tags or {}):
                     e = replace(e, is_favourite=True)
             if e.person and e.title == e.person:
@@ -2126,8 +2326,11 @@ class MatrixSession:
         for sid in space_ids:
             room = self.client.rooms.get(sid)
             in_some_space |= set(getattr(room, "children", set()) or ())
-        for children in self.space_children.values():
-            in_some_space |= children
+        for sid in space_ids:
+            # Only spaces you are still in may claim a child. Unfiltered, a
+            # stale entry for a space you have left keeps hiding its former
+            # rooms from "others" while the space itself no longer shows.
+            in_some_space |= self.space_children.get(sid, set())
         for rid, room in self.client.rooms.items():
             if space_ids & (getattr(room, "parents", set()) or set()):
                 in_some_space.add(rid)
@@ -2283,6 +2486,11 @@ class MatrixSession:
         something is typed."""
         q = fold_text(query.strip())
         opened = self.state["last_opened_ts"]
+        if scope is None and not q:
+            # Hoisted above the rebuild: this runs on every keystroke in the
+            # search box, and _all_entries() is O(rooms) with a state.json
+            # write whenever an unread count moved.
+            return []
         entries = self._all_entries()
         if scope == "favourites":
             entries = [e for e in entries if e.is_favourite and not e.is_space]
@@ -2358,11 +2566,7 @@ class MatrixSession:
             noted = self._reaction_events.pop(event.event_id or "", None)
             if noted is not None:
                 noted_room, target, key, sender = noted
-                senders = (
-                    self.reactions.get(noted_room, {}).get(target, {}).get(key)
-                )
-                if senders is not None:
-                    senders.discard(sender)
+                self._drop_reaction_vote(noted_room, target, key, sender)
                 return None
             # Only a deleted *message* gets a tombstone. Removing a reaction
             # redacts an event too, and the timeline never showed that one, so
@@ -2921,7 +3125,14 @@ class MatrixSession:
     def room_title(self, room_id: str) -> str:
         """A room's display name as the dashboard would show it."""
         room = self.client.rooms.get(room_id)
-        return _clean(getattr(room, "display_name", "")) or room_id
+        name = _clean(getattr(room, "display_name", ""))
+        if not name or room_id in self._placeholder_rooms:
+            # A bare MatrixRoom has no state, so nio names it "Empty Room";
+            # the full-sync popup would label every room it downloads that.
+            snap = (self.state.get("room_meta") or {}).get(room_id)
+            if isinstance(snap, dict) and snap.get("title"):
+                return _clean(snap["title"]) or name or room_id
+        return name or room_id
 
     async def _backfill(self, room_id: str) -> None:
         """Walk /messages backwards until the room's first event is reached,
@@ -3159,6 +3370,7 @@ class MatrixSession:
                 self.cfg.user_id,
                 room_id in getattr(self.client, "encrypted_rooms", set()),
             )
+            self._placeholder_rooms.add(room_id)
 
     async def send(
         self,
@@ -3311,11 +3523,7 @@ class MatrixSession:
                 noted = self._reaction_events.pop(existing, None)
                 if noted is not None:
                     _room, tgt, k, sender = noted
-                    senders = (
-                        self.reactions.get(room_id, {}).get(tgt, {}).get(k)
-                    )
-                    if senders is not None:
-                        senders.discard(sender)
+                    self._drop_reaction_vote(room_id, tgt, k, sender)
                 self.last_event_id[room_id] = resp.event_id
                 return True, resp.event_id, False
             return False, getattr(resp, "message", "removal failed"), False
@@ -3398,6 +3606,8 @@ class MatrixSession:
             cached = self.cfg.load_media_cache(message.media_url)
         if cached is not None:
             self._media_cache[message.media_url] = cached
+            while len(self._media_cache) > 32:
+                self._media_cache.pop(next(iter(self._media_cache)))
             return True, cached
         ok, result = await self._fetch_preview_uncached(message, width, height)
         if ok and message.media_url:

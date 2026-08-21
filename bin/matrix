@@ -34,5 +34,5 @@ for arg in "$@"; do
 done
 
 # -P (not -C) points Poetry at the project while keeping the caller's working
-# directory, so the app's documented ./config.ini resolution still works.
+# directory, so relative paths passed on the command line still resolve.
 exec poetry -P "$project_dir" run matrix ${forwarded+"${forwarded[@]}"}

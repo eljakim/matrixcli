@@ -18,6 +18,7 @@ from matrixcli.app import (
     HistoryScreen,
     HomeScreen,
     MatrixApp,
+    MessageLine,
     PreviewScreen,
     ReactionsScreen,
     RoomScreen,
@@ -402,6 +403,37 @@ class TestComposerTitle:
         assert screen._composer_title() == "Reply in thread"
         screen.reply_to = self.msg(name="Dana")
         assert screen._composer_title() == "Reply to Dana: x"
+
+
+class TestComposerWordDelete:
+    """Option+Backspace deletes the word before the cursor."""
+
+    def press(self, key):
+        class ComposerApp(App):
+            def compose(self):
+                yield ComposerArea(id="c")
+
+        async def run():
+            app = ComposerApp()
+            async with app.run_test() as pilot:
+                editor = app.query_one("#c", ComposerArea)
+                editor.focus()
+                editor.text = "hello wide world"
+                editor.move_cursor(editor.document.end)
+                await pilot.press(key)
+                await pilot.pause()
+                return editor.text
+
+        return asyncio.run(run())
+
+    def test_option_backspace_on_kitty_terminals(self):
+        # Terminals speaking the kitty protocol send Option+Backspace as its
+        # own key, which TextArea does not bind by default.
+        assert self.press("alt+backspace") == "hello wide "
+
+    def test_option_backspace_elsewhere(self):
+        # Everywhere else the sequence folds onto ctrl+w.
+        assert self.press("ctrl+w") == "hello wide "
 
 
 class TestFirstUnread:
@@ -1774,6 +1806,52 @@ class TestHomeKeys:
     def test_l_and_h_step_between_columns_and_wrap(self):
         assert self.walk("lhh") == [("dms", 0), ("recent", 0), ("spaces", 0)]
 
+    def test_dms_heading_survives_focus(self):
+        # A DMs list taller than the terminal used to scroll its own column
+        # when focused, carrying the "DMs" heading off the top. The heading is
+        # docked now, so the list scrolls inside itself and the heading stays.
+        data = self.dashboard(dms=[f"Person{n}" for n in range(40)])
+        session = SimpleNamespace(
+            cfg=SimpleNamespace(
+                user_id="@me:hs",
+                save_state=lambda state: None,
+                cache_messages=True,
+            ),
+            state={},
+            dashboard=lambda selected_space: data,
+            space_cache_enabled=lambda space_id: True,
+            section_rows=lambda section: 5,
+        )
+
+        class HomeApp(App):
+            CSS = MatrixApp.CSS
+
+            def on_mount(self):
+                self.session = session
+                return self.push_screen(HomeScreen())
+
+        async def run():
+            app = HomeApp()
+            async with app.run_test(size=(100, 24)) as pilot:
+                screen = app.screen
+                dms = screen.query_one("#dms", ListView)
+                dms.focus()
+                await pilot.pause()
+                column = dms.parent
+                label = screen.query_one("#dmslabel")
+                return (
+                    column.scroll_offset.y,
+                    column.virtual_size.height <= column.size.height,
+                    label.region.y == column.region.y,
+                    dms.virtual_size.height > dms.size.height,
+                )
+
+        offset, fits, heading_on_top, list_scrolls = asyncio.run(run())
+        assert offset == 0
+        assert fits
+        assert heading_on_top
+        assert list_scrolls
+
     def test_slash_scopes_search_to_recent_and_favourites(self):
         # "/" is scoped on Recent/Favourites, global anywhere else.
 
@@ -3080,3 +3158,156 @@ class TestPreviewScreen:
 
         out = self.run(steps)
         assert out["error_shown"] is True
+
+
+class TestIncrementalRedraw:
+    """_redraw rebuilds only from the first row whose signature changed, so a
+    reaction on a recent message does not remount the whole window. Whatever
+    it produces must match what a from-scratch rebuild produces."""
+
+    DAY_MS = 24 * 3600 * 1000
+
+    def history(self):
+        # Two calendar days, so a day divider lands mid-list and the
+        # (prev sender, prev day) carry into a partial rebuild is exercised.
+        return [
+            Message(
+                sender=f"@u{i % 3}:hs",
+                sender_name=f"U{i % 3}",
+                body=f"m{i}",
+                ts=1700000000000 + (0 if i < 6 else self.DAY_MS) + i * 1000,
+                event_id=f"$m{i}",
+            )
+            for i in range(12)
+        ]
+
+    def shape(self, screen):
+        """Every mounted row as (kind, message index, rendered text, classes),
+        which is exactly what the partial rebuild has to get right."""
+        from rich.console import Console
+        from textual.containers import VerticalScroll
+
+        console = Console(width=78, no_color=True, legacy_windows=False)
+        out = []
+        for w in screen.query_one("#timeline", VerticalScroll).children:
+            with console.capture() as cap:
+                console.print(w.content)
+            out.append(
+                (
+                    "line" if isinstance(w, MessageLine) else "other",
+                    getattr(w, "msg_index", None),
+                    cap.get().rstrip(),
+                    tuple(sorted(w.classes)),
+                )
+            )
+        return out
+
+    def run(self, mutate):
+        """Draw a room, apply `mutate`, redraw incrementally, then force a
+        full rebuild of the same state; return both shapes."""
+        rows = self.history()
+        session = SimpleNamespace(
+            cfg=SimpleNamespace(user_id="@me:hs"),
+            my_name="Me",
+            client=SimpleNamespace(rooms={}),
+            last_event_id={},
+            load_history=lambda room_id, limit=40, cached_only=False: _async(
+                list(rows)
+            ),
+            fetch_fully_read=lambda room_id: _async(None),
+            mark_read=lambda room_id: _async(None),
+            start_backfill=lambda room_id: None,
+            reset_pagination=lambda room_id: None,
+            drafts={},
+            reaction_summary=lambda room_id, event_id: [],
+        )
+
+        class RoomApp(App):
+            CSS = MatrixApp.CSS
+
+            def on_mount(self):
+                self.session = session
+                self.last_sync_at = None
+                self.sync_ok = True
+                return self.push_screen(RoomScreen(make_entry()))
+
+        async def go():
+            app = RoomApp()
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.pause()
+                screen = app.screen
+                mutate(screen)
+                await screen._redraw()
+                await pilot.pause()
+                incremental = self.shape(screen)
+                screen._drawn_sig = None  # force the from-scratch path
+                await screen._redraw()
+                await pilot.pause()
+                return incremental, self.shape(screen)
+
+        return asyncio.run(go())
+
+    def check(self, mutate):
+        incremental, full = self.run(mutate)
+        assert incremental == full
+        return incremental
+
+    def test_edit_of_the_first_message(self):
+        # Divergence at index 0: the whole window is rebuilt, as before.
+        def mutate(screen):
+            screen.messages[0] = replace(
+                screen.messages[0], body="EDITED", edited_ts=99
+            )
+
+        assert any("EDITED" in row[2] for row in self.check(mutate))
+
+    def test_edit_of_a_message_after_a_day_divider(self):
+        def mutate(screen):
+            screen.messages[6] = replace(
+                screen.messages[6], body="EDITED6", edited_ts=99
+            )
+
+        assert any("EDITED6" in row[2] for row in self.check(mutate))
+
+    def test_deletion_in_the_middle(self):
+        self.check(
+            lambda screen: screen.messages.__setitem__(
+                5, replace(screen.messages[5], redacted_ts=123)
+            )
+        )
+
+    def test_messages_dropped_from_the_tail(self):
+        def mutate(screen):
+            del screen.messages[8:]
+
+        self.check(mutate)
+
+    def test_plain_tail_append(self):
+        def mutate(screen):
+            screen.messages.append(
+                Message(
+                    sender="@z:hs", sender_name="Z", body="brand new",
+                    ts=screen.messages[-1].ts + 1000, event_id="$new",
+                )
+            )
+
+        assert any("brand new" in row[2] for row in self.check(mutate))
+
+    def test_sender_change_repairs_header_suppression(self):
+        # The carry into a partial rebuild is the previous row's sender; get
+        # it wrong and the next message renders attributed to nobody.
+        def mutate(screen):
+            screen.messages[4] = replace(
+                screen.messages[4], sender="@zz:hs", sender_name="ZZ"
+            )
+
+        self.check(mutate)
+
+    def test_every_message_replaced(self):
+        def mutate(screen):
+            screen.messages[:] = [
+                replace(m, body=f"x{i}", event_id=f"$x{i}")
+                for i, m in enumerate(screen.messages)
+            ]
+
+        self.check(mutate)

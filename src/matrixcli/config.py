@@ -3,14 +3,17 @@
 Three kinds of persistence live here:
 
 * ``config.ini`` (non-secret): homeserver, user id, device name, and the paths
-  used for the crypto store and local state. Resolved from ``$MATRIXCLI_CONFIG``,
-  then ``./config.ini``, then ``~/.config/matrixcli/config.ini``.
+  used for the crypto store and local state. Resolved from ``--config``, then
+  ``$MATRIXCLI_CONFIG``, then ``~/.config/matrixcli/config.ini``. The current
+  working directory is deliberately NOT searched; see _default_config_path.
 * The system keyring (via ``keyring``: macOS Keychain, Secret Service or
   KWallet on Linux): the login password (you store this yourself before first
   run) and, after the first login, a cached access token + device id so later
   launches never need the password again.
-* ``state.json`` (non-secret): per-room "last event seen" and "last opened"
-  timestamps, used to rank the home screen's Recent, Favourites, and DMs.
+* ``state.json`` (0600, not encrypted): per-room "last event seen" and "last
+  opened" timestamps, used to rank the home screen's Recent, Favourites, and
+  DMs, plus the room titles and DM peers those rankings display. No message
+  bodies, but it is the list of who you talk to, so it is not world-readable.
 * ``store/timelines.cache``, ``store/archive/<sha256(room id)>.cache``, and
   ``store/media/<sha256(mxc url)>.cache`` (secret): the per-room message
   windows, one full-history archive file per room, and fetched image
@@ -165,7 +168,7 @@ class Config:
         # hardcoded nio default, so directory perms were the only at-rest guard.
         store_path.mkdir(mode=0o700, parents=True, exist_ok=True)
         store_path.chmod(0o700)  # tighten if it pre-existed under a looser mode
-        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
 
         # Sweep tmp files stranded by a crash between write and rename. Only
         # touch files at least an hour old: a fresh one may be another
@@ -343,7 +346,13 @@ class Config:
         # crashing this one with FileNotFoundError.
         tmp = self.state_path.with_name(f"{self.state_path.name}.{os.getpid()}.tmp")
         try:
-            tmp.write_text(json.dumps(state))
+            # 0600, not the umask default: room_meta is the full list of who
+            # you talk to (DM peers' MXIDs, room names, when you last opened
+            # each), and the parent directory may be a user-configured shared
+            # one, so the file's own mode is the only guard we control.
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                json.dump(state, fh)
             tmp.replace(self.state_path)
         except OSError:
             # This snapshot only speeds up the next launch; a failed write
