@@ -3031,6 +3031,51 @@ class TestTimelineCachePersistence:
         assert not session.timelines
         assert not cfg._timeline_cache_path.exists()
 
+    def test_close_rewrites_a_moved_sync_token(self, cfg, session, monkeypatch):
+        self.seed(session)
+        session.archives["!a:hs"] = {
+            "$1": Message(
+                sender=ALICE, sender_name="Alice", body="hello", ts=1000, event_id="$1"
+            )
+        }
+        session.archive_done.add("!a:hs")
+        session._save_timelines()
+        # An empty sync advances nio's token without dirtying anything.
+        session.client.next_batch = "later"
+        session._cache_dirty = False
+        session._archive_dirty.clear()
+
+        async def fake_close():
+            return None
+
+        monkeypatch.setattr(session.client, "close", fake_close)
+        asyncio.run(session.close())
+        assert cfg.load_timeline_cache()["next_batch"] == "later"
+        # So the next launch reads the cache as aligned: no gap bumps, and no
+        # archive marked stale, which is what puts every room back in the
+        # full-sync queue.
+        fresh = self.restored(cfg, token="later")
+        assert fresh.archives["!a:hs"]
+        assert not fresh.archive_stale
+        assert fresh.gap_gen == {}
+
+    def test_close_leaves_a_matching_token_alone(self, cfg, session, monkeypatch):
+        self.seed(session)
+        session._save_timelines()
+        session._cache_dirty = False
+        session._archive_dirty.clear()
+        written = []
+        monkeypatch.setattr(
+            cfg, "save_timeline_cache", lambda payload: written.append(payload)
+        )
+
+        async def fake_close():
+            return None
+
+        monkeypatch.setattr(session.client, "close", fake_close)
+        asyncio.run(session.close())
+        assert written == []
+
     def test_close_flushes_a_dirty_cache(self, cfg, session, monkeypatch):
         self.seed(session)
         session._cache_dirty = True
@@ -3112,6 +3157,52 @@ class TestBackfillArchive:
         assert set(session.archives["!a:hs"]) == {"$1", "$2", "$4", "$5"}
         assert "!a:hs" in session.archive_done
         assert "!a:hs" not in session.archive_stale
+
+    def test_stale_partial_walk_jumps_back_to_its_depth(self, session, fake_room):
+        session.archives["!a:hs"] = {
+            "$1": self.msg("$1", 1000),
+            "$2": self.msg("$2", 2000),
+        }
+        session.archive_tokens["!a:hs"] = "deep"
+        session.archive_stale.add("!a:hs")  # partial: stale but not done
+        calls = self.wire_pages(
+            session,
+            fake_room,
+            [
+                ([text_event("$5", ALICE, 5000, "e"), text_event("$4", ALICE, 4000, "d")], "t1"),
+                ([text_event("$2", ALICE, 2000, "b"), text_event("$1", ALICE, 1000, "a")], "t2"),
+                ([text_event("$0", ALICE, 500, "z")], None),
+            ],
+        )
+        asyncio.run(session._backfill("!a:hs"))
+        # The hole above is covered, then the walk resumes at the depth the
+        # earlier one reached instead of re-descending $2..$1 and below.
+        assert calls[1:] == ["t1", "deep"]
+        assert set(session.archives["!a:hs"]) == {"$0", "$1", "$2", "$4", "$5"}
+        assert "!a:hs" in session.archive_done
+        assert "!a:hs" not in session.archive_stale
+
+    def test_interrupted_hole_walk_keeps_the_deep_token(self, session, fake_room):
+        session.archives["!a:hs"] = {"$1": self.msg("$1", 1000)}
+        session.archive_tokens["!a:hs"] = "deep"
+        session.archive_stale.add("!a:hs")
+        session.client.rooms["!a:hs"] = fake_room("!a:hs")
+        calls = []
+
+        async def fake_room_messages(room_id, start, direction, limit):
+            calls.append(start)
+            if len(calls) == 1:
+                return SimpleNamespace(
+                    chunk=[text_event("$5", ALICE, 5000, "e")], end="t1"
+                )
+            raise aiohttp.ClientError("dropped")
+
+        session.client.room_messages = fake_room_messages
+        asyncio.run(session._backfill("!a:hs"))
+        # Interrupted above the archive: the resume depth must survive, and
+        # the room must stay stale so the next walk covers the hole again.
+        assert session.archive_tokens["!a:hs"] == "deep"
+        assert "!a:hs" in session.archive_stale
 
     def test_load_older_serves_archive_without_network(self, session):
         session.archives["!a:hs"] = {

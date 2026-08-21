@@ -21,6 +21,7 @@ import getpass
 import logging
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -3548,7 +3549,7 @@ class SyncAllScreen(ModalScreen):
         if rid:
             text.append(session.room_title(rid), style="bold")
             text.append(
-                f"\n{len(session.archives.get(rid, {}))} messages archived",
+                f"\n{len(session.archives.get(rid, {}))} messages cached",
                 style="dim",
             )
         else:
@@ -5087,6 +5088,50 @@ async def _run_verify(cfg: Config) -> None:
     print("\n" + result)
 
 
+async def _run_export_keys(cfg: Config, outfile: str) -> None:
+    """Export this device's Megolm room keys, encrypted, to FILE: the same
+    format Element's "Export E2E room keys" writes, and what --import-keys
+    reads back. Without a file like this a lost store means permanently
+    unreadable history, since matrix-nio has no server-side key backup.
+
+    The passphrase is generated, not asked for: 128 random bits beat anything
+    typed at a prompt, and there is nothing to forget while the file is being
+    written. It is printed once, at the end, and kept nowhere else."""
+    path = Path(outfile).expanduser()
+    if path.exists():
+        # A key export is not worth losing to a typo'd path.
+        raise SystemExit(f"Refusing to overwrite an existing file: {path}")
+
+    # 32 hex chars from the OS CSPRNG, dashed into groups of four so it can be
+    # read out loud or retyped without losing the place.
+    raw = secrets.token_hex(16)
+    passphrase = "-".join(raw[i : i + 4] for i in range(0, len(raw), 4))
+
+    session = MatrixSession(cfg)
+    ok, message = await session.connect()
+    print(message)
+    if not ok:
+        await session.close()
+        raise SystemExit(1)
+
+    print(f"Exporting room keys to {path} ...")
+    try:
+        await session.export_keys(str(path), passphrase)
+    except Exception as exc:
+        await session.close()
+        raise SystemExit(f"Export failed: {exc}")
+    await session.close()
+
+    size = path.stat().st_size
+    print(f"\nDone. Wrote {path} ({size} bytes, mode 600).")
+    print(f"\n  Passphrase: {passphrase}\n")
+    print(
+        "Save that now - it is stored nowhere else, and the file is useless "
+        "without it. Restore with: matrix --import-keys "
+        f"{path}"
+    )
+
+
 async def _run_import_keys(cfg: Config, infile: str) -> None:
     """Import Megolm room keys exported from another client (Element: Settings
     -> Security & Privacy -> Export E2E room keys). This is how the CLI gets
@@ -5139,6 +5184,12 @@ def main() -> None:
         help="Import Megolm room keys exported from another client (Element: "
         "Export E2E room keys) to decrypt older history.",
     )
+    parser.add_argument(
+        "--export-keys",
+        metavar="FILE",
+        help="Export this device's Megolm room keys to FILE, encrypted with a "
+        "generated passphrase that is printed once when it finishes.",
+    )
     args = parser.parse_args()
 
     try:
@@ -5178,6 +5229,10 @@ def main() -> None:
 
     if args.import_keys:
         asyncio.run(_run_import_keys(cfg, args.import_keys))
+        return
+
+    if args.export_keys:
+        asyncio.run(_run_export_keys(cfg, args.export_keys))
         return
 
     app = MatrixApp(cfg)

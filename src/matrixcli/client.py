@@ -467,6 +467,11 @@ class MatrixSession:
         self._cache_dirty = False
         self._cache_saved_at = 0.0
         self._cache_saving = False  # a threaded write is in flight
+        # The sync token the file on disk was written at. nio persists its
+        # own token on every sync response, ours only when a save runs, so
+        # close() rewrites the payload when the two drifted apart (see
+        # _restore_timelines: a mismatch marks every archive stale).
+        self._saved_next_batch = ""
         self._cache_save_task: asyncio.Task | None = None
         # Full-history archives, event id -> Message, downloaded in the
         # background and never evicted (unlike the TIMELINE_CAP'd live
@@ -777,6 +782,22 @@ class MatrixSession:
             pass
         self._new_client()
 
+    async def export_keys(self, outfile: str, passphrase: str) -> None:
+        """Write this device's Megolm room keys to an encrypted file in
+        Element's "E2E room keys" format, so either client can read the
+        other's export. The counterpart of import_keys, and the only backup
+        there is: matrix-nio has no server-side key backup, so a lost store
+        means unreadable history unless a file like this exists. Room keys
+        only, never the device's own identity keys. Raises OSError if the
+        file cannot be written."""
+        await self.client.export_keys(outfile, passphrase)
+        # nio writes through atomicwrites (temp file + rename), so the mode
+        # is the process umask's, not ours: tighten it after the fact.
+        try:
+            os.chmod(outfile, 0o600)
+        except OSError:
+            pass
+
     async def import_keys(self, infile: str, passphrase: str) -> None:
         """Import Megolm room keys from an Element 'Export E2E room keys' file.
 
@@ -893,6 +914,7 @@ class MatrixSession:
         payload = self.cfg.load_timeline_cache()
         if not payload or payload.get("user_id") != self.cfg.user_id:
             payload = {}
+        self._saved_next_batch = payload.get("next_batch") or ""
         for room_id, rows in (payload.get("timelines") or {}).items():
             if not self.cache_allowed(room_id):
                 continue  # written before a space was toggled off
@@ -1126,6 +1148,7 @@ class MatrixSession:
             else:
                 self.cfg.save_room_archive(room_id, room_payload)
         self.cfg.save_timeline_cache(payload)
+        self._saved_next_batch = payload.get("next_batch") or ""
 
     def _save_timelines(self, force: bool = False) -> None:
         if not self.cfg.cache_messages:
@@ -1439,6 +1462,20 @@ class MatrixSession:
                 pass
         if self._cache_dirty or self._archive_dirty:
             self._save_timelines(force=True)
+        elif self.cfg.cache_messages:
+            token = self.client.next_batch or self.client.loaded_sync_token or ""
+            if token and token != self._saved_next_batch:
+                # Nothing changed since the last save, but the sync token
+                # moved on (an empty sync still advances it). Rewrite just
+                # the main payload - cheap, no archive files - so the next
+                # launch sees its token and does not read the cache as
+                # misaligned, which would mark every archive stale and put
+                # every room back in the full-sync queue.
+                try:
+                    self.cfg.save_timeline_cache(self._timeline_payload())
+                    self._saved_next_batch = token
+                except Exception:
+                    pass
         await self.client.close()
 
     # --- interactive SAS (emoji) device verification ----------------------
@@ -3143,15 +3180,22 @@ class MatrixSession:
         A stale room walks from the current head instead of resuming from
         its depth token, to re-cover a possible hole at the new end; once the
         walk hits a chunk whose messages are all already archived, the room
-        below that point is known contiguous, so an already-done room stops
-        there instead of re-fetching its entire history."""
+        below that point is known contiguous. An already-done room stops
+        there; a partial one jumps back to the depth its earlier walk reached
+        instead of re-descending history it already holds."""
         async with self._backfill_gate:
             self.backfill_active = room_id
             arch = self.archives.setdefault(room_id, {})
-            recover = room_id in self.archive_stale and room_id in self.archive_done
-            start = "" if room_id in self.archive_stale else (
+            stale = room_id in self.archive_stale
+            recover = stale and room_id in self.archive_done
+            # The depth a partial archive was last walked to, held back until
+            # the hole at the new end is covered: with it in hand the walk can
+            # skip straight past the region it already has, and an interrupted
+            # recovery still finds the deep token where it left it.
+            deep = "" if recover or not stale else (
                 self.archive_tokens.get(room_id) or ""
             )
+            start = "" if stale else (self.archive_tokens.get(room_id) or "")
             if not start:
                 start = self.client.next_batch or self.client.loaded_sync_token or ""
             self._ensure_room(room_id)
@@ -3186,27 +3230,31 @@ class MatrixSession:
                     self._archive_dirty.add(room_id)
                 end = getattr(resp, "end", None)
                 # A done room's token is meaningless (there is nothing below
-                # to resume from), and a recover walk must not shrink a
-                # partial room's resume depth either, unless it IS the walk
-                # rebuilding contiguity for a stale partial archive.
-                if end and not recover:
+                # to resume from), and a walk covering a hole above a partial
+                # archive must not shrink that archive's resume depth either.
+                if end and not recover and not deep:
                     self.archive_tokens[room_id] = end
-                    # A stale partial archive is contiguous [head..token]
-                    # again the moment the head walk records a depth: an
-                    # interrupted recovery can then resume from the token
-                    # instead of starting over from the head.
                     self.archive_stale.discard(room_id)
                 if not end or not chunk:
                     self.archive_done.add(room_id)
                     self.archive_stale.discard(room_id)
                     self._maybe_save_timelines()
                     return
-                if recover and seen and not fresh:
+                if seen and not fresh:
                     # Reached already-archived territory: the hole above is
-                    # covered and everything below was contiguous already.
-                    self.archive_stale.discard(room_id)
-                    self._maybe_save_timelines()
-                    return
+                    # covered and everything below it was contiguous already.
+                    if recover:
+                        self.archive_stale.discard(room_id)
+                        self._maybe_save_timelines()
+                        return
+                    if deep:
+                        # Same, except this archive never reached the room's
+                        # start: carry on from its old depth, not from here.
+                        self.archive_stale.discard(room_id)
+                        start, deep = deep, ""
+                        self._maybe_save_timelines()
+                        await asyncio.sleep(0.5)
+                        continue
                 start = end
                 self._maybe_save_timelines()
                 await asyncio.sleep(0.5)  # be gentle with a loaded homeserver

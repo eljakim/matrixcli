@@ -310,6 +310,19 @@ bin/matrix --import-keys element-keys.txt
 Delete the export file afterwards; it contains the keys to your message
 history.
 
+It works the other way too: `--export-keys` writes this device's room keys to
+an encrypted file in the same format, so Element (or another matrixcli install)
+can read them back. There is no server-side key backup, so this file is the
+only copy that survives a lost store. The passphrase is generated rather than
+asked for, and printed once when the export finishes:
+
+```sh
+bin/matrix --export-keys ~/matrixcli-keys.txt
+```
+
+Write the passphrase down before the terminal scrolls away; it is stored
+nowhere, and the file cannot be read without it.
+
 ## Where things live
 
 | What | Where |

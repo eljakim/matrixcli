@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Run the Poetry-managed matrixcli client from any directory. Path arguments,
-# both standalone (the FILE after --import-keys or -c) and in equals form
-# (--import-keys=FILE, --config=FILE), are resolved against the current
-# working directory; other flags like --verify are passed through untouched.
+# both standalone (the FILE after --import-keys, --export-keys or -c) and in
+# equals form (--import-keys=FILE, --config=FILE), are resolved against the
+# current working directory; other flags like --verify are passed through
+# untouched.
 set -euo pipefail
 
 # Resolve this script's real location, following symlinks, so a symlink in
@@ -26,7 +27,7 @@ abspath() {
 forwarded=()
 for arg in "$@"; do
     case "$arg" in
-        --config=*|--import-keys=*)
+        --config=*|--import-keys=*|--export-keys=*)
             forwarded+=("${arg%%=*}=$(abspath "${arg#*=}")") ;;
         -*) forwarded+=("$arg") ;;
         *)  forwarded+=("$(abspath "$arg")") ;;
