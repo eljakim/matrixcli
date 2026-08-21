@@ -4,9 +4,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import aiohttp
+import pytest
 from nio.events.room_events import Event, RoomMessageText, RoomSpaceChildEvent
 
-from matrixcli.client import MatrixSession, Message, fold_edits
+from matrixcli.client import MatrixSession, Message, NeedsPassword, fold_edits
 
 ME = "@me:example.org"
 ALICE = "@alice:example.org"
@@ -2468,15 +2469,16 @@ class TestConnect:
         assert session.client is original
         assert saved == {"token": "new-tok", "device": "DEV"}
 
-    def test_rejected_token_without_password_fails_with_hint(
+    def test_rejected_token_without_password_asks_for_one(
         self, session, monkeypatch
     ):
         whoami = SimpleNamespace(status_code="M_UNKNOWN_TOKEN", message="bad")
         cleared, saved = self._prep(session, monkeypatch, whoami, password=None)
-        ok, msg = asyncio.run(session.connect())
-        assert not ok
+        # Missing credentials are not a fatal launch error: the app answers
+        # this by showing the setup screen.
+        with pytest.raises(NeedsPassword):
+            asyncio.run(session.connect())
         assert cleared
-        assert "keyring" in msg and "Store one with" in msg
 
     def test_unreadable_store_resets_and_relogins(self, session, monkeypatch):
         # restore_login (not a later load_store) is what raises when the store
@@ -2580,7 +2582,42 @@ class TestConnect:
         assert not reset_called
         assert "login failed" in msg
 
-    def test_unreadable_store_without_password_gives_clean_message(
+    def test_wrong_password_asks_again(self, session, monkeypatch):
+        from nio import LoginError
+
+        monkeypatch.setattr(
+            session.cfg, "get_password", lambda: "wrong", raising=False
+        )
+        error = LoginError("Invalid password")
+        error.status_code = "M_FORBIDDEN"
+
+        async def fake_login(password, device_name=None):
+            return error
+
+        monkeypatch.setattr(session.client, "login", fake_login)
+        with pytest.raises(NeedsPassword, match="Invalid password"):
+            asyncio.run(session.connect())
+
+    def test_other_login_errors_stay_fatal(self, session, monkeypatch):
+        from nio import LoginError
+
+        monkeypatch.setattr(
+            session.cfg, "get_password", lambda: "hunter2", raising=False
+        )
+        # Rate limiting is not something a new password fixes, so it must not
+        # send the user back to the setup screen.
+        error = LoginError("Too Many Requests")
+        error.status_code = "M_LIMIT_EXCEEDED"
+
+        async def fake_login(password, device_name=None):
+            return error
+
+        monkeypatch.setattr(session.client, "login", fake_login)
+        ok, msg = asyncio.run(session.connect())
+        assert not ok
+        assert "Too Many Requests" in msg
+
+    def test_unreadable_store_without_password_asks_for_one(
         self, session, monkeypatch
     ):
         cleared, saved = self._prep(
@@ -2590,9 +2627,77 @@ class TestConnect:
             session.client, "restore_login", lambda **kw: (_ for _ in ()).throw(Exception("MAC"))
         )
         monkeypatch.setattr(session, "_reset_store", lambda: None)
-        ok, msg = asyncio.run(session.connect())
-        assert not ok
-        assert "reset" in msg and "keyring" in msg
+        with pytest.raises(NeedsPassword, match="reset"):
+            asyncio.run(session.connect())
+
+
+class TestDiscoverHomeserver:
+    """Setup asks only for a user id; the homeserver comes from the domain's
+    .well-known, which is how @you:example.org lives on matrix.example.org."""
+
+    class FakeGet:
+        def __init__(self, payload, status=200, boom=None):
+            self.payload, self.status, self.boom = payload, status, boom
+            self.urls = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def get(self, url, **kwargs):
+            self.urls.append(url)
+            outer = self
+
+            class Ctx:
+                async def __aenter__(ctx):
+                    if outer.boom:
+                        raise outer.boom
+                    return SimpleNamespace(status=outer.status, json=outer._json)
+
+                async def __aexit__(ctx, *args):
+                    return False
+
+            return Ctx()
+
+        async def _json(self, content_type=None):
+            return self.payload
+
+    def run(self, monkeypatch, fake, user_id="@me:example.org"):
+        from matrixcli.client import discover_homeserver
+
+        monkeypatch.setattr(
+            "matrixcli.client.aiohttp.ClientSession", lambda **kw: fake
+        )
+        return asyncio.run(discover_homeserver(user_id))
+
+    def test_uses_the_published_base_url(self, monkeypatch):
+        fake = self.FakeGet({"m.homeserver": {"base_url": "https://matrix.example.org/"}})
+        assert self.run(monkeypatch, fake) == "https://matrix.example.org"
+        assert fake.urls == ["https://example.org/.well-known/matrix/client"]
+
+    def test_no_well_known_falls_back_to_the_domain(self, monkeypatch):
+        assert self.run(monkeypatch, self.FakeGet(None, status=404)) == (
+            "https://example.org"
+        )
+
+    def test_unreachable_domain_falls_back(self, monkeypatch):
+        fake = self.FakeGet(None, boom=aiohttp.ClientError("dns"))
+        assert self.run(monkeypatch, fake) == "https://example.org"
+
+    def test_http_base_url_is_refused(self, monkeypatch):
+        # A well-known that downgrades to http would put the access token on
+        # the wire in the clear.
+        fake = self.FakeGet({"m.homeserver": {"base_url": "http://matrix.example.org"}})
+        assert self.run(monkeypatch, fake) == "https://example.org"
+
+    def test_junk_payload_falls_back(self, monkeypatch):
+        fake = self.FakeGet({"m.homeserver": "not-a-dict"})
+        assert self.run(monkeypatch, fake) == "https://example.org"
+
+    def test_user_id_without_a_domain(self, monkeypatch):
+        assert self.run(monkeypatch, self.FakeGet({}), user_id="@me") == ""
 
 
 class TestRefreshSpaceChildren:

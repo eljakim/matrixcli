@@ -6,10 +6,10 @@ Three kinds of persistence live here:
   used for the crypto store and local state. Resolved from ``--config``, then
   ``$MATRIXCLI_CONFIG``, then ``~/.config/matrixcli/config.ini``. The current
   working directory is deliberately NOT searched; see _default_config_path.
-* The system keyring (via ``keyring``: macOS Keychain, Secret Service or
-  KWallet on Linux): the login password (you store this yourself before first
-  run) and, after the first login, a cached access token + device id so later
-  launches never need the password again.
+* Secrets (see SecretStore): the login password, a cached access token +
+  device id, and the key that encrypts everything below. The system keyring
+  holds them (macOS Keychain, Secret Service or KWallet on Linux) when the
+  machine has one; a headless box falls back to a 0600 file.
 * ``state.json`` (0600, not encrypted): per-room "last event seen" and "last
   opened" timestamps, used to rank the home screen's Recent, Favourites, and
   DMs, plus the room titles and DM peers those rankings display. No message
@@ -52,19 +52,19 @@ DEFAULT_ASCII_RAMP = (
 CONFIG_TEMPLATE = """\
 [matrix]
 ; Your homeserver's base URL.
-homeserver = https://matrix.org
+homeserver = __HOMESERVER__
 ; Your full Matrix user id.
-user_id = @you:matrix.org
+user_id = __USER_ID__
 ; Shown to other users as the name of this login/session.
-device_name = matrixcli
+device_name = __DEVICE_NAME__
 ; Optional: a room id or alias to open by default (leave blank for the dashboard).
 room =
 
 [keychain]
-; The keyring "service" name. Store your password before first run with:
-;   macOS:  security add-generic-password -s "matrix-cli" -a "@you:matrix.org" -w
-;   Linux:  keyring set matrix-cli @you:matrix.org
-; (Linux needs a Secret Service keyring such as gnome-keyring, or KWallet.)
+; The name matrixcli files its secrets (password, access token, cache key)
+; under in the system keyring: the macOS Keychain, or Secret Service/KWallet
+; on Linux. Without a keyring they go to secrets.json next to state.json
+; below, mode 0600, and the password is never written to disk at all.
 service = matrix-cli
 
 [storage]
@@ -90,6 +90,136 @@ messages = true
 ; A classic shorter alternative:
 ;   ascii_ramp = "@%#*+=-:. "
 """
+
+
+def render_config(homeserver: str, user_id: str, device_name: str) -> str:
+    """CONFIG_TEMPLATE with one account filled in, comments and all. Plain
+    replacement rather than str.format or %: the default ASCII ramp in the
+    template is full of braces and percent signs."""
+    return (
+        CONFIG_TEMPLATE.replace("__HOMESERVER__", homeserver)
+        .replace("__USER_ID__", user_id)
+        .replace("__DEVICE_NAME__", device_name or "matrixcli")
+    )
+
+
+class SecretStore:
+    """Where the password, the access token, and the cache key are kept.
+
+    First choice is the OS keyring (macOS Keychain, Secret Service or KWallet
+    on Linux). A server or container often has none of those, and refusing to
+    run there is worse than the alternative, so we fall back to a 0600 JSON
+    file beside the app's other state. That fallback never receives the login
+    password: it holds the access token, device id, and cache key, so a
+    leaked file costs one revokable session instead of the account.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._keyring_ok: bool | None = None
+        # Values held for this process only (the password, when there is no
+        # keyring to put it in).
+        self._memory: dict[tuple[str, str], str] = {}
+
+    @property
+    def uses_keyring(self) -> bool:
+        if self._keyring_ok is None:
+            try:
+                # A real lookup, not a look at which backend class was picked:
+                # Secret Service imports fine on any desktop Linux but raises
+                # here when no daemon is listening (ssh session, container).
+                keyring.get_password("matrixcli-probe", "matrixcli-probe")
+            except Exception:
+                self._keyring_ok = False
+            else:
+                self._keyring_ok = True
+        return self._keyring_ok
+
+    def describe(self) -> str:
+        """Short phrase naming where secrets land, for the setup screen."""
+        if self.uses_keyring:
+            if sys.platform == "darwin":
+                return "the macOS Keychain"
+            if sys.platform == "win32":
+                return "the Windows Credential Locker"
+            return "the system keyring"
+        try:
+            shown = "~/" + str(self.path.relative_to(Path.home()))
+        except ValueError:
+            shown = str(self.path)
+        return f"{shown} (0600)"
+
+    def get(self, service: str, key: str) -> str | None:
+        if (service, key) in self._memory:
+            return self._memory[(service, key)]
+        if self.uses_keyring:
+            try:
+                value = keyring.get_password(service, key)
+            except Exception:
+                value = None
+            if value is not None:
+                return value
+        entry = self._read().get(service)
+        return entry.get(key) if isinstance(entry, dict) else None
+
+    def set(
+        self, service: str, key: str, value: str, *, persist: bool = True
+    ) -> None:
+        """Store a secret. ``persist=False`` keeps it in memory for this run
+        only, for secrets too sensitive for the file fallback."""
+        if not persist:
+            self._memory[(service, key)] = value
+            return
+        if self.uses_keyring:
+            try:
+                keyring.set_password(service, key, value)
+                return
+            except Exception:
+                # Readable but not writable (a locked collection): fall
+                # through to the file rather than lose the session.
+                pass
+        data = self._read()
+        entry = data.get(service)
+        if not isinstance(entry, dict):
+            entry = data[service] = {}
+        entry[key] = value
+        self._write(data)
+
+    def delete(self, service: str, key: str) -> None:
+        self._memory.pop((service, key), None)
+        if self.uses_keyring:
+            try:
+                keyring.delete_password(service, key)
+            except Exception:
+                pass
+        data = self._read()
+        entry = data.get(service)
+        if isinstance(entry, dict) and entry.pop(key, None) is not None:
+            self._write(data)
+
+    def _read(self) -> dict:
+        try:
+            data = json.loads(self.path.read_text())
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write(self, data: dict) -> None:
+        # 0600 from the moment it exists: this file is the login session.
+        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
+        try:
+            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                json.dump(data, fh)
+            tmp.replace(self.path)
+        except OSError:
+            # Losing the token costs a fresh login next launch; crashing the
+            # app in the middle of one costs the whole session.
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _default_config_path() -> Path:
@@ -130,28 +260,26 @@ class Config:
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Config":
+        """The config at ``path``. A missing file is not an error: it yields
+        an unconfigured Config (``needs_setup``), which the app fills in from
+        its setup screen and writes with write_account. Nothing is created
+        on disk here except the storage directories."""
         path = path or _default_config_path()
-        if not path.exists():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(CONFIG_TEMPLATE)
-            raise FileNotFoundError(
-                f"No config found. A template was written to {path}.\n"
-                "Edit it with your homeserver and user id, then store your "
-                "password in the Keychain (see the comments in that file)."
-            )
-
         # interpolation=None: with the default BasicInterpolation, a bare "%"
         # in any value raises lazily at m.get() time, past the except below.
         parser = configparser.ConfigParser(interpolation=None)
-        try:
-            parser.read(path)
-        except configparser.Error as exc:
-            raise ValueError(f"Could not parse {path}: {exc}")
-        if not parser.has_section("matrix"):
-            raise ValueError(
-                f"{path} has no [matrix] section. Fix it, or delete the file "
-                "and rerun to regenerate the template."
-            )
+        if path.exists():
+            try:
+                parser.read(path)
+            except configparser.Error as exc:
+                raise ValueError(f"Could not parse {path}: {exc}")
+            if not parser.has_section("matrix"):
+                raise ValueError(
+                    f"{path} has no [matrix] section. Fix it, or delete the "
+                    "file and rerun to set the account up again."
+                )
+        else:
+            parser.add_section("matrix")
         m = parser["matrix"]
         kc = parser["keychain"] if parser.has_section("keychain") else {}
         st = parser["storage"] if parser.has_section("storage") else {}
@@ -179,6 +307,7 @@ class Config:
         sweeps = [
             (state_path.parent, state_path.name + ".*.tmp"),
             (state_path.parent, state_path.name + ".tmp"),
+            (state_path.parent, "secrets.json.*.tmp"),
             (store_path, "*.cache.*.tmp"),
             (store_path, "*.cache.tmp"),
             (store_path / "media", "*.cache.*.tmp"),
@@ -226,26 +355,100 @@ class Config:
             ascii_ramp=ramp,
         )
 
-    # --- Keychain: password (user-provided) and token cache (we write it) ---
+    @property
+    def needs_setup(self) -> bool:
+        """True when there is no real account to connect with yet: no config
+        file, an unedited template, or a half-filled one. The app answers this
+        with its setup screen instead of an error message."""
+        return (
+            not self.homeserver
+            or not self.user_id
+            or "@you:" in self.user_id
+        )
+
+    def write_account(
+        self, homeserver: str, user_id: str, device_name: str = ""
+    ) -> "Config":
+        """Save an account to config.ini and return the config read back from
+        it. A file that already exists keeps its other sections, and its
+        comments, byte for byte: only the three account keys are rewritten."""
+        device_name = device_name or self.device_name or "matrixcli"
+        wanted = {
+            "homeserver": homeserver,
+            "user_id": user_id,
+            "device_name": device_name,
+        }
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.config_path.exists():
+            self.config_path.write_text(
+                render_config(homeserver, user_id, device_name)
+            )
+            return Config.load(self.config_path)
+
+        out: list[str] = []
+        section = ""
+        header_at = None  # where to add keys [matrix] does not have yet
+        seen: set[str] = set()
+
+        def close_matrix() -> None:
+            missing = [f"{k} = {v}" for k, v in wanted.items() if k not in seen]
+            if missing and header_at is not None:
+                out[header_at + 1:header_at + 1] = missing
+
+        for line in self.config_path.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                if section == "matrix":
+                    close_matrix()
+                section = stripped[1:-1].strip().lower()
+                if section == "matrix":
+                    header_at = len(out)
+            elif (
+                section == "matrix"
+                and "=" in stripped
+                and not stripped.startswith((";", "#"))
+            ):
+                key = stripped.split("=", 1)[0].strip().lower()
+                if key in wanted:
+                    seen.add(key)
+                    out.append(f"{key} = {wanted[key]}")
+                    continue
+            out.append(line)
+        if section == "matrix":
+            close_matrix()
+        self.config_path.write_text("\n".join(out) + "\n")
+        return Config.load(self.config_path)
+
+    # --- Secrets: password (asked for once) and token cache (we write it) ---
+
+    @property
+    def secrets(self) -> SecretStore:
+        store = getattr(self, "_secrets", None)
+        if store is None:
+            store = SecretStore(self.state_path.parent / "secrets.json")
+            self._secrets = store
+        return store
 
     @property
     def _token_service(self) -> str:
         return f"{self.keychain_service}-token"
 
     def get_password(self) -> str | None:
-        return keyring.get_password(self.keychain_service, self.user_id)
+        return self.secrets.get(self.keychain_service, self.user_id)
 
-    def store_password_hint(self) -> str:
-        """The platform's one-liner for putting the login password into the
-        system keyring, quoted in error messages and docs. macOS has the
-        Keychain's own tool; everywhere else the keyring package's bundled
-        CLI talks to whatever backend is installed (Secret Service, KWallet)."""
-        if sys.platform == "darwin":
-            return (
-                f'security add-generic-password -s "{self.keychain_service}" '
-                f'-a "{self.user_id}" -w'
-            )
-        return f'keyring set "{self.keychain_service}" "{self.user_id}"'
+    def set_password(self, password: str) -> None:
+        """Remember the password typed into the setup screen. With a system
+        keyring it goes there, so later launches can log in unattended even
+        after the token is revoked. Without one it would land in a plain
+        file, so it stays in memory for this run only: the access token
+        cached by this login is what the next launch uses, and if that dies
+        the app asks again."""
+        self.secrets.set(
+            self.keychain_service,
+            self.user_id,
+            password,
+            persist=self.secrets.uses_keyring,
+        )
 
     def get_or_create_store_key(self) -> str:
         """A per-account random key used to encrypt nio's Olm/Megolm store on
@@ -255,14 +458,14 @@ class Config:
         malware running as the user recovers them). Generated once on first use.
         """
         service = f"{self.keychain_service}-store"
-        key = keyring.get_password(service, self.user_id)
+        key = self.secrets.get(service, self.user_id)
         if not key:
             key = secrets.token_urlsafe(32)
-            keyring.set_password(service, self.user_id, key)
+            self.secrets.set(service, self.user_id, key)
         return key
 
     def load_token(self) -> dict | None:
-        raw = keyring.get_password(self._token_service, self.user_id)
+        raw = self.secrets.get(self._token_service, self.user_id)
         if not raw:
             return None
         try:
@@ -278,17 +481,14 @@ class Config:
         return data
 
     def save_token(self, access_token: str, device_id: str) -> None:
-        keyring.set_password(
+        self.secrets.set(
             self._token_service,
             self.user_id,
             json.dumps({"access_token": access_token, "device_id": device_id}),
         )
 
     def clear_token(self) -> None:
-        try:
-            keyring.delete_password(self._token_service, self.user_id)
-        except keyring.errors.PasswordDeleteError:
-            pass
+        self.secrets.delete(self._token_service, self.user_id)
 
     # --- Local UI state (recency ranking) ---
 

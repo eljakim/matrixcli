@@ -30,11 +30,14 @@ state_path = {tmp_path}/state.json
 
 
 class TestLoad:
-    def test_missing_file_writes_template_and_raises(self, tmp_path):
+    def test_missing_file_yields_an_unconfigured_config(self, tmp_path):
+        # No error and nothing written: the app asks for the account and
+        # writes the file itself (see TestWriteAccount).
         path = tmp_path / "config.ini"
-        with pytest.raises(FileNotFoundError):
-            Config.load(path)
-        assert "[matrix]" in path.read_text()
+        cfg = Config.load(path)
+        assert cfg.needs_setup
+        assert cfg.config_path == path
+        assert not path.exists()
 
     def test_loads_values_and_defaults(self, tmp_path):
         cfg = Config.load(minimal_config(tmp_path))
@@ -269,23 +272,143 @@ class TestCacheMessagesSetting:
         assert Config.load(path).cache_messages is False
 
     def test_template_documents_the_section(self, tmp_path):
-        with pytest.raises(FileNotFoundError):
-            Config.load(tmp_path / "config.ini")
-        assert "[cache]" in (tmp_path / "config.ini").read_text()
+        path = tmp_path / "config.ini"
+        Config.load(path).write_account("https://hs.example", "@me:hs.example")
+        assert "[cache]" in path.read_text()
 
 
-class TestPasswordHint:
-    def test_platform_specific_command(self, cfg, monkeypatch):
-        import matrixcli.config as config_module
+class TestSecretStore:
+    """The keyring is preferred; a machine without one (a server, a
+    container) falls back to a 0600 file, and the password stays out of it."""
 
-        monkeypatch.setattr(config_module.sys, "platform", "darwin")
-        hint = cfg.store_password_hint()
-        assert hint.startswith("security add-generic-password")
-        assert cfg.user_id in hint
-        monkeypatch.setattr(config_module.sys, "platform", "linux")
-        hint = cfg.store_password_hint()
-        assert hint.startswith("keyring set")
-        assert cfg.user_id in hint
+    def no_keyring(self, monkeypatch):
+        import keyring
+        import keyring.errors
+
+        def fail(*args, **kwargs):
+            raise keyring.errors.NoKeyringError("no backend")
+
+        monkeypatch.setattr(keyring, "get_password", fail)
+        monkeypatch.setattr(keyring, "set_password", fail)
+        monkeypatch.setattr(keyring, "delete_password", fail)
+
+    def fake_keyring(self, monkeypatch):
+        import keyring
+
+        store = {}
+        monkeypatch.setattr(
+            keyring, "get_password", lambda s, k: store.get((s, k))
+        )
+        monkeypatch.setattr(
+            keyring, "set_password", lambda s, k, v: store.__setitem__((s, k), v)
+        )
+        monkeypatch.setattr(
+            keyring, "delete_password", lambda s, k: store.pop((s, k), None)
+        )
+        return store
+
+    def test_uses_the_keyring_when_there_is_one(self, cfg, monkeypatch):
+        store = self.fake_keyring(monkeypatch)
+        assert cfg.secrets.uses_keyring
+        cfg.save_token("tok", "DEV")
+        cfg.set_password("hunter2")
+        assert store[("test-svc", cfg.user_id)] == "hunter2"
+        assert cfg.load_token() == {"access_token": "tok", "device_id": "DEV"}
+        assert not (cfg.state_path.parent / "secrets.json").exists()
+
+    def test_falls_back_to_a_0600_file(self, cfg, monkeypatch):
+        self.no_keyring(monkeypatch)
+        assert not cfg.secrets.uses_keyring
+        cfg.save_token("tok", "DEV")
+        path = cfg.state_path.parent / "secrets.json"
+        assert path.exists()
+        assert oct(path.stat().st_mode)[-3:] == "600"
+        assert cfg.load_token() == {"access_token": "tok", "device_id": "DEV"}
+        assert cfg.get_or_create_store_key() == cfg.get_or_create_store_key()
+        cfg.clear_token()
+        assert cfg.load_token() is None
+        # Clearing the token leaves the store key alone: it is what makes the
+        # existing encryption store readable at all.
+        assert json.loads(path.read_text())["test-svc-store"]
+
+    def test_password_never_reaches_the_fallback_file(self, cfg, monkeypatch):
+        self.no_keyring(monkeypatch)
+        cfg.set_password("hunter2")
+        # Usable for this run (the login about to happen)...
+        assert cfg.get_password() == "hunter2"
+        path = cfg.state_path.parent / "secrets.json"
+        assert not path.exists() or "hunter2" not in path.read_text()
+        # ...and gone for the next one, which uses the cached token instead.
+        assert replace(cfg).get_password() is None
+
+    def test_write_failure_does_not_raise(self, cfg, monkeypatch):
+        self.no_keyring(monkeypatch)
+        monkeypatch.setattr(
+            os, "open", lambda *a, **kw: (_ for _ in ()).throw(OSError("full"))
+        )
+        cfg.save_token("tok", "DEV")  # a lost token costs a fresh login, not a crash
+
+    def test_describe_names_the_fallback_path(self, cfg, monkeypatch):
+        self.no_keyring(monkeypatch)
+        assert str(cfg.state_path.parent / "secrets.json") in cfg.secrets.describe()
+
+
+class TestNeedsSetup:
+    def test_true_for_missing_empty_and_template_values(self, tmp_path):
+        assert Config.load(tmp_path / "none.ini").needs_setup
+        path = write_config(tmp_path, "[matrix]\nhomeserver = https://hs.example\n")
+        assert Config.load(path).needs_setup  # no user id
+        path = write_config(
+            tmp_path,
+            "[matrix]\nhomeserver = https://matrix.org\nuser_id = @you:matrix.org\n",
+        )
+        assert Config.load(path).needs_setup  # unedited template
+        assert not Config.load(minimal_config(tmp_path)).needs_setup
+
+
+class TestWriteAccount:
+    def test_new_file_gets_the_commented_template(self, tmp_path):
+        path = tmp_path / "config.ini"
+        cfg = Config.load(path).write_account("https://hs.example", "@me:hs.example")
+        assert not cfg.needs_setup
+        assert cfg.homeserver == "https://hs.example"
+        assert cfg.user_id == "@me:hs.example"
+        assert cfg.device_name == "matrixcli"
+        body = path.read_text()
+        for section in ("[matrix]", "[keychain]", "[storage]", "[cache]", "[preview]"):
+            assert section in body
+        assert "__USER_ID__" not in body
+
+    def test_existing_file_keeps_everything_else(self, tmp_path):
+        path = write_config(
+            tmp_path,
+            f"""\
+[matrix]
+; a comment worth keeping
+homeserver = https://old.example
+user_id = @old:old.example
+room = !fav:old.example
+
+[storage]
+store_path = {tmp_path}/store
+state_path = {tmp_path}/state.json
+""",
+        )
+        cfg = Config.load(path).write_account("https://new.example", "@new:new.example")
+        body = path.read_text()
+        assert cfg.homeserver == "https://new.example"
+        assert cfg.user_id == "@new:new.example"
+        assert cfg.room == "!fav:old.example"
+        assert cfg.store_path == tmp_path / "store"
+        assert "; a comment worth keeping" in body
+        assert "old.example" not in body.replace("!fav:old.example", "")
+
+    def test_missing_keys_are_added_to_the_matrix_section(self, tmp_path):
+        path = write_config(tmp_path, "[matrix]\nroom =\n\n[cache]\nmessages = false\n")
+        cfg = Config.load(path).write_account("https://hs.example", "@me:hs.example")
+        assert cfg.user_id == "@me:hs.example"
+        assert cfg.homeserver == "https://hs.example"
+        assert cfg.cache_messages is False
 
 
 class TestAsciiRamp:
@@ -326,9 +449,9 @@ class TestAsciiRamp:
         assert Config.load(path).ascii_ramp == DEFAULT_ASCII_RAMP
 
     def test_template_documents_the_section(self, tmp_path):
-        with pytest.raises(FileNotFoundError):
-            Config.load(tmp_path / "config.ini")
-        assert "[preview]" in (tmp_path / "config.ini").read_text()
+        path = tmp_path / "config.ini"
+        Config.load(path).write_account("https://hs.example", "@me:hs.example")
+        assert "[preview]" in path.read_text()
 
 
 class TestAtomicWrites:

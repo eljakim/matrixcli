@@ -32,8 +32,6 @@ from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-import keyring.errors
-
 import textual.events
 import textual.message
 from textual import work
@@ -69,6 +67,8 @@ from .client import (
     Entry,
     MatrixSession,
     Message,
+    NeedsPassword,
+    discover_homeserver,
     fold_edits,
     fold_text,
 )
@@ -3570,12 +3570,138 @@ class SyncAllScreen(ModalScreen):
         self.dismiss()
 
 
+class SetupScreen(ModalScreen):
+    """First-run account setup, and the same screen again whenever the saved
+    session is gone and there is nothing left to log in with.
+
+    Everything a fresh machine needs is asked for here: no hand-edited
+    config.ini, no keyring command to run first. The homeserver field may stay
+    empty, in which case it is looked up from the user id's domain
+    (.well-known), which is what accounts whose domain and homeserver differ
+    need. Dismisses with (homeserver, user_id, password), or None to quit.
+    """
+
+    BINDINGS = [
+        ("escape", "cancel", "Quit"),
+        Binding("ctrl+s", "submit", "Connect"),
+    ]
+
+    def __init__(self, cfg: Config, error: str = "") -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.error = error
+
+    def compose(self) -> ComposeResult:
+        # A template config carries the example account; show empty fields
+        # rather than inviting the user to sign in as @you:matrix.org.
+        known = "@you:" not in self.cfg.user_id
+        with Vertical(id="setupbox"):
+            yield Label("Sign in to Matrix", id="setuptitle")
+            if self.error:
+                # Server errors arrive verbatim and can run very long; the
+                # box has fields to show below them.
+                shown = self.error
+                if len(shown) > 160:
+                    shown = shown[:157] + "..."
+                yield Static(Text(shown, style="red"), id="setuperror")
+            yield Label("User ID")
+            yield Input(
+                value=self.cfg.user_id if known else "",
+                placeholder="@you:matrix.org",
+                id="setup_user",
+                compact=True,
+            )
+            yield Label("Password", classes="setuplabel")
+            yield Input(password=True, id="setup_pass", compact=True)
+            yield Label(
+                "Homeserver (leave empty to look it up)", classes="setuplabel"
+            )
+            yield Input(
+                value=self.cfg.homeserver if known else "",
+                placeholder="https://matrix.org",
+                id="setup_hs",
+                compact=True,
+            )
+            try:
+                settings_path = "~/" + str(
+                    self.cfg.config_path.relative_to(Path.home())
+                )
+            except ValueError:
+                settings_path = str(self.cfg.config_path)
+            where = Text(
+                f"Credentials: {self.cfg.secrets.describe()}"
+                f" - settings: {settings_path}",
+                style="dim",
+            )
+            if not self.cfg.secrets.uses_keyring:
+                # Worth saying out loud: on this machine the password is used
+                # for this login and then forgotten (see Config.set_password).
+                where.append("\nNo keyring found: only the session is saved.")
+            yield Static(where, id="setupwhere")
+            yield Static("", id="setupstatus")
+            yield Static(
+                Text("Enter connects - Esc quits", style="dim"), id="setuphint"
+            )
+
+    def on_mount(self) -> None:
+        # Coming back after a rejected password, the account is already
+        # filled in and the password is the only thing to retype.
+        user = self.query_one("#setup_user", Input)
+        if user.value:
+            self.query_one("#setup_pass", Input).focus()
+        else:
+            user.focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.action_submit()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_submit(self) -> None:
+        # Exclusive, like the settings screen: Enter and ctrl+s both land
+        # here, and two queued submits would each call dismiss().
+        self.run_worker(self._submit, group="setup", exclusive=True)
+
+    def _status(self, text: str, error: bool = False) -> None:
+        self.query_one("#setupstatus", Static).update(
+            Text(text, style="red" if error else "dim")
+        )
+
+    async def _submit(self) -> None:
+        user_id = self.query_one("#setup_user", Input).value.strip()
+        password = self.query_one("#setup_pass", Input).value
+        homeserver = self.query_one("#setup_hs", Input).value.strip()
+        if user_id and not user_id.startswith("@"):
+            user_id = "@" + user_id
+        local, _, domain = user_id.partition(":")
+        if len(local) < 2 or not domain or " " in user_id:
+            self._status("A user id looks like @you:example.org", error=True)
+            return
+        if user_id.startswith("@you:"):
+            # The template's example account: taking it would leave the
+            # config still unconfigured, and setup would ask again forever.
+            self._status("That is the example id; use your own.", error=True)
+            return
+        if not password:
+            self._status("Enter your account password.", error=True)
+            return
+        if not homeserver:
+            self._status(f"looking up the homeserver for {domain}...")
+            homeserver = await discover_homeserver(user_id)
+        if "://" not in homeserver:
+            homeserver = "https://" + homeserver
+        self.dismiss((homeserver.rstrip("/"), user_id, password))
+
+
 class SettingsScreen(ModalScreen):
-    """":settings" (or ":set"): account and app settings. The display name
-    saves to the homeserver; the email addresses are read-only (changing
-    them needs a validation mail the server may not even send, so that
-    stays in Element); the titlebar unread counter and the timezone live
-    in state.json and apply immediately on save."""
+    """":settings" (or ":set"): account and app settings. The account and
+    homeserver are shown read-only (they are what config.ini says; signing
+    in as someone else is the setup screen's job); the display name saves to
+    the homeserver; the email addresses are read-only too (changing them
+    needs a validation mail the server may not even send, so that stays in
+    Element); the titlebar unread counter and the timezone live in
+    state.json and apply immediately on save."""
 
     BINDINGS = [
         ("escape", "dismiss", "Cancel"),
@@ -3586,7 +3712,11 @@ class SettingsScreen(ModalScreen):
         session = self.app.session
         with Vertical(id="settingsbox"):
             yield Label("Settings", id="settingstitle")
-            yield Label("Display name")
+            yield Label("Account")
+            yield Static(Text(session.cfg.user_id), id="set_account")
+            yield Label("Homeserver", classes="settingslabel")
+            yield Static(Text(session.cfg.homeserver), id="set_homeserver")
+            yield Label("Display name", classes="settingslabel")
             yield Input(
                 value=session.my_name or "", id="set_name", compact=True
             )
@@ -4612,7 +4742,7 @@ class MatrixApp(App):
        line would spill one cell onto a blank row and stripe the picture. */
     #previewart { width: auto; height: auto; text-wrap: nowrap; }
     #reactionsbox #reactors { height: auto; max-height: 20; }
-    AboutScreen, ConfirmScreen, SettingsScreen, SyncAllScreen {
+    AboutScreen, ConfirmScreen, SettingsScreen, SetupScreen, SyncAllScreen {
         align: center middle;
     }
     #syncbox {
@@ -4625,6 +4755,23 @@ class MatrixApp(App):
     }
     #synctitle { text-style: bold; padding: 0 0 1 0; }
     #synchint { padding: 1 0 0 0; }
+    /* A connection error lands on this box verbatim and can run long;
+       scroll inside it rather than overflowing a short terminal. */
+    #setupbox {
+        width: 60%;
+        max-width: 64;
+        height: auto;
+        max-height: 90%;
+        overflow-y: auto;
+        padding: 1 2;
+        border: round $accent;
+        background: $panel;
+    }
+    #setuptitle { text-style: bold; padding: 0 0 1 0; }
+    #setuperror { color: $error; padding: 0 0 1 0; }
+    #setupbox Input { background: $boost; }
+    #setupbox .setuplabel { padding: 1 0 0 0; }
+    #setupwhere { padding: 1 0 0 0; }
     #settingsbox {
         width: 60%;
         max-width: 70;
@@ -4775,12 +4922,10 @@ class MatrixApp(App):
     def __init__(self, cfg: Config) -> None:
         super().__init__()
         self.cfg = cfg
-        self.session = MatrixSession(cfg)
-        # Repaint the open room when its background member-list fetch lands
-        # and raw @user:server ids can resolve to display names.
-        self.session.on_members_loaded = self._on_members_loaded
-        # Likewise repaint the dashboard when a background name fetch lands.
-        self.session.on_names_loaded = self.action_refresh_home
+        # An unconfigured launch has no account to build a session around
+        # yet (and building one would mint a store key for an empty user
+        # id); startup() asks for the account first, then attaches it.
+        self.session = None if cfg.needs_setup else self._attach_session(cfg)
         self.fatal: str | None = None
         # Connection health for the footer's ConnStatus: monotonic time of the
         # last successful sync (None until the first one lands) and whether
@@ -4795,19 +4940,78 @@ class MatrixApp(App):
         await self.push_screen(LoadingScreen())
         self.startup()
 
+    def _attach_session(self, cfg: Config) -> MatrixSession:
+        session = MatrixSession(cfg)
+        # Repaint the open room when its background member-list fetch lands
+        # and raw @user:server ids can resolve to display names.
+        session.on_members_loaded = self._on_members_loaded
+        # Likewise repaint the dashboard when a background name fetch lands.
+        session.on_names_loaded = self.action_refresh_home
+        return session
+
+    async def _setup_account(self, error: str = "") -> bool:
+        """Ask for the account (SetupScreen), write config.ini when it
+        changed, and build the session for it. False means the user pressed
+        Escape, which quits."""
+        result = await self.push_screen_wait(SetupScreen(self.cfg, error))
+        if result is None:
+            return False
+        homeserver, user_id, password = result
+        if self.session is None or (homeserver, user_id) != (
+            self.cfg.homeserver, self.cfg.user_id
+        ):
+            try:
+                self.cfg = self.cfg.write_account(homeserver, user_id)
+            except (OSError, ValueError) as exc:
+                self.fatal = f"could not write {self.cfg.config_path}: {exc}"
+                return False
+            if self.session is not None:
+                # A different account means a different device, store key and
+                # token; the old client must not linger on its sockets.
+                await self.session.close()
+            self.session = self._attach_session(self.cfg)
+        self.cfg.set_password(password)
+        return True
+
     @work
     async def startup(self) -> None:
         loading = self.screen
-        host = self.cfg.homeserver.replace("https://", "").replace("http://", "")
-        loading.set_status(f"connecting to {host}")
-        try:
-            ok, message = await self.session.connect(progress=loading.set_status)
-        except Exception as exc:
-            # With max_timeouts set, offline network calls raise instead of
-            # retrying forever inside nio; anything connect cannot name
-            # should end in the clean fatal exit, not a worker traceback.
-            ok, message = False, f"could not connect: {exc}"
-        if not ok:
+        # A pending error means "ask again": either there is no account yet,
+        # or what we were given did not get us in.
+        error = ""
+        asked = False
+        while True:
+            if self.session is None or self.cfg.needs_setup or error:
+                if not await self._setup_account(error):
+                    self.exit()
+                    return
+                error, asked = "", True
+            host = self.cfg.homeserver.replace("https://", "").replace(
+                "http://", ""
+            )
+            loading.set_status(f"connecting to {host}")
+            try:
+                ok, message = await self.session.connect(
+                    progress=loading.set_status
+                )
+            except NeedsPassword as exc:
+                # Nothing is wrong with the config, only with the
+                # credentials: ask again rather than dying with a hint.
+                error = str(exc)
+                continue
+            except Exception as exc:
+                # With max_timeouts set, offline network calls raise instead of
+                # retrying forever inside nio; anything connect cannot name
+                # should end in the clean fatal exit, not a worker traceback.
+                ok, message = False, f"could not connect: {exc}"
+            if ok:
+                break
+            if asked:
+                # What we were just handed cannot connect (a typo in the
+                # homeserver, a server that is down): put the reason on the
+                # sign-in box instead of exiting into the shell.
+                error = message
+                continue
             self.fatal = message
             self.exit()
             return
@@ -4953,8 +5157,12 @@ class MatrixApp(App):
         request uses timeout=0), so a wedged connection is retried on the
         spot. The screens' change-detection caches are cleared first so they
         rebuild even if the sync brings nothing new."""
-        if isinstance(self.screen, LoadingScreen):
-            return  # startup owns the connection until the home screen is up
+        if self.session is None or isinstance(
+            self.screen, (LoadingScreen, SetupScreen)
+        ):
+            # Startup owns the connection until the home screen is up, and
+            # during setup there is no logged-in session to resync at all.
+            return
         for screen in self.screen_stack:
             if isinstance(screen, HomeScreen):
                 screen._last_signature = None
@@ -5000,7 +5208,10 @@ class MatrixApp(App):
                 self.call_later(screen.refresh_names)
 
     async def on_unmount(self) -> None:
-        await self.session.close()
+        # None when the app is quit from the setup screen, before there is an
+        # account to build a session for.
+        if self.session is not None:
+            await self.session.close()
 
 
 async def _run_verify(cfg: Config) -> None:
@@ -5199,41 +5410,33 @@ def main() -> None:
         # clean message, not a traceback.
         raise SystemExit(str(exc))
 
-    if not cfg.homeserver or "@you:" in cfg.user_id or not cfg.user_id:
+    # These three run without the TUI, so they cannot ask for anything; the
+    # app itself does the setup.
+    if cfg.needs_setup and (args.verify or args.import_keys or args.export_keys):
         raise SystemExit(
-            f"Edit {cfg.config_path} with your real homeserver and user id first."
+            f"No Matrix account is set up yet ({cfg.config_path}).\n"
+            "Run 'matrix' on its own first: it asks for your user id, "
+            "password, and homeserver, then writes the config."
         )
 
     # A second live instance corrupts the shared crypto store and caches
     # (last writer wins); refuse to start while one is running.
     cfg.acquire_instance_lock()
 
-    # Probe the keyring now: without a usable backend every later credential
-    # access raises deep inside the app; here it can be an actionable
-    # message.
     try:
-        cfg.load_token()
-    except keyring.errors.KeyringError as exc:
-        raise SystemExit(
-            f"No usable system keyring: {exc}\n"
-            "matrixcli keeps your password, access token, and cache keys in "
-            "the system keyring (macOS Keychain; Secret Service or KWallet "
-            "on Linux). On Linux, install and unlock one (e.g. gnome-keyring "
-            "or KWallet), then store your password with:\n"
-            f"  {cfg.store_password_hint()}"
-        )
+        if args.verify:
+            asyncio.run(_run_verify(cfg))
+            return
 
-    if args.verify:
-        asyncio.run(_run_verify(cfg))
-        return
+        if args.import_keys:
+            asyncio.run(_run_import_keys(cfg, args.import_keys))
+            return
 
-    if args.import_keys:
-        asyncio.run(_run_import_keys(cfg, args.import_keys))
-        return
-
-    if args.export_keys:
-        asyncio.run(_run_export_keys(cfg, args.export_keys))
-        return
+        if args.export_keys:
+            asyncio.run(_run_export_keys(cfg, args.export_keys))
+            return
+    except NeedsPassword as exc:
+        raise SystemExit(f"{exc}\nRun 'matrix' on its own to sign in first.")
 
     app = MatrixApp(cfg)
     app.run()

@@ -1,8 +1,10 @@
 # matrixcli
 
 A terminal [Matrix](https://matrix.org) client with a **three-column home
-dashboard**, end-to-end encryption, and credentials kept in the **macOS
-Keychain**. Built on [matrix-nio](https://github.com/matrix-nio/matrix-nio) and
+dashboard**, end-to-end encryption, and credentials kept in the system
+keyring (**macOS Keychain**, Secret Service or KWallet on Linux, a 0600 file
+where there is none). Built on
+[matrix-nio](https://github.com/matrix-nio/matrix-nio) and
 [Textual](https://textual.textualize.io/); works on Python 3.10 through 3.14.
 
 The home screen shows three columns:
@@ -28,16 +30,28 @@ being read and prefixing the total unread count as `(N)` (switchable in
 ## Install
 
 End-to-end encryption comes from matrix-nio's vodozemac backend (prebuilt
-Rust wheels), so installation is plain Poetry with no system crypto
-libraries:
+Rust wheels), so there is nothing to build and no system crypto libraries to
+install. Dependencies are managed with Poetry, and the launcher installs them
+itself the first time you run it:
 
 ```sh
 cd matrix
-poetry install
+bin/matrix
 ```
 
-Poetry picks any Python between 3.10 and 3.14 (`poetry env use python3.12`
-to pin one explicitly).
+That needs Poetry (and a Python between 3.10 and 3.14) on the machine; if
+either is missing the launcher says so and prints the command to fix it:
+
+```sh
+sudo apt install -y pipx && pipx install poetry && pipx ensurepath   # Debian/Ubuntu
+sudo port install poetry                                             # macOS/MacPorts
+curl -sSL https://install.python-poetry.org | python3 -              # anywhere
+```
+
+pipx and the installer script put `poetry` in `~/.local/bin`, so open a new
+shell afterwards. To install by hand instead, `poetry install` in the project
+directory does the same thing (`poetry env use python3.12` pins an
+interpreter).
 
 Verify the crypto stack:
 
@@ -47,8 +61,18 @@ poetry run python -c "import vodozemac; print(vodozemac.Account().ed25519_key an
 
 ## Configure
 
-First run writes a template to `~/.config/matrixcli/config.ini` (or put a
-`config.ini` in the current directory). Edit it:
+Nothing to edit by hand: the first launch asks. It shows a sign-in box for
+your **user id**, **password**, and **homeserver**, writes
+`~/.config/matrixcli/config.ini` from what you type, and connects.
+
+Leave the homeserver empty and it is looked up from your user id's domain
+(`.well-known/matrix/client`), which is what accounts like
+`@you:example.org` living on `matrix.example.org` need. The same box comes
+back, with the reason on it, whenever a saved session has expired or a
+password is rejected.
+
+The written config.ini is documented in its own comments and can be edited
+afterwards:
 
 ```ini
 [matrix]
@@ -68,21 +92,31 @@ state_path =
 `room` is optional: set it to a room id or canonical alias to open that room
 automatically on launch.
 
-Store your password in the system keyring once (you will be prompted for it):
+### Where credentials are kept
 
-```sh
-security add-generic-password -s "matrix-cli" -a "@you:matrix.org" -w   # macOS
-keyring set matrix-cli @you:matrix.org                                  # Linux
-```
+After the first login the app caches an **access token + device id** and the
+key that encrypts its local caches, so later launches never need your
+password again.
 
-On Linux the `keyring` CLI comes with the installed dependencies
-(`poetry run keyring ...` also works) and needs a Secret Service keyring
-such as gnome-keyring, or KWallet, installed and unlocked; without one the
-app exits at startup with a pointer to this section.
+- **With a system keyring** (macOS Keychain, or Secret Service/KWallet on
+  Linux) they go there, under the service names `matrix-cli`,
+  `matrix-cli-token` and `matrix-cli-store`. Your password is stored too, so
+  the app can log in again unattended if the token is ever revoked. To force
+  a fresh login, delete the `matrix-cli-token` entry. Preloading the password
+  yourself still works:
 
-On first launch the app logs in with that password and caches an **access token +
-device id** back into the keyring (service `matrix-cli-token`), so later launches
-never touch your password. To force a fresh login, delete that token entry.
+  ```sh
+  security add-generic-password -s "matrix-cli" -a "@you:matrix.org" -w   # macOS
+  keyring set matrix-cli @you:matrix.org                                  # Linux
+  ```
+
+- **Without one** (a server, a container, an ssh session with no unlocked
+  keyring) they go to `~/.local/share/matrixcli/secrets.json`, mode 0600.
+  The password is deliberately *not* written there: it is used for that one
+  login and forgotten, and if the cached token ever dies the app asks for it
+  again. Anything that can read your home directory can still use that
+  cached session, so on a shared machine install and unlock a keyring
+  (gnome-keyring, KWallet) and matrixcli will use it instead.
 
 ## Run
 
@@ -92,7 +126,10 @@ bin/matrix
 
 The launcher works from any directory (symlink it into `/opt/local/bin` if you
 like) and forwards arguments, resolving file paths against your current
-directory. `poetry run matrix` from the project directory does the same thing.
+directory. It runs the app straight out of the project's virtualenv, so Poetry
+only has to be present for installs; after a `git pull` that changes
+`poetry.lock` it reinstalls the dependencies before starting. `poetry run
+matrix` from the project directory does the same thing.
 
 ### Keys
 
@@ -328,8 +365,8 @@ nowhere, and the file cannot be read without it.
 | What | Where |
 |------|-------|
 | Settings | `~/.config/matrixcli/config.ini` |
-| Password | macOS Keychain, service `matrix-cli` |
-| Cached token | macOS Keychain, service `matrix-cli-token` |
+| Password | system keyring, service `matrix-cli` (not stored without one) |
+| Cached token | system keyring, service `matrix-cli-token`, or `~/.local/share/matrixcli/secrets.json` (0600) |
 | Encryption store (Olm keys) | `~/.local/share/matrixcli/store/` |
 | Recency state (UI ranking) | `~/.local/share/matrixcli/state.json` |
 

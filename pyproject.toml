@@ -1,7 +1,7 @@
 [project]
 name = "matrixcli"
-version = "3.6"
-description = "A terminal Matrix client with an unread-first home dashboard, end-to-end encryption, and macOS Keychain credentials"
+version = "3.7"
+description = "A terminal Matrix client with an unread-first home dashboard, end-to-end encryption, and system-keyring credentials"
 authors = [{ name = "Eljakim" }]
 readme = "README.md"
 requires-python = ">=3.10,<3.15"

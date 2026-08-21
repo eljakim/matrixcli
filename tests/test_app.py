@@ -22,6 +22,7 @@ from matrixcli.app import (
     PreviewScreen,
     ReactionsScreen,
     RoomScreen,
+    SetupScreen,
     SyncAllScreen,
     ThreadScreen,
     _ascii_art,
@@ -2792,7 +2793,9 @@ class TestSettingsScreen:
             return _async(set_name_ok)
 
         session = SimpleNamespace(
-            cfg=SimpleNamespace(user_id="@me:hs"),
+            cfg=SimpleNamespace(
+                user_id="@me:hs", homeserver="https://hs.example"
+            ),
             my_name="Old Name",
             get_setting=lambda key, default=None: default,
             set_setting=lambda key, value: calls["set"].append((key, value)),
@@ -2860,6 +2863,18 @@ class TestSettingsScreen:
         my_name, calls = self.run(steps)
         assert calls["name"] == ["New Name"]
         assert my_name == "New Name"
+
+    def test_account_and_homeserver_are_shown_read_only(self):
+        async def steps(pilot, app):
+            screen = app.screen
+            return (
+                str(screen.query_one("#set_account", Static).render()),
+                str(screen.query_one("#set_homeserver", Static).render()),
+            )
+
+        (account, homeserver), _ = self.run(steps)
+        assert account == "@me:hs"
+        assert homeserver == "https://hs.example"
 
     def test_emails_are_listed_read_only(self):
         async def steps(pilot, app):
@@ -3311,3 +3326,268 @@ class TestIncrementalRedraw:
             ]
 
         self.check(mutate)
+
+
+class TestSetupScreen:
+    """First-run sign-in popup: what it accepts, and what it hands back to
+    the app that has to write config.ini from it."""
+
+    def submit(
+        self,
+        cfg,
+        monkeypatch,
+        user="",
+        password="",
+        homeserver="",
+        discovered="https://found.example",
+    ):
+        """Fill the three fields, press Enter, and return
+        (dismissed value or None, status line, user ids discovery was asked
+        about)."""
+        import keyring
+
+        monkeypatch.setattr(keyring, "get_password", lambda s, k: None)
+        asked = []
+
+        async def fake_discover(user_id):
+            asked.append(user_id)
+            return discovered
+
+        monkeypatch.setattr("matrixcli.app.discover_homeserver", fake_discover)
+        results = []
+
+        class SetupApp(App):
+            CSS = MatrixApp.CSS
+
+            def on_mount(self):
+                self.push_screen(SetupScreen(cfg), results.append)
+
+        async def run():
+            app = SetupApp()
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.pause()
+                screen = app.screen
+                screen.query_one("#setup_user").value = user
+                screen.query_one("#setup_pass").value = password
+                screen.query_one("#setup_hs").value = homeserver
+                await pilot.press("enter")
+                await app.workers.wait_for_complete()
+                await pilot.pause()
+                status = ""
+                if not results:
+                    status = str(screen.query_one("#setupstatus").render())
+                return (results[0] if results else None), status
+
+        value, status = asyncio.run(run())
+        return value, status, asked
+
+    def test_accepts_an_account_and_normalises_it(self, cfg, monkeypatch):
+        value, _, asked = self.submit(
+            self.blank(cfg),
+            monkeypatch,
+            user="@me:hs.example",
+            password="hunter2",
+            homeserver="hs.example/",
+        )
+        # A typed homeserver is used as given, bar the scheme and trailing
+        # slash, and discovery is not consulted.
+        assert value == ("https://hs.example", "@me:hs.example", "hunter2")
+        assert asked == []
+
+    def test_blank_homeserver_is_discovered(self, cfg, monkeypatch):
+        value, _, asked = self.submit(
+            self.blank(cfg), monkeypatch, user="me:hs.example", password="pw"
+        )
+        # A missing @ is forgiving, not an error.
+        assert value == ("https://found.example", "@me:hs.example", "pw")
+        assert asked == ["@me:hs.example"]
+
+    def test_rejects_a_malformed_user_id(self, cfg, monkeypatch):
+        value, status, _ = self.submit(
+            self.blank(cfg), monkeypatch, user="me", password="pw"
+        )
+        assert value is None
+        assert "@you:example.org" in status
+
+    def test_rejects_the_template_example_id(self, cfg, monkeypatch):
+        # Accepting it would write a config that still reads as unconfigured,
+        # and setup would ask again on every launch.
+        value, status, _ = self.submit(
+            self.blank(cfg), monkeypatch, user="@you:matrix.org", password="pw"
+        )
+        assert value is None
+        assert "example id" in status
+
+    def test_requires_a_password(self, cfg, monkeypatch):
+        value, status, _ = self.submit(
+            self.blank(cfg), monkeypatch, user="@me:hs.example"
+        )
+        assert value is None
+        assert "password" in status
+
+    def test_prefills_a_known_account_but_never_the_template_one(
+        self, cfg, monkeypatch
+    ):
+        import keyring
+
+        monkeypatch.setattr(keyring, "get_password", lambda s, k: None)
+
+        async def values(config):
+            class SetupApp(App):
+                CSS = MatrixApp.CSS
+
+                def on_mount(self):
+                    self.push_screen(SetupScreen(config))
+
+            app = SetupApp()
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.pause()
+                screen = app.screen
+                return (
+                    screen.query_one("#setup_user").value,
+                    screen.query_one("#setup_hs").value,
+                )
+
+        assert asyncio.run(values(cfg)) == (cfg.user_id, cfg.homeserver)
+        template = replace(
+            cfg, user_id="@you:matrix.org", homeserver="https://matrix.org"
+        )
+        assert asyncio.run(values(template)) == ("", "")
+
+    def blank(self, cfg):
+        """The config of a machine that has never been set up."""
+        return replace(cfg, homeserver="", user_id="")
+
+
+
+async def _sign_in(app, pilot, user, password, homeserver, after=None):
+    """Wait for the sign-in box (a fresh one when ``after`` is given), fill
+    it in, and submit. Returns the screen it filled in."""
+    for _ in range(100):
+        if isinstance(app.screen, SetupScreen) and app.screen is not after:
+            break
+        await pilot.pause()
+    else:
+        raise AssertionError("the setup screen never appeared")
+    screen = app.screen
+    screen.query_one("#setup_user").value = user
+    screen.query_one("#setup_pass").value = password
+    screen.query_one("#setup_hs").value = homeserver
+    await pilot.press("enter")
+    return screen
+
+
+class TestFirstRunFlow:
+    """The whole no-config path: the app asks, writes config.ini, and
+    connects with what it was given."""
+
+    class FakeSession:
+        def __init__(self, cfg):
+            self.cfg = cfg
+            self.on_members_loaded = None
+            self.on_names_loaded = None
+            self.passwords = []
+
+        async def connect(self, progress=None):
+            # Stop the launch right after setup: what happens past this point
+            # (sync, dashboard) is covered elsewhere.
+            self.passwords.append(self.cfg.get_password())
+            return False, "stop here"
+
+        async def close(self):
+            pass
+
+    def keyring(self, monkeypatch):
+        import keyring
+
+        stored = {}
+        monkeypatch.setattr(keyring, "get_password", lambda s, k: stored.get((s, k)))
+        monkeypatch.setattr(
+            keyring, "set_password", lambda s, k, v: stored.__setitem__((s, k), v)
+        )
+        return stored
+
+    def test_setup_writes_the_config_and_builds_a_session(
+        self, cfg, monkeypatch
+    ):
+        self.keyring(monkeypatch)
+        monkeypatch.setattr("matrixcli.app.MatrixSession", self.FakeSession)
+        app = MatrixApp(replace(cfg, homeserver="", user_id=""))
+        # Nothing is built for an account that does not exist yet: a session
+        # here would mint a store key for the empty user id.
+        assert app.session is None
+
+        async def run():
+            async with app.run_test(size=(80, 24)) as pilot:
+                first = await _sign_in(
+                    app, pilot, "@me:hs.example", "hunter2", "https://hs.example"
+                )
+                # A server that will not take the new account puts its reason
+                # on a fresh box rather than exiting to the shell.
+                for _ in range(100):
+                    await pilot.pause()
+                    if isinstance(app.screen, SetupScreen) and app.screen is not first:
+                        break
+                assert app.screen is not first
+                assert "stop here" in app.screen.error
+
+        asyncio.run(run())
+        assert app.cfg.user_id == "@me:hs.example"
+        assert app.cfg.homeserver == "https://hs.example"
+        assert "user_id = @me:hs.example" in cfg.config_path.read_text()
+        assert app.session is not None and app.session.cfg is app.cfg
+        assert app.session.passwords == ["hunter2"]
+
+
+class TestReLoginFlow:
+    """A rejected password does not kill the launch: the same box comes back
+    carrying the reason, and the retry connects."""
+
+    class RetrySession(TestFirstRunFlow.FakeSession):
+        async def connect(self, progress=None):
+            from matrixcli.client import NeedsPassword
+
+            self.passwords.append(self.cfg.get_password())
+            if len(self.passwords) == 1:
+                raise NeedsPassword("Login failed: Invalid password")
+            return False, "stop here"
+
+    def test_wrong_password_reopens_the_box_with_the_reason(
+        self, cfg, monkeypatch
+    ):
+        TestFirstRunFlow.keyring(self, monkeypatch)
+        monkeypatch.setattr("matrixcli.app.MatrixSession", self.RetrySession)
+        app = MatrixApp(replace(cfg, homeserver="", user_id=""))
+
+        async def run():
+            async with app.run_test(size=(80, 24)) as pilot:
+                first = await _sign_in(
+                    app, pilot, "@me:hs.example", "wrong", "https://hs.example"
+                )
+                for _ in range(100):
+                    await pilot.pause()
+                    if isinstance(app.screen, SetupScreen) and app.screen is not first:
+                        break
+                second = app.screen
+                assert isinstance(second, SetupScreen)
+                assert "Invalid password" in second.error
+                # The account it already knows is kept; only the password is
+                # asked for again.
+                assert second.query_one("#setup_user").value == "@me:hs.example"
+                assert second.focused.id == "setup_pass"
+                await _sign_in(
+                    app,
+                    pilot,
+                    "@me:hs.example",
+                    "hunter2",
+                    "https://hs.example",
+                    after=first,
+                )
+                for _ in range(100):
+                    await pilot.pause()
+                    if app.screen is not second:
+                        break
+
+        asyncio.run(run())
+        # The second attempt reused the session built for that account.
+        assert app.session.passwords == ["wrong", "hunter2"]

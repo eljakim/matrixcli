@@ -101,6 +101,44 @@ _UNSAFE_RE = re.compile(
 )
 
 
+class NeedsPassword(Exception):
+    """No usable saved session, and no password to log in with (or the one we
+    had was rejected). The app catches this and asks for credentials; the
+    plain-CLI entry points turn it into a message."""
+
+
+async def discover_homeserver(user_id: str) -> str:
+    """The homeserver base URL for a user id, from the domain's
+    .well-known/matrix/client if it publishes one (that is how @you:example.org
+    lives on matrix.example.org), else https://<domain>. Empty for a user id
+    with no domain."""
+    domain = user_id.split(":", 1)[1].strip() if ":" in user_id else ""
+    if not domain:
+        return ""
+    fallback = f"https://{domain}"
+    try:
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                f"https://{domain}/.well-known/matrix/client"
+            ) as resp:
+                if resp.status != 200:
+                    return fallback
+                # content_type=None: servers serve this as text/plain often
+                # enough that insisting on application/json breaks discovery.
+                data = await resp.json(content_type=None)
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError):
+        return fallback
+    base = ""
+    if isinstance(data, dict):
+        entry = data.get("m.homeserver")
+        if isinstance(entry, dict) and isinstance(entry.get("base_url"), str):
+            base = entry["base_url"].strip().rstrip("/")
+    # https only: a well-known that downgrades to http would put the access
+    # token on the wire in the clear.
+    return base if base.startswith("https://") else fallback
+
+
 def _clean(text) -> str:
     """Strip terminal-control and bidi-override characters from an untrusted
     server string before it can reach the renderer. Anything that is not a
@@ -591,8 +629,10 @@ class MatrixSession:
 
     async def connect(self, progress=None) -> tuple[bool, str]:
         """Restore from a cached token if possible, else log in with the
-        Keychain password and cache a fresh token. ``progress(msg)`` if given is
-        called with short status strings for the loading screen."""
+        stored password and cache a fresh token. ``progress(msg)`` if given is
+        called with short status strings for the loading screen. Raises
+        NeedsPassword when only credentials are missing, so the caller can ask
+        for them instead of failing the launch."""
         def step(msg: str) -> None:
             if progress is not None:
                 progress(msg)
@@ -679,20 +719,19 @@ class MatrixSession:
 
         password = self.cfg.get_password()
         if not password:
+            # The token path above may have opened an http session; close it
+            # so a CLI exit does not warn about an unclosed one. nio reopens
+            # it on the next request, so a retry after asking still works.
+            await self.client.close()
             if store_reset:
-                return False, (
-                    "Your encryption store could not be opened (it was written "
-                    "under the previous store key) and has been reset. No login "
-                    "password is in the keyring to sign in fresh.\n"
-                    f"Store one with: {self.cfg.store_password_hint()}\n"
-                    "then relaunch, run 'matrix --verify', and "
-                    "'matrix --import-keys <your key export>' to restore history."
+                raise NeedsPassword(
+                    "The encryption store could not be opened (it was written "
+                    "under the previous store key) and has been reset, so this "
+                    "device has to sign in again. Afterwards run "
+                    "'matrix --verify' and 'matrix --import-keys <your key "
+                    "export>' to restore encrypted history."
                 )
-            return (
-                False,
-                "No cached token and no password in the keyring.\n"
-                f"Store one with: {self.cfg.store_password_hint()}",
-            )
+            raise NeedsPassword("No saved session; sign in to continue.")
 
         step("logging in with password")
         # The token path may already have loaded the store for the now-revoked
@@ -728,6 +767,11 @@ class MatrixSession:
             store_reset = True
             resp = await self.client.login(password, device_name=self.cfg.device_name)
         if isinstance(resp, LoginError):
+            if getattr(resp, "status_code", "") in ("M_FORBIDDEN", "M_UNAUTHORIZED"):
+                # Wrong password or wrong user id: worth asking again. Other
+                # login errors (rate limited, server down) are not.
+                await self.client.close()
+                raise NeedsPassword(f"Login failed: {resp.message}")
             return False, f"login failed: {resp.message}"
         if stale_device and resp.device_id != stale_device:
             await self.client.close()
@@ -748,7 +792,7 @@ class MatrixSession:
                 "device. Run 'matrix --verify' and 'matrix --import-keys "
                 "<your key export>' to restore encrypted history."
             )
-        return True, "logged in with Keychain password (token cached)"
+        return True, "logged in with your password (token cached)"
 
     def _insecure_homeserver(self) -> bool:
         """True when the homeserver URL would send the bearer token in the

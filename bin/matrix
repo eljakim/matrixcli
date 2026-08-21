@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Run the Poetry-managed matrixcli client from any directory. Path arguments,
-# both standalone (the FILE after --import-keys, --export-keys or -c) and in
-# equals form (--import-keys=FILE, --config=FILE), are resolved against the
-# current working directory; other flags like --verify are passed through
-# untouched.
+# Run the matrixcli client from any directory, installing its dependencies the
+# first time (and again whenever poetry.lock changes). Path arguments, both
+# standalone (the FILE after --import-keys, --export-keys or -c) and in equals
+# form (--import-keys=FILE, --config=FILE), are resolved against the current
+# working directory; other flags like --verify are passed through untouched.
 set -euo pipefail
 
 # Resolve this script's real location, following symlinks, so a symlink in
@@ -12,7 +12,9 @@ source="${BASH_SOURCE[0]}"
 while [ -L "$source" ]; do
   dir="$(cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd)"
   source="$(readlink "$source")"
-  [[ "$source" != /* ]] && source="$dir/$source"
+  if [[ "$source" != /* ]]; then
+    source="$dir/$source"
+  fi
 done
 script_dir="$(cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd)"
 project_dir="$(dirname "$script_dir")"
@@ -34,6 +36,132 @@ for arg in "$@"; do
     esac
 done
 
-# -P (not -C) points Poetry at the project while keeping the caller's working
-# directory, so relative paths passed on the command line still resolve.
-exec poetry -P "$project_dir" run matrix ${forwarded+"${forwarded[@]}"}
+# Poetry is only needed to install; once the virtualenv exists the launcher
+# runs the app straight out of it, so a missing poetry is not fatal.
+poetry=""
+if command -v poetry >/dev/null 2>&1; then
+    poetry="$(command -v poetry)"
+else
+    # pipx, the official installer and MacPorts all drop it in one of these,
+    # so a PATH without ~/.local/bin still works.
+    for candidate in "$HOME/.local/bin/poetry" "$HOME/.poetry/bin/poetry" \
+                     /opt/local/bin/poetry /usr/local/bin/poetry; do
+        if [ -x "$candidate" ]; then
+            poetry="$candidate"
+            break
+        fi
+    done
+fi
+
+# poetry.toml asks for an in-project .venv; fall back to asking Poetry where
+# the environment lives in case that setting is overridden globally.
+app="$project_dir/.venv/bin/matrix"
+if [ ! -x "$app" ] && [ -n "$poetry" ]; then
+    env_path="$( (cd "$project_dir" && "$poetry" env info --path) 2>/dev/null || true)"
+    if [ -n "$env_path" ] && [ -x "$env_path/bin/matrix" ]; then
+        app="$env_path/bin/matrix"
+    fi
+fi
+
+# A copy of the lock file the environment was built from: if it differs, the
+# dependencies moved on (a git pull, usually) and need reinstalling.
+stamp="${app%/bin/matrix}/.installed-from-lock"
+
+if [ -x "$app" ] && cmp -s "$project_dir/poetry.lock" "$stamp"; then
+    exec "$app" ${forwarded+"${forwarded[@]}"}
+fi
+
+if [ -z "$poetry" ]; then
+    if [ -x "$app" ]; then
+        echo "matrixcli: poetry.lock changed but poetry was not found; starting the existing environment anyway." >&2
+        echo "matrixcli: install Poetry and rerun this launcher if the app fails to start." >&2
+        exec "$app" ${forwarded+"${forwarded[@]}"}
+    fi
+    cat >&2 <<EOF
+matrixcli is not installed yet, and installing it needs Poetry, which was not
+found on your PATH.
+
+Install Poetry, then run this launcher again: it installs everything else by
+itself.
+
+  Debian / Ubuntu   sudo apt install -y pipx && pipx install poetry && pipx ensurepath
+  macOS (MacPorts)  sudo port install poetry
+  Anywhere          curl -sSL https://install.python-poetry.org | python3 -
+
+pipx and the installer script put poetry in ~/.local/bin, so open a new shell
+afterwards (or add that directory to your PATH) before trying again.
+Poetry's own instructions: https://python-poetry.org/docs/#installation
+
+Or install without Poetry, ignoring the pinned versions in poetry.lock
+(on Debian/Ubuntu install python3-venv first):
+
+  python3 -m venv $project_dir/.venv
+  $project_dir/.venv/bin/pip install -e $project_dir
+EOF
+    exit 1
+fi
+
+# Poetry needs an interpreter matching requires-python in pyproject.toml.
+python_bin=""
+for py in python3 python3.14 python3.13 python3.12 python3.11 python3.10; do
+    if command -v "$py" >/dev/null 2>&1 &&
+       "$py" -c 'import sys; sys.exit(0 if (3, 10) <= sys.version_info < (3, 15) else 1)' 2>/dev/null; then
+        python_bin="$py"
+        break
+    fi
+done
+if [ -z "$python_bin" ]; then
+    cat >&2 <<'EOF'
+matrixcli needs Python 3.10 to 3.14, and no interpreter in that range was found
+on your PATH.
+
+  Debian / Ubuntu   sudo apt install -y python3.12 python3.12-venv
+  macOS (MacPorts)  sudo port install python312
+
+Then run this launcher again.
+EOF
+    exit 1
+fi
+
+if [ -x "$app" ]; then
+    echo "matrixcli: syncing dependencies with poetry.lock ..." >&2
+else
+    echo "matrixcli: first run, installing dependencies into $project_dir/.venv ..." >&2
+fi
+
+if [ "$python_bin" != python3 ]; then
+    # The default python3 is out of range but a usable one is installed.
+    (cd "$project_dir" && "$poetry" env use "$python_bin")
+fi
+
+if ! (cd "$project_dir" && "$poetry" install); then
+    cat >&2 <<EOF
+
+matrixcli: "poetry install" failed; its output is above.
+
+Fix what it complains about and run this launcher again, or install by hand:
+
+  cd $project_dir && poetry install
+EOF
+    exit 1
+fi
+
+if [ ! -x "$app" ]; then
+    env_path="$( (cd "$project_dir" && "$poetry" env info --path) 2>/dev/null || true)"
+    if [ -n "$env_path" ] && [ -x "$env_path/bin/matrix" ]; then
+        app="$env_path/bin/matrix"
+        stamp="$env_path/.installed-from-lock"
+    else
+        cat >&2 <<EOF
+matrixcli: "poetry install" finished but no "matrix" command turned up in the
+virtualenv. Try a clean install:
+
+  cd $project_dir && poetry env remove --all && poetry install
+EOF
+        exit 1
+    fi
+fi
+
+cp "$project_dir/poetry.lock" "$stamp" 2>/dev/null || true
+
+exec "$app" ${forwarded+"${forwarded[@]}"}
