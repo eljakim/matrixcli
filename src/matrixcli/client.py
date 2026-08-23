@@ -24,6 +24,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from urllib.parse import quote, urlsplit
+from uuid import uuid4
 
 _verify_log = logging.getLogger("matrixcli.verify")
 # NullHandler so a swallowed-callback report never reaches logging's
@@ -32,11 +33,18 @@ _verify_log = logging.getLogger("matrixcli.verify")
 _log = logging.getLogger("matrixcli")
 _log.addHandler(logging.NullHandler())
 
+import hmac
+
 import aiohttp
+import vodozemac
+from Crypto.Cipher import AES
+from Crypto.PublicKey import ECC
+from Crypto.Signature import eddsa
 
 from nio import (
     AsyncClient,
     AsyncClientConfig,
+    KeyVerificationAccept,
     KeyVerificationCancel,
     KeyVerificationKey,
     KeyVerificationMac,
@@ -171,6 +179,262 @@ def _sas_emoji(sas) -> list[tuple[str, str]]:
     """
     indices = sas.established_sas.bytes(sas._extra_info).emoji_indices
     return [Sas.emoji[i] for i in indices]
+
+
+def _single_key(obj) -> str | None:
+    """The one ed25519 key a /keys/query cross-signing key object carries,
+    or None for anything else."""
+    if not isinstance(obj, dict):
+        return None
+    keys = obj.get("keys")
+    if not isinstance(keys, dict) or len(keys) != 1:
+        return None
+    ((key_id, key),) = keys.items()
+    return key if isinstance(key, str) and key_id == f"ed25519:{key}" else None
+
+
+def _b64(data: bytes) -> str:
+    """Unpadded standard base64, the Matrix convention for keys."""
+    return base64.b64encode(data).decode().rstrip("=")
+
+
+def _unb64(text) -> bytes:
+    """base64 as clients write it (padding optional); ValueError on junk."""
+    if not isinstance(text, str):
+        raise ValueError("not base64 text")
+    return base64.b64decode(text + "=" * (-len(text) % 4))
+
+
+_BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def _decode_security_key(text: str) -> bytes | None:
+    """The 32 secret-storage key bytes behind an Element Security Key
+    ("EsTx abcd ..."): base58 of 0x8B 0x01, the key, and a parity byte.
+    None when the text is not one (a Security Phrase, or a typo)."""
+    raw = "".join(text.split())
+    if not raw or any(c not in _BASE58 for c in raw):
+        return None
+    n = 0
+    for c in raw:
+        n = n * 58 + _BASE58.index(c)
+    leading = len(raw) - len(raw.lstrip("1"))
+    data = bytes(leading) + n.to_bytes((n.bit_length() + 7) // 8, "big")
+    parity = 0
+    for b in data:
+        parity ^= b
+    if len(data) != 35 or data[:2] != b"\x8b\x01" or parity:
+        return None
+    return data[2:34]
+
+
+def _ssss_keys(key: bytes, name: str) -> tuple[bytes, bytes]:
+    """The AES and HMAC keys m.secret_storage.v1.aes-hmac-sha2 derives for
+    one secret: HKDF-SHA256 over the storage key, zero salt, the secret's
+    name as info, 64 bytes split in two."""
+    prk = hmac.new(bytes(32), key, hashlib.sha256).digest()
+    info = name.encode()
+    aes_key = hmac.new(prk, info + b"\x01", hashlib.sha256).digest()
+    mac_key = hmac.new(prk, aes_key + info + b"\x02", hashlib.sha256).digest()
+    return aes_key, mac_key
+
+
+def _ssss_ctr(aes_key: bytes, iv: bytes):
+    """AES-256-CTR as WebCrypto runs it for secret storage: the low 64 bits
+    of the 16-byte iv are the counter."""
+    return AES.new(aes_key, AES.MODE_CTR, nonce=iv[:8], initial_value=iv[8:])
+
+
+def _ssss_decrypt(key: bytes, name: str, blob) -> bytes | None:
+    """One secret-storage payload ({iv, ciphertext, mac}) opened with the
+    storage key: HMAC-SHA256 over the ciphertext checked first, then
+    decrypted. None on a bad MAC or a malformed blob, which is where a
+    wrong Security Key shows up."""
+    if not isinstance(blob, dict):
+        return None
+    try:
+        iv, ciphertext, mac = (_unb64(blob[k]) for k in ("iv", "ciphertext", "mac"))
+    except (KeyError, ValueError):
+        return None
+    if len(iv) != 16:
+        return None
+    aes_key, mac_key = _ssss_keys(key, name)
+    if not hmac.compare_digest(
+        hmac.new(mac_key, ciphertext, hashlib.sha256).digest(), mac
+    ):
+        return None
+    return _ssss_ctr(aes_key, iv).decrypt(ciphertext)
+
+
+def _ssss_key_matches(key: bytes, description: dict) -> bool:
+    """A key description carries 32 zero bytes encrypted under the empty
+    name as a check value; recompute and compare. One without it (older
+    clients) cannot be checked here and passes: a wrong key still fails
+    the secret's own MAC."""
+    try:
+        iv, mac = _unb64(description["iv"]), _unb64(description["mac"])
+    except (KeyError, ValueError):
+        return True
+    if len(iv) != 16:
+        return False
+    aes_key, mac_key = _ssss_keys(key, "")
+    ciphertext = _ssss_ctr(aes_key, iv).encrypt(bytes(32))
+    return hmac.compare_digest(
+        hmac.new(mac_key, ciphertext, hashlib.sha256).digest(), mac
+    )
+
+
+
+def _ed25519_from_seed(seed: bytes):
+    """A pycryptodome Ed25519 key from a 32-byte private seed. Its signatures
+    verify under vodozemac (checked in the tests), which is what nio and the
+    homeserver validate cross-signatures with."""
+    return ECC.construct(curve="Ed25519", seed=seed)
+
+
+def _ed25519_public(seed: bytes) -> str:
+    return _b64(_ed25519_from_seed(seed).public_key().export_key(format="raw"))
+
+
+def _sign_object(seed: bytes, obj: dict) -> str:
+    """The account's canonical-json signature of ``obj`` (its own signatures
+    and unsigned block excluded, per the spec) under the ed25519 ``seed``."""
+    body = {k: v for k, v in obj.items() if k not in ("signatures", "unsigned")}
+    signer = eddsa.new(_ed25519_from_seed(seed), "rfc8032")
+    return _b64(signer.sign(Api.to_canonical_json(body).encode()))
+
+
+def _signed_by(obj, user_id: str, key_id: str, key: str) -> bool:
+    """True when ``obj`` (a /keys/query device or cross-signing key object)
+    carries a valid ed25519 signature by ``user_id``'s ``ed25519:<key_id>``,
+    checked against the public ``key``. Cross-signing keys sign under their
+    own public key as the id; devices under their device id."""
+    if not isinstance(obj, dict):
+        return False
+    sig = ((obj.get("signatures") or {}).get(user_id) or {}).get(f"ed25519:{key_id}")
+    if not isinstance(sig, str):
+        return False
+    body = {k: v for k, v in obj.items() if k not in ("signatures", "unsigned")}
+    try:
+        vodozemac.Ed25519PublicKey.from_base64(key).verify_signature(
+            Api.to_canonical_json(body).encode(),
+            vodozemac.Ed25519Signature.from_base64(sig),
+        )
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
+def _base64_commitment_check(sas):
+    """A drop-in for a Sas instance's ``_check_commitment`` that recomputes
+    the responder's commitment as unpadded base64 instead of nio's hex, so an
+    initiating matrixcli accepts the base64 commitment a responding matrixcli
+    (or Element) sends. Same formula as the responder writes in ``on_start``."""
+
+    def check(key: str) -> bool:
+        raw = key.encode() + Api.to_canonical_json(sas.start_verification().content).encode()
+        return sas.commitment == base64.b64encode(hashlib.sha256(raw).digest()).decode().rstrip("=")
+
+    return check
+
+
+def _mac_with_master(sas, master_pub: str):
+    """A ``get_mac`` replacement for a Sas that also MACs the account master
+    key under ``ed25519:<master_pub>``, the way Element does. nio's own
+    ``get_mac`` covers only the device key, so a peer verifying against
+    matrixcli could never learn (and pin) the identity; adding the master key
+    here lets the peer confirm the identity from the emoji compare alone,
+    without its own Security Key. The receiver's nio skips the non-device
+    entry when checking, and our ``_master_key_from_mac`` reads it."""
+    original = sas.get_mac
+
+    def get_mac():
+        message = original()
+        info = (
+            "MATRIX_KEY_VERIFICATION_MAC"
+            f"{sas.own_user}{sas.own_device}"
+            f"{sas.other_olm_device.user_id}{sas.other_olm_device.id}"
+            f"{sas.transaction_id}"
+        )
+        key_id = f"ed25519:{master_pub}"
+        mac = dict(message.content.get("mac") or {})
+        mac[key_id] = sas.established_sas.calculate_mac(master_pub, info + key_id)
+        message.content["mac"] = mac
+        # The `keys` MAC covers the full sorted list of key ids; recompute it
+        # now that the master key is in the set, or the peer rejects the mac.
+        message.content["keys"] = sas.established_sas.calculate_mac(
+            ",".join(sorted(mac)), info + "KEY_IDS"
+        )
+        return message
+
+    return get_mac
+
+
+def _master_key_from_mac(sas, event) -> str | None:
+    """The account's master cross-signing key as vouched for by the peer's
+    ``m.key.verification.mac``, or None. Alongside its device key, a
+    cross-signed peer MACs its master key under the id ``ed25519:<key>``.
+    nio checks the list of ids as a whole but skips every non-device entry,
+    so this re-checks that one entry with the shared secret. Only meaningful
+    once ``sas.verified``: the peer is then a device whose key we compared
+    in person, so what it says the identity is, is the identity."""
+    if event is None or not sas.verified or sas.other_olm_device is None:
+        return None
+    other = sas.other_olm_device
+    info = (
+        f"MATRIX_KEY_VERIFICATION_MAC{other.user_id}{other.id}"
+        f"{sas.own_user}{sas.own_device}{sas.transaction_id}"
+    )
+    for key_id, mac in (event.mac or {}).items():
+        algo, _, key = key_id.partition(":")
+        if algo != "ed25519" or not key or key == other.id:
+            continue
+        if mac == sas.established_sas.calculate_mac(key, info + key_id):
+            return key
+    return None
+
+
+@dataclass
+class OwnDevice:
+    """One session on our own account, as ``:verify`` lists it."""
+
+    device_id: str
+    display_name: str
+    last_seen_ts: int  # ms, 0 when the server did not say
+    last_seen_ip: str
+    fingerprint: str  # ed25519 key; "" for a device that published none
+    cross_signed: bool  # validly signed by the account's self-signing key
+    verified_here: bool  # this client SAS-verified it (nio's trust state)
+    is_this: bool
+
+
+@dataclass
+class SessionReport:
+    devices: list[OwnDevice]
+    master_key: str | None  # as the server publishes it; None: no cross-signing
+    pinned_key: str | None  # the identity this client confirmed in person
+    error: str = ""
+
+    @property
+    def identity_confirmed(self) -> bool:
+        return bool(self.master_key) and self.master_key == self.pinned_key
+
+    @property
+    def identity_changed(self) -> bool:
+        """The server now publishes a different identity than the one we
+        pinned: someone reset cross-signing, or the server is lying."""
+        return bool(self.master_key and self.pinned_key) and not self.identity_confirmed
+
+    @property
+    def this_device(self) -> OwnDevice | None:
+        return next((d for d in self.devices if d.is_this), None)
+
+    @property
+    def this_verified(self) -> bool:
+        """What other clients mean by a verified session: cross-signed by an
+        identity this client has confirmed."""
+        me = self.this_device
+        return self.identity_confirmed and me is not None and me.cross_signed
 
 
 @dataclass
@@ -431,6 +695,11 @@ class MatrixSession:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.state = cfg.load_state()
+        # Cross-signing private seeds, used to self-sign, cross-sign peers,
+        # and vouch for the identity in a SAS. Restored from the keyring if a
+        # previous 'k' unlock persisted them (keyringless hosts keep them in
+        # memory for the session only); unlock_cross_signing fills/saves them.
+        self._cross_signing: dict[str, bytes] = cfg.load_cross_signing()
         self.my_name = cfg.user_id  # our own display name, filled on first sync
         self.direct_by_room: dict[str, str] = {}  # room_id -> other user id
         self.timelines: dict[str, deque[Message]] = defaultdict(
@@ -1525,25 +1794,26 @@ class MatrixSession:
     # --- interactive SAS (emoji) device verification ----------------------
 
     async def prepare_verification(self) -> None:
-        """Make our own devices' keys known (so nio can build the SAS object for
-        the incoming start) and drain any stale to-device backlog from earlier
-        cancelled attempts, before we start listening. Draining happens here,
+        """Drain any stale to-device backlog from earlier cancelled attempts
+        before the plain-CLI flow starts listening. Draining happens here,
         with no callbacks registered, so old request/cancel events don't trip
-        the live handler."""
+        the live handler. (The TUI needs none of this: its sync loop has been
+        consuming to-device events all along.)"""
         await self.client.sync(timeout=3000)
-        if self.cfg.user_id not in self.client.olm.tracked_users:
-            self.client.olm.add_changed_users({self.cfg.user_id})
-        try:
-            await self.client.keys_query()
-        except LocalProtocolError:
-            pass
         # A couple of quick syncs flush (and mark processed) any redelivered
         # to-device events from previous runs.
         await self.client.sync(timeout=2000)
         await self.client.sync(timeout=2000)
 
-    async def verify_interactive(self, confirm, announce=None) -> str:
-        """Respond to an emoji (SAS) verification that you start from Element.
+    async def begin_verification(self, confirm, announce=None, *, initiate=None):
+        """Arm an emoji (SAS) verification of one of your own sessions.
+
+        With ``initiate=None`` we are the *responder*: you start the
+        verification from the other device (Element, or another matrixcli)
+        and we answer. With ``initiate=<device_id>`` we are the *initiator*:
+        we send the request to that session and drive the handshake, which
+        is how one matrixcli verifies another (neither can be started from
+        a bare terminal otherwise).
 
         matrix-nio only models the legacy ``m.key.verification.start``
         handshake, not the ``request -> ready -> start`` phase modern Element
@@ -1553,9 +1823,17 @@ class MatrixSession:
         ``start`` nio understands; we then drive accept/key/mac and finish with a
         ``done``. This is the path that makes Element share room keys with us.
 
+        The handlers are fed by whatever ``sync()`` the caller keeps running:
+        the TUI's sync loop, or ``verify_interactive``'s own. Returns
+        ``(result, stop)``: ``result`` is a future that resolves to
+        ``(ok, message)`` once the handshake ends either way, and
+        ``await stop()`` removes the handlers, cancelling a verification still
+        in flight so the other device stops waiting.
+
         ``confirm(emoji)`` is awaited with ``(glyph, name)`` tuples and returns
-        True if they match. ``announce(msg)`` if given is awaited with progress
-        strings. Returns a human-readable result.
+        True if they match. It runs in its own task, not inside the sync that
+        delivered the key, so it may take as long as the user needs.
+        ``announce(msg)`` if given is awaited with progress strings.
         """
         # matrix-nio 0.26's SAS handshake has THREE wire-incompatibilities with
         # modern Element (Rust crypto), each worked around here. All are scoped
@@ -1573,15 +1851,45 @@ class MatrixSession:
         #   3. Emoji: nio's Sas.get_emoji() re-packs vodozemac's already-final
         #      emoji_indices (old libolm raw-bytes logic), scrambling them. Fix:
         #      _sas_emoji() maps the indices directly; used in on_key.
-        # (nio's _check_commitment has the same hex bug as #2 but is only reached
-        # when nio *initiates*, which it cannot do here, so it never bites us.)
+        #   4. Initiator commitment check: as the initiator nio verifies the
+        #      responder's accept `commitment` with the same hex logic as #2
+        #      (Sas._check_commitment), so against a base64 commitment it
+        #      would cancel. Fix: the initiator's Sas gets an instance
+        #      _check_commitment that recomputes base64 (in on_ready).
         Sas._mac_normal = "hkdf-hmac-sha256.v2"
         Sas._mac_v1 = ["hkdf-hmac-sha256.v2"]
 
-        done: dict[str, str] = {}
+        # If this session has unlocked cross-signing, it can vouch for the
+        # account identity: include the master key in the mac we send so the
+        # peer pins it (see _mac_with_master). None otherwise.
+        master_seed = self._cross_signing.get("m.cross_signing.master")
+        master_pub = _ed25519_public(master_seed) if master_seed else None
+
+        # nio builds the SAS object for the incoming start from its device
+        # store, so our own other devices' keys must be fresh: a session that
+        # logged in since the last query would otherwise be "unknown" and its
+        # start silently dropped.
+        if self.client.olm is not None:
+            self.client.olm.add_changed_users({self.cfg.user_id})
+        try:
+            await self.client.keys_query()
+        except LocalProtocolError:
+            pass
+
+        result: asyncio.Future[tuple[bool, str]] = (
+            asyncio.get_running_loop().create_future()
+        )
         # The verification we've committed to. Once set, events for any other
         # transaction id (stale redeliveries from earlier attempts) are ignored.
         active: dict[str, str] = {}  # txn, other_user, other_device
+        # The peer's mac event, kept for master-key pinning once verified.
+        macs: dict[str, KeyVerificationMac] = {}
+        pending: list[asyncio.Task] = []  # the confirm task, for stop()
+        started_uuid = str(uuid4())  # our txn when we initiate
+
+        def finish(msg: str, ok: bool = False) -> None:
+            if not result.done():
+                result.set_result((ok, msg))
 
         async def say(msg: str) -> None:
             if announce is not None:
@@ -1595,7 +1903,8 @@ class MatrixSession:
             from the same device we pinned. Guards every later step so a second
             sender cannot ride an in-progress transaction id."""
             return (
-                is_active(getattr(event, "transaction_id", None))
+                not result.done()
+                and is_active(getattr(event, "transaction_id", None))
                 and event.sender == active.get("other_user")
             )
 
@@ -1616,6 +1925,8 @@ class MatrixSession:
             )
 
         async def on_unknown(event) -> None:
+            if result.done():
+                return
             etype = event.source.get("type")
             content = event.source.get("content", {})
             txn = content.get("transaction_id")
@@ -1658,12 +1969,60 @@ class MatrixSession:
                     {"from_device": self.client.device_id, "methods": ["m.sas.v1"]},
                 )
             elif (
+                etype == "m.key.verification.ready"
+                and initiate is not None
+                and is_active(txn)
+                and event.sender == active.get("other_user")
+            ):
+                # We initiated: the peer accepted the request, now WE send the
+                # start it will accept. nio's create-as-initiator generates its
+                # own txn, so build the Sas directly with ours to keep the
+                # request/ready/start framing on one transaction id.
+                if txn in self.client.key_verifications:
+                    return  # a duplicate ready; the start already went out
+                device = self._peer_olm_device(active["other_device"])
+                if device is None:
+                    finish("could not find that session's keys to verify")
+                    return
+                sas = Sas(
+                    self.cfg.user_id,
+                    self.client.device_id,
+                    self.client.olm.account.identity_keys["ed25519"],
+                    device,
+                    transaction_id=txn,
+                    short_auth_string=["emoji"],
+                    mac_methods=Sas._mac_v1,
+                )
+                # Bug 4: check the responder's accept commitment as base64.
+                sas._check_commitment = _base64_commitment_check(sas)
+                if master_pub:
+                    sas.get_mac = _mac_with_master(sas, master_pub)
+                self.client.key_verifications[txn] = sas
+                await say("sending start…")
+                start = sas.start_verification()
+                resp = await self.client.to_device(start)
+                if isinstance(resp, ToDeviceError):
+                    finish(f"start failed: {resp.message}")
+            elif (
                 etype == "m.key.verification.done"
                 and is_active(txn)
                 and event.sender == active.get("other_user")
             ):
                 await send_raw("m.key.verification.done", {})
-                done.setdefault("result", "verification complete; device verified")
+                finish("verification complete; device verified", ok=True)
+
+        async def on_accept(event) -> None:
+            # Only the initiator receives an accept. nio has already run
+            # receive_accept_event (state -> accepted) and, per the protocol,
+            # it is now our turn to reveal our key.
+            if initiate is None or not from_peer(event):
+                return
+            sas = self.client.key_verifications.get(event.transaction_id)
+            if sas is None:
+                return
+            share = await self.client.to_device(sas.share_key())
+            if isinstance(share, ToDeviceError):
+                finish(f"key share failed: {share.message}")
 
         async def on_start(event) -> None:
             _verify_log.debug(
@@ -1681,7 +2040,7 @@ class MatrixSession:
                 return
             if "emoji" not in event.short_authentication_string:
                 await self.client.cancel_key_verification(event.transaction_id, reject=True)
-                done["result"] = "other device does not support emoji verification"
+                finish("other device does not support emoji verification")
                 return
             # Rewrite nio's hex commitment as the unpadded base64 the spec
             # requires, before the accept (which reads sas.commitment) goes out.
@@ -1695,17 +2054,70 @@ class MatrixSession:
                     base64.b64encode(hashlib.sha256(raw).digest()).decode().rstrip("=")
                 )
                 _verify_log.debug("rewrote commitment to base64: %s", sas.commitment)
+                if master_pub:
+                    sas.get_mac = _mac_with_master(sas, master_pub)
             await say("accepting verification…")
             resp = await self.client.accept_key_verification(event.transaction_id)
             _verify_log.debug("accept resp=%s", type(resp).__name__)
             if isinstance(resp, ToDeviceError):
-                done["result"] = f"accept failed: {resp.message}"
+                finish(f"accept failed: {resp.message}")
             # Deliberately do NOT share our key here. As the responder, nio put a
             # commitment to our key in the accept; the SAS protocol requires us
             # to reveal the key only AFTER the initiator sends theirs. Sending it
             # now (before their key) makes the initiator discard it as an
             # out-of-order message and hang on the emoji screen forever. The key
             # goes out in on_key instead.
+
+        async def complete_if_verified(txn: str) -> None:
+            """Both macs are in and ours was confirmed: nio has marked the
+            device verified (it covers either arrival order itself); pin the
+            account identity the peer vouched for and close the exchange."""
+            sas = self.client.key_verifications.get(txn)
+            if sas is None or not sas.verified or result.done():
+                return
+            master = _master_key_from_mac(sas, macs.get(txn))
+            if master:
+                self.state.setdefault("master_keys", {})[self.cfg.user_id] = master
+                self.cfg.save_state(self.state)
+            # If we hold the account's self-signing key (unlocked with the
+            # Security Key this session), cross-sign the peer now that SAS has
+            # authenticated its device key: that is what turns the other
+            # matrixcli into a "verified" session for every client, not just a
+            # locally trusted one.
+            dev = sas.other_olm_device.id if sas.other_olm_device else "?"
+            note = ""
+            if self._cross_signing.get("m.cross_signing.self_signing") and sas.other_olm_device:
+                signed = await self._cross_sign_peer(sas.other_olm_device)
+                note = " and cross-signed it" if signed else ""
+            # Send our 'done'; the peer replies with its own, closing the
+            # request/ready framing on its side. Settle the future first:
+            # decide() and on_mac can both get here, and only the one that
+            # resolves it sends the done.
+            finish(f"verified the other device ({dev}){note}", ok=True)
+            await send_raw("m.key.verification.done", {})
+
+        async def decide(txn: str, emoji) -> None:
+            """Ask the user, off the sync: a long stare at the emoji must not
+            stall (or, under the TUI's sync timeout, cancel) the sync that
+            delivered them."""
+            try:
+                matches = await confirm(emoji)
+            except asyncio.CancelledError:
+                return
+            if result.done():
+                return  # the peer cancelled, or stop() ran, while we looked
+            if not matches:
+                await self.client.cancel_key_verification(txn, reject=True)
+                finish("you reported the emoji did not match; cancelled")
+                return
+            await say("confirming…")
+            # Sends our mac; nio also marks the device verified here when the
+            # peer's mac already landed.
+            resp = await self.client.confirm_short_auth_string(txn)
+            if isinstance(resp, ToDeviceError):
+                finish(f"confirm failed: {resp.message}")
+                return
+            await complete_if_verified(txn)
 
         async def on_key(event) -> None:
             _verify_log.debug(
@@ -1721,34 +2133,29 @@ class MatrixSession:
             if sas is None:
                 _verify_log.debug("no SAS object for txn")
                 return
-            # We just received the initiator's key (nio established the SAS in
-            # receive_key_event before this callback). Now reveal ours, so the
-            # initiator can compute the same SAS and show its emoji, then compare.
-            key_msg = sas.share_key()
-            _verify_log.debug(
-                "sharing key: state=%s other=%s/%s content=%s",
-                getattr(sas, "state", None),
-                getattr(getattr(sas, "other_olm_device", None), "user_id", None),
-                getattr(getattr(sas, "other_olm_device", None), "id", None),
-                getattr(key_msg, "content", None),
-            )
-            share = await self.client.to_device(key_msg)
-            _verify_log.debug("share_key resp=%s", type(share).__name__)
-            if isinstance(share, ToDeviceError):
-                done["result"] = f"key share failed: {share.message}"
-                return
-            # Compute emoji via _sas_emoji (bug 3 below), not sas.get_emoji().
+            if initiate is None:
+                # Responder: we just received the initiator's key (nio
+                # established the SAS in receive_key_event before this
+                # callback). Now reveal ours, so the initiator can compute the
+                # same SAS and show its emoji, then compare. (As the initiator
+                # our key already went out in on_accept.)
+                key_msg = sas.share_key()
+                _verify_log.debug(
+                    "sharing key: state=%s other=%s/%s content=%s",
+                    getattr(sas, "state", None),
+                    getattr(getattr(sas, "other_olm_device", None), "user_id", None),
+                    getattr(getattr(sas, "other_olm_device", None), "id", None),
+                    getattr(key_msg, "content", None),
+                )
+                share = await self.client.to_device(key_msg)
+                _verify_log.debug("share_key resp=%s", type(share).__name__)
+                if isinstance(share, ToDeviceError):
+                    finish(f"key share failed: {share.message}")
+                    return
+            # Compute emoji via _sas_emoji (bug 3 above), not sas.get_emoji().
             emoji = _sas_emoji(sas)
             _verify_log.debug("SAS emoji=%s", [name for _, name in emoji])
-            matches = await confirm(emoji)
-            if not matches:
-                await self.client.cancel_key_verification(event.transaction_id, reject=True)
-                done["result"] = "you reported the emoji did not match; cancelled"
-                return
-            await say("confirming…")
-            resp = await self.client.confirm_short_auth_string(event.transaction_id)
-            if isinstance(resp, ToDeviceError):
-                done["result"] = f"confirm failed: {resp.message}"
+            pending.append(asyncio.create_task(decide(event.transaction_id, emoji)))
 
         async def on_mac(event) -> None:
             _verify_log.debug(
@@ -1758,24 +2165,11 @@ class MatrixSession:
             )
             if not from_peer(event):
                 return
-            sas = self.client.key_verifications.get(event.transaction_id)
-            if sas is None:
-                return
-            try:
-                mac = sas.get_mac()
-            except LocalProtocolError:
-                # We haven't confirmed yet; the next sync re-delivers the event.
-                return
-            resp = await self.client.to_device(mac)
-            if isinstance(resp, ToDeviceError):
-                done["result"] = f"mac send failed: {resp.message}"
-                return
-            if sas.verified:
-                # Send our 'done'; Element replies with its own, closing the
-                # request/ready framing on its side.
-                await send_raw("m.key.verification.done", {})
-                dev = sas.other_olm_device.id if sas.other_olm_device else "?"
-                done["result"] = f"verified the other device ({dev})"
+            # nio has already checked this mac (receive_mac_event ran before
+            # the callback). If we confirmed first the exchange is complete
+            # now; otherwise decide() completes it after the user's answer.
+            macs[event.transaction_id] = event
+            await complete_if_verified(event.transaction_id)
 
         async def on_cancel(event) -> None:
             _verify_log.debug(
@@ -1787,37 +2181,415 @@ class MatrixSession:
             )
             if not from_peer(event):
                 return
-            done["result"] = f"the other device cancelled: {event.reason}"
+            finish(f"the other device cancelled: {event.reason}")
 
-        self.client.add_to_device_callback(on_unknown, (UnknownToDeviceEvent,))
-        self.client.add_to_device_callback(on_start, (KeyVerificationStart,))
-        self.client.add_to_device_callback(on_key, (KeyVerificationKey,))
-        self.client.add_to_device_callback(on_mac, (KeyVerificationMac,))
-        self.client.add_to_device_callback(on_cancel, (KeyVerificationCancel,))
+        def guarded(func):
+            """A raise inside a to-device callback would kill the caller's
+            sync tick (the TUI swallows it and the flow silently hangs);
+            surface it as the outcome instead."""
 
-        while "result" not in done:
+            async def run(*args) -> None:
+                try:
+                    await func(*args)
+                except Exception as exc:
+                    _verify_log.exception("%s failed", func.__name__)
+                    finish(f"verification failed: {type(exc).__name__}: {exc}")
+
+            return run
+
+        decide = guarded(decide)
+        handlers = (
+            (guarded(on_unknown), (UnknownToDeviceEvent,)),
+            (guarded(on_start), (KeyVerificationStart,)),
+            (guarded(on_accept), (KeyVerificationAccept,)),
+            (guarded(on_key), (KeyVerificationKey,)),
+            (guarded(on_mac), (KeyVerificationMac,)),
+            (guarded(on_cancel), (KeyVerificationCancel,)),
+        )
+        for func, kinds in handlers:
+            self.client.add_to_device_callback(func, kinds)
+        mine = {func for func, _ in handlers}
+
+        if initiate is not None:
+            # We drive: pin the transaction now and send the request; the
+            # peer's ready (handled in on_unknown) makes us send the start.
+            active["txn"] = started_uuid
+            active["other_user"] = self.cfg.user_id
+            active["other_device"] = initiate
+            await say(f"asking session {initiate} to verify…")
+            await send_raw(
+                "m.key.verification.request",
+                {
+                    "from_device": self.client.device_id,
+                    "methods": ["m.sas.v1"],
+                    "timestamp": int(time.time() * 1000),
+                },
+            )
+
+        async def stop() -> None:
+            self.client.to_device_callbacks = [
+                cb for cb in self.client.to_device_callbacks if cb.func not in mine
+            ]
+            for task in pending:
+                task.cancel()
+            if (result.done() and not result.cancelled()) or not active.get("txn"):
+                return
+            # Abandoned mid-flight: tell the other device, so Element stops
+            # waiting on its emoji screen, and settle the future for anyone
+            # still awaiting it.
+            txn = active["txn"]
             try:
-                resp = await self.client.sync(timeout=10000)
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-                # Offline raises (max_timeouts) instead of retrying forever
-                # inside nio; keep polling rather than dumping a traceback
-                # over the interactive verification.
-                await asyncio.sleep(2)
-                continue
-            for ev in getattr(resp, "to_device_events", []) or []:
-                _verify_log.debug(
-                    "SYNC to_device %s from %s: %s",
-                    type(ev).__name__,
-                    getattr(ev, "sender", None),
-                    getattr(ev, "source", None),
+                if txn in self.client.key_verifications:
+                    await self.client.cancel_key_verification(txn)
+                else:
+                    await send_raw(
+                        "m.key.verification.cancel",
+                        {"code": "m.user", "reason": "Verification cancelled"},
+                    )
+            except Exception:
+                pass  # best effort; the peer times out on its own
+            finish("cancelled")
+
+        return result, stop
+
+    async def verify_interactive(self, confirm, announce=None) -> str:
+        """The plain-CLI wrapper around ``begin_verification``: runs its own
+        sync loop until the handshake ends. Returns a human-readable result."""
+        result, stop = await self.begin_verification(confirm, announce)
+        try:
+            while not result.done():
+                try:
+                    resp = await self.client.sync(timeout=10000)
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                    # Offline raises (max_timeouts) instead of retrying forever
+                    # inside nio; keep polling rather than dumping a traceback
+                    # over the interactive verification.
+                    await asyncio.sleep(2)
+                    continue
+                for ev in getattr(resp, "to_device_events", []) or []:
+                    _verify_log.debug(
+                        "SYNC to_device %s from %s: %s",
+                        type(ev).__name__,
+                        getattr(ev, "sender", None),
+                        getattr(ev, "source", None),
+                    )
+                if isinstance(resp, SyncError):
+                    if getattr(resp, "status_code", None) == "M_UNKNOWN_TOKEN":
+                        return "sync failed: this session was signed out by the server"
+                    # Error responses return immediately (no long-poll); back off
+                    # instead of hammering the server in a tight loop.
+                    await asyncio.sleep(2)
+        finally:
+            await stop()
+        return result.result()[1]
+
+    async def own_sessions(self) -> SessionReport:
+        """Every session on this account and how far each is trusted, for
+        ``:verify``. Cross-signing is read straight off ``/keys/query``
+        (matrix-nio has no model for it): a device counts as cross-signed
+        when the account's self-signing key validly signs it and the master
+        key validly signs that self-signing key. The master key itself is
+        only trusted once this client has pinned it (see
+        ``_master_key_from_mac``); until then the server could publish any
+        identity it likes, so the report says "cross-signed" but not
+        "verified"."""
+        user = self.cfg.user_id
+        pinned = (self.state.get("master_keys") or {}).get(user)
+        pinned = pinned if isinstance(pinned, str) else None
+        keys = await self._get_json(
+            "POST", "/_matrix/client/v3/keys/query", {"device_keys": {user: []}}
+        )
+        if keys is None:
+            return SessionReport(
+                [], None, pinned, error="could not fetch the account's keys"
+            )
+        devices = await self._get_json("GET", "/_matrix/client/v3/devices") or {}
+
+        def for_user(section: str):
+            block = keys.get(section)
+            return block.get(user) if isinstance(block, dict) else None
+
+        master_obj = for_user("master_keys")
+        ssk_obj = for_user("self_signing_keys")
+        master = _single_key(master_obj)
+        ssk = _single_key(ssk_obj)
+        ssk_ok = bool(master and ssk and _signed_by(ssk_obj, user, master, master))
+
+        device_keys = keys.get("device_keys")
+        device_keys = device_keys.get(user) if isinstance(device_keys, dict) else None
+        if not isinstance(device_keys, dict):
+            device_keys = {}
+        meta: dict[str, dict] = {}
+        for d in devices.get("devices") or []:
+            if isinstance(d, dict) and isinstance(d.get("device_id"), str):
+                meta[d["device_id"]] = d
+        rows = []
+        for device_id in set(device_keys) | set(meta):
+            dk = device_keys.get(device_id)
+            dk = dk if isinstance(dk, dict) else {}
+            dk_keys = dk.get("keys")
+            fingerprint = dk_keys.get(f"ed25519:{device_id}") if isinstance(dk_keys, dict) else None
+            fingerprint = fingerprint if isinstance(fingerprint, str) else ""
+            m = meta.get(device_id, {})
+            name = m.get("display_name")
+            unsigned = dk.get("unsigned")
+            if not isinstance(name, str) and isinstance(unsigned, dict):
+                name = unsigned.get("device_display_name")
+            ts = m.get("last_seen_ts")
+            ip = m.get("last_seen_ip")
+            try:
+                verified_here = self.client.device_store[user][device_id].verified
+            except (KeyError, LocalProtocolError):
+                verified_here = False
+            rows.append(
+                OwnDevice(
+                    device_id=device_id,
+                    display_name=_clean(name) if isinstance(name, str) else "",
+                    last_seen_ts=ts if isinstance(ts, int) and not isinstance(ts, bool) else 0,
+                    last_seen_ip=_clean(ip) if isinstance(ip, str) else "",
+                    fingerprint=fingerprint,
+                    cross_signed=bool(
+                        ssk_ok and fingerprint and _signed_by(dk, user, ssk, ssk)
+                    ),
+                    verified_here=bool(verified_here),
+                    is_this=device_id == self.client.device_id,
                 )
-            if isinstance(resp, SyncError):
-                if getattr(resp, "status_code", None) == "M_UNKNOWN_TOKEN":
-                    return "sync failed: this session was signed out by the server"
-                # Error responses return immediately (no long-poll); back off
-                # instead of hammering the server in a tight loop.
-                await asyncio.sleep(2)
-        return done["result"]
+            )
+        rows.sort(key=lambda d: (not d.is_this, -d.last_seen_ts, d.device_id))
+
+        if master and pinned is None:
+            # Verified with an older matrixcli, before the mac pinned the
+            # identity: a device we SAS-verified then may have signed the
+            # master key itself, which vouches for it just as well.
+            for d in rows:
+                if d.verified_here and d.fingerprint and _signed_by(
+                    master_obj, user, d.device_id, d.fingerprint
+                ):
+                    pinned = master
+                    self.state.setdefault("master_keys", {})[user] = master
+                    self.cfg.save_state(self.state)
+                    break
+        return SessionReport(rows, master, pinned)
+
+    def _peer_olm_device(self, device_id: str):
+        """The nio ``OlmDevice`` for one of our own other sessions, or None.
+        begin_verification's keys_query has just refreshed the store."""
+        try:
+            return self.client.device_store[self.cfg.user_id][device_id]
+        except (KeyError, LocalProtocolError):
+            return None
+
+    async def _cross_sign_peer(self, olm_device) -> bool:
+        """Cross-sign a session we just authenticated over SAS, so every
+        client sees it as verified. The device key is refetched and its
+        fingerprint checked against the one SAS compared, so a server that
+        swapped the key cannot get it signed."""
+        ssk = self._cross_signing.get("m.cross_signing.self_signing")
+        if not ssk:
+            return False
+        user = self.cfg.user_id
+        keys = await self._get_json(
+            "POST", "/_matrix/client/v3/keys/query", {"device_keys": {user: []}}
+        )
+        obj = (
+            ((keys or {}).get("device_keys") or {}).get(user) or {}
+        ).get(olm_device.id) if isinstance(keys, dict) else None
+        if not isinstance(obj, dict):
+            return False
+        published = (obj.get("keys") or {}).get(f"ed25519:{olm_device.id}")
+        if published != olm_device.ed25519:
+            # The key SAS authenticated is not the one the server now serves.
+            return False
+        ok, _ = await self._upload_signatures(
+            {user: {olm_device.id: self._cross_sign(ssk, obj)}}
+        )
+        return ok
+
+    async def unlock_cross_signing(self, recovery: str) -> tuple[bool, str]:
+        """Bring the account's cross-signing keys into matrixcli from
+        server-side secret storage, unlocked with the account's Security Key
+        (``EsTx ...``) or Security Phrase, and sign THIS device with the
+        self-signing key so every client sees it as verified.
+
+        This is the Element-free path to a verified session: nio cannot
+        create or read cross-signing on its own, so we open secret storage
+        by hand (SSSS, ``m.secret_storage.v1.aes-hmac-sha2``), decrypt the
+        master and self-signing private keys, check they match the identity
+        the server publishes, cross-sign this device, and pin the master key
+        as confirmed. Returns ``(ok, message)``.
+
+        The private keys are held in memory for the rest of the session (so
+        the same unlock can also cross-sign a peer after an emoji check), but
+        never written to disk.
+        """
+        recovery = recovery.strip()
+        if not recovery:
+            return False, "no Security Key entered"
+        user = self.cfg.user_id
+
+        default = await self._account_data("m.secret_storage.default_key")
+        key_id = default.get("key") if isinstance(default, dict) else None
+        if not isinstance(key_id, str) or not key_id:
+            return False, (
+                "this account has no default secret-storage key; set up "
+                "Secure Backup in Element once, then try again"
+            )
+        desc = await self._account_data(f"m.secret_storage.key.{key_id}")
+        if not isinstance(desc, dict):
+            return False, "could not read the secret-storage key description"
+        if desc.get("algorithm") != "m.secret_storage.v1.aes-hmac-sha2":
+            return False, (
+                f"unsupported secret-storage algorithm {desc.get('algorithm')!r}"
+            )
+
+        storage_key = self._derive_storage_key(recovery, desc)
+        if storage_key is None:
+            return False, (
+                "that does not look like this account's Security Key or "
+                "Security Phrase"
+            )
+        if not _ssss_key_matches(storage_key, desc):
+            return False, "the Security Key or Phrase did not match"
+
+        secrets: dict[str, bytes] = {}
+        for name in (
+            "m.cross_signing.master",
+            "m.cross_signing.self_signing",
+            "m.cross_signing.user_signing",
+        ):
+            data = await self._account_data(name)
+            enc = (data or {}).get("encrypted") if isinstance(data, dict) else None
+            blob = enc.get(key_id) if isinstance(enc, dict) else None
+            plain = _ssss_decrypt(storage_key, name, blob)
+            if plain is None:
+                if name == "m.cross_signing.user_signing":
+                    continue  # only needed to verify OTHER users; optional here
+                return False, f"could not decrypt {name} from secret storage"
+            try:
+                secrets[name] = _unb64(plain.decode("ascii"))
+            except (ValueError, UnicodeDecodeError):
+                return False, f"{name} in secret storage is malformed"
+            if len(secrets[name]) != 32:
+                return False, f"{name} in secret storage is the wrong size"
+
+        # The identity the server publishes must be the one whose private
+        # keys we just decrypted; otherwise a tampered server could make us
+        # sign under a key it controls.
+        keys = await self._get_json(
+            "POST", "/_matrix/client/v3/keys/query", {"device_keys": {user: []}}
+        )
+        if not isinstance(keys, dict):
+            return False, "could not fetch the account's keys to check against"
+        master_pub = _single_key((keys.get("master_keys") or {}).get(user))
+        ssk_pub = _single_key((keys.get("self_signing_keys") or {}).get(user))
+        if _ed25519_public(secrets["m.cross_signing.master"]) != master_pub:
+            return False, (
+                "the master key in secret storage does not match the one the "
+                "server publishes; refusing to sign"
+            )
+        if _ed25519_public(secrets["m.cross_signing.self_signing"]) != ssk_pub:
+            return False, "the self-signing key does not match the server's"
+
+        device_obj = (
+            ((keys.get("device_keys") or {}).get(user) or {}).get(self.client.device_id)
+        )
+        if not isinstance(device_obj, dict):
+            return False, "the server has no device keys for this session yet"
+
+        signed = self._cross_sign(secrets["m.cross_signing.self_signing"], device_obj)
+        ok, detail = await self._upload_signatures({user: {self.client.device_id: signed}})
+        if not ok:
+            return False, f"signing this device failed: {detail}"
+
+        # We hold the master private key, so the identity is confirmed for real.
+        self.state.setdefault("master_keys", {})[user] = master_pub
+        self.cfg.save_state(self.state)
+        self._cross_signing = secrets
+        # Persist to the keyring so a single unlock sticks across launches;
+        # returns False (and stays memory-only) on a keyringless host.
+        persisted = self.cfg.save_cross_signing(secrets)
+        tail = "" if persisted else " (this session only; no keyring to store it in)"
+        return True, "unlocked cross-signing and verified this session" + tail
+
+    def _derive_storage_key(self, recovery: str, desc: dict) -> bytes | None:
+        """The 32-byte secret-storage key from the recovery input: a Security
+        Key decodes directly; a Security Phrase is stretched with the PBKDF2
+        parameters in the key description. None when it is neither."""
+        key = _decode_security_key(recovery)
+        if key is not None:
+            return key
+        passphrase = desc.get("passphrase")
+        if not isinstance(passphrase, dict) or passphrase.get("algorithm") != "m.pbkdf2":
+            return None
+        salt = passphrase.get("salt")
+        iterations = passphrase.get("iterations")
+        if not isinstance(salt, str) or not isinstance(iterations, int) or iterations <= 0:
+            return None
+        bits = passphrase.get("bits")
+        length = bits // 8 if isinstance(bits, int) and bits > 0 else 32
+        try:
+            return hashlib.pbkdf2_hmac(
+                "sha512", recovery.encode(), salt.encode(), iterations, dklen=length
+            )
+        except (ValueError, OverflowError):
+            return None
+
+    def _cross_sign(self, ssk_seed: bytes, key_obj: dict) -> dict:
+        """``key_obj`` (a device key or another user's master key) with our
+        account's self-signing signature added, ready to upload. Existing
+        signatures are kept so the endpoint sees the device's own too."""
+        ssk_pub = _ed25519_public(ssk_seed)
+        signed = dict(key_obj)
+        sigs = {
+            u: dict(v) for u, v in (signed.get("signatures") or {}).items()
+        }
+        sigs.setdefault(self.cfg.user_id, {})[f"ed25519:{ssk_pub}"] = _sign_object(
+            ssk_seed, key_obj
+        )
+        signed["signatures"] = sigs
+        return signed
+
+    async def _upload_signatures(self, signed: dict) -> tuple[bool, str]:
+        resp = await self._get_json(
+            "POST", "/_matrix/client/v3/keys/signatures/upload", signed
+        )
+        if resp is None:
+            return False, "the server rejected the signature upload"
+        failures = resp.get("failures") if isinstance(resp, dict) else None
+        if failures:
+            return False, f"the server reported {failures}"
+        return True, "ok"
+
+    async def _account_data(self, event_type: str):
+        """One global account-data event, or None. Used for secret storage,
+        which nio does not model."""
+        return await self._get_json(
+            "GET",
+            f"/_matrix/client/v3/user/{quote(self.cfg.user_id, safe='')}"
+            f"/account_data/{quote(event_type, safe='')}",
+        )
+
+    async def _get_json(self, method: str, path: str, body: dict | None = None):
+        """One authenticated request on its own connection, parsed as JSON;
+        None on any failure. nio's own helpers parse into its response
+        classes, which have no model for what these endpoints return."""
+        headers = {"Authorization": f"Bearer {self.client.access_token}"}
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.request(
+                    method,
+                    f"{self.cfg.homeserver}{path}",
+                    json=body,
+                    headers=headers,
+                    allow_redirects=False,
+                ) as r:
+                    if r.status != 200:
+                        return None
+                    data = await r.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
 
     # --- event handling ---------------------------------------------------
 

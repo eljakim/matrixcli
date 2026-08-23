@@ -193,6 +193,24 @@ def _fmt_time(ts: int) -> str:
     return time.strftime("%H:%M", lt) if lt else "--:--"
 
 
+def _fmt_ago(ts_ms: int) -> str:
+    """A device's last-seen time as a distance ("3 h ago"), a date once it
+    is more than two weeks back, "" when the server gave none."""
+    if not ts_ms:
+        return ""
+    secs = max(0.0, time.time() - ts_ms / 1000)
+    if secs < 90:
+        return "just now"
+    if secs < 3600:
+        return f"{int(secs // 60)} min ago"
+    if secs < 86400:
+        return f"{int(secs // 3600)} h ago"
+    if secs < 14 * 86400:
+        return f"{int(secs // 86400)} d ago"
+    lt = _safe_localtime(ts_ms)
+    return time.strftime("%d %b %Y", lt) if lt else ""
+
+
 def _fmt_size(size) -> str:
     # Coerced, not assumed: info.size is sender-controlled and reaches here
     # during the timeline render, where a TypeError takes the whole app down.
@@ -3492,7 +3510,406 @@ class AboutScreen(ModalScreen):
             text.append(f"version {v}\n", style="dim")
         text.append("\n(c) 2026 Eljakim Schrijvers\n")
         text.append("eljakim@gmail.com", style="dim")
+        text.append("\n\n")
+        text.append(":help", style="bold")
+        text.append(" for actual help", style="dim")
         yield Static(text, id="aboutbox")
+
+
+class SecurityKeyScreen(ModalScreen):
+    """The Security Key (or Security Phrase) prompt behind ':verify' → k. The
+    input is masked; Enter or Ctrl+S submits, Esc cancels. Dismisses with the
+    typed text, or None."""
+
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+        Binding("ctrl+s", "submit", "Unlock"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="seckeybox"):
+            yield Label("Verify with Security Key", id="seckeytitle")
+            yield Static(
+                Text(
+                    "Type this account's Security Key (the 'EsTx …' code Element "
+                    "showed when you set up Secure Backup) or your Security "
+                    "Phrase. matrixcli reads the cross-signing keys from secret "
+                    "storage and signs this session. It is used once and never "
+                    "written to disk.",
+                ),
+                id="seckeyhelp",
+            )
+            yield Input(password=True, id="seckey", compact=True)
+            yield Static(Text("Enter unlocks · Esc cancels", style="dim"), id="seckeyhint")
+
+    def on_mount(self) -> None:
+        self.query_one("#seckey", Input).focus()
+
+    def action_submit(self) -> None:
+        self.dismiss(self.query_one("#seckey", Input).value)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class SecurityKeyScreen(ModalScreen):
+    """The Security Key (or Security Phrase) prompt behind ':verify' -> k. The
+    input is masked; Enter or Ctrl+S submits, Esc cancels. Dismisses with the
+    typed text, or None."""
+
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+        Binding("ctrl+s", "submit", "Unlock"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="seckeybox"):
+            yield Label("Verify with Security Key", id="seckeytitle")
+            yield Static(
+                Text(
+                    "Type this account's Security Key (the 'EsTx ...' code "
+                    "Element showed when you set up Secure Backup) or your "
+                    "Security Phrase. matrixcli reads the cross-signing keys "
+                    "from secret storage and signs this session. It is used "
+                    "once and never written to disk."
+                ),
+                id="seckeyhelp",
+            )
+            yield Input(password=True, id="seckey", compact=True)
+            yield Static(
+                Text("Enter unlocks | Esc cancels", style="dim"), id="seckeyhint"
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#seckey", Input).focus()
+
+    def action_submit(self) -> None:
+        self.dismiss(self.query_one("#seckey", Input).value)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class VerifyScreen(ModalScreen):
+    """":verify": every session on this account and how far each is trusted,
+    with this one at the top, and the three Element-free ways to verify:
+
+    - "k": unlock cross-signing with the account's Security Key / Phrase and
+      sign THIS session (no other device needed).
+    - select another session with "j"/"k" and "v": start an emoji (SAS)
+      verification against it, which matrixcli drives as the initiator. Once
+      this session holds the cross-signing keys (via "k"), a successful
+      compare also cross-signs the other session, so a second matrixcli
+      becomes verified for everyone.
+    - "v" on this own session (or with nothing else selected): wait for a
+      verification started from another device (Element or another matrixcli).
+
+    The to-device handshake rides the app's normal sync loop, so the rest of
+    the app stays live underneath."""
+
+    BINDINGS = [
+        ("escape", "close", "Close"),
+        Binding("q", "close", "Close", show=False),
+        Binding("enter", "enter", "Close", show=False),
+        Binding("v", "verify", "Verify", show=False),
+        Binding("k", "security_key", "Security Key", show=False),
+        Binding("j", "move(1)", "Down", show=False),
+        Binding("down", "move(1)", "Down", show=False),
+        Binding("up", "move(-1)", "Up", show=False),
+        Binding("r", "reload", "Refresh", show=False),
+        # Only while the emoji are on screen; Enter deliberately does NOT
+        # confirm them, a reflex keypress must not vouch for a stranger.
+        Binding("y", "answer(True)", "Match", show=False),
+        Binding("n", "answer(False)", "No match", show=False),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.report = None
+        self._verifying = False  # a verification worker is up
+        self._answer: asyncio.Future | None = None  # the pending y/n
+        self._emoji: list | None = None
+        self._status = ""  # latest progress line from the handshake
+        self._outcome: tuple[bool, str] | None = None  # how the last run ended
+        self._selected = 0  # highlighted row in the session list
+        self._target: str = ""  # who the current run verifies ("" = passive)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="verifybox"):
+            yield Label("Sessions", id="verifytitle")
+            yield Static("", id="verifysummary")
+            yield Static("", id="verifylist")
+            yield Static("", id="verifyflow")
+            yield Static("", id="verifyhint")
+
+    def on_mount(self) -> None:
+        self.load()
+
+    @work(exclusive=True, group="verify_report")
+    async def load(self) -> None:
+        """Re-read keys and devices from the server and repaint. Nothing is
+        started automatically: the summary explains the choices ("k" for the
+        Security Key, select a session and "v" to verify it, "v" alone to
+        wait)."""
+        self.query_one("#verifysummary", Static).update(
+            Text("Checking this account's sessions...", style="dim")
+        )
+        self.render_flow()
+        self.report = await self.app.session.own_sessions()
+        self._selected = min(self._selected, max(0, len(self.report.devices) - 1))
+        self.render_report()
+        self.render_flow()
+
+    def render_report(self) -> None:
+        rep = self.report
+        me = rep.this_device
+        summary = Text()
+        if rep.error:
+            summary.append(f"X {rep.error}", style="bold red")
+        elif rep.this_verified:
+            summary.append("✓ This session is verified", style="bold green")
+            summary.append(
+                ": cross-signed by the account identity this client confirmed."
+            )
+        elif rep.identity_changed:
+            summary.append("! The account identity has changed", style="bold red")
+            summary.append(
+                "\nThe server now publishes a different cross-signing identity "
+                "than the one this client confirmed earlier: either cross-signing "
+                "was reset from another client (Element: Settings -> Encryption -> "
+                "Reset) or the server is not to be trusted. Verify again only if "
+                "you know which."
+            )
+        elif rep.master_key is None:
+            summary.append("✗ This session is not verified", style="bold red")
+            summary.append(
+                "\nCross-signing is not set up on this account, so there is no "
+                "identity for sessions to be verified against. Sign in with "
+                "Element once to set up cross-signing and a Security Key; after "
+                "that everything here works without it."
+            )
+        elif me is not None and me.cross_signed:
+            summary.append("~ Cross-signed, identity unconfirmed", style="bold yellow")
+            summary.append(
+                "\nOther clients already trust this session, but this client has "
+                "not confirmed the account identity in person yet. Press k to "
+                "confirm it with your Security Key, or verify from another device."
+            )
+        else:
+            summary.append("✗ This session is not verified", style="bold red")
+            summary.append(
+                "\nPress k to verify it with your Security Key (no other device "
+                "needed), or start a verification from another session."
+            )
+        self.query_one("#verifysummary", Static).update(summary)
+
+        table = Table(
+            box=None, show_header=True, header_style="dim", padding=(0, 1)
+        )
+        table.add_column(" ")
+        table.add_column("")
+        # Names are free text from other clients: clip rather than wrap a
+        # row into two.
+        table.add_column("session", no_wrap=True, max_width=32, overflow="ellipsis")
+        table.add_column("id", no_wrap=True)
+        table.add_column("trust")
+        table.add_column("last seen", justify="right", no_wrap=True)
+        for i, d in enumerate(rep.devices):
+            if d.cross_signed and rep.identity_confirmed:
+                mark = Text("✓", style="green")
+            elif d.cross_signed:
+                mark = Text("~", style="yellow")
+            else:
+                mark = Text("✗", style="red")
+            trust = "cross-signed" if d.cross_signed else "not cross-signed"
+            if d.verified_here:
+                trust += " · verified here"
+            if d.is_this:
+                trust += " · this session"
+            selected = i == self._selected
+            row_style = "bold" if (selected or d.is_this) else ""
+            # Text(), not str: names come from other clients and the server,
+            # and a str cell would be parsed as markup.
+            table.add_row(
+                Text("›" if selected else " ", style="bold cyan"),
+                mark,
+                Text(d.display_name or "(unnamed)", style=row_style),
+                Text(d.device_id, style="dim"),
+                Text(trust),
+                Text(_fmt_ago(d.last_seen_ts), style="dim"),
+            )
+        self.query_one("#verifylist", Static).update(table if rep.devices else "")
+
+    def _target_device(self):
+        rep = self.report
+        if rep is None or not rep.devices:
+            return None
+        return rep.devices[min(self._selected, len(rep.devices) - 1)]
+
+    def render_flow(self) -> None:
+        if not self.is_attached:
+            return  # a late progress line after Esc closed the box
+        text = Text()
+        if self._emoji is not None:
+            who = f" with {self._target}" if self._target else " with the other device"
+            text.append(f"Compare these emoji{who}:\n\n", style="bold")
+            text.append("    " + "   ".join(f"{g} {n}" for g, n in self._emoji))
+            text.append("\n\nDo they match?  ")
+            text.append("y", style="bold")
+            text.append(" yes   ")
+            text.append("n", style="bold")
+            text.append(" no")
+            hint = "Esc cancels"
+        elif self._verifying and self._target:
+            text.append(f"Verifying session {self._target}...\n", style="bold")
+            text.append(
+                "Accept the request on that session (another matrixcli shows it "
+                "in its own :verify; Element pops a toast)."
+            )
+            if self._status:
+                text.append(f"\n\n{self._status}", style="dim")
+            hint = "Esc cancels"
+        elif self._verifying:
+            text.append("Waiting for a verification request...\n", style="bold")
+            text.append(
+                "Start it from another session for this account "
+                f"({self.app.session.client.device_id}): in Element, Settings -> "
+                "Sessions -> this session -> Verify; in another matrixcli, select "
+                "this session in :verify and press v."
+            )
+            if self._status:
+                text.append(f"\n\n{self._status}", style="dim")
+            hint = "Esc cancels"
+        elif self._outcome is not None:
+            ok, message = self._outcome
+            text.append(message, style="bold green" if ok else "bold red")
+            hint = self._idle_hint()
+        elif self.report is None:
+            hint = "Esc closes"
+        else:
+            hint = self._idle_hint()
+        flow = self.query_one("#verifyflow", Static)
+        flow.update(text)
+        flow.display = bool(text)  # no empty block between list and hint
+        self.query_one("#verifyhint", Static).update(Text(hint, style="dim"))
+
+    def _idle_hint(self) -> str:
+        target = self._target_device()
+        if target is not None and not target.is_this:
+            verb = f"v verify {target.device_id}"
+        else:
+            verb = "v wait for a request"
+        return f"k Security Key · {verb} · j/k select · r refresh · q/Esc close"
+
+    def action_move(self, delta: int) -> None:
+        rep = self.report
+        if rep is None or not rep.devices or self._verifying:
+            return
+        self._selected = (self._selected + delta) % len(rep.devices)
+        self.render_report()
+        self.render_flow()
+
+    def action_verify(self) -> None:
+        if self._verifying:
+            return
+        target = self._target_device()
+        initiate = None if target is None or target.is_this else target.device_id
+        self._target = initiate or ""
+        self._verifying = True
+        self.run_worker(self._verify(initiate), group="verify_flow", exclusive=True)
+
+    def action_security_key(self) -> None:
+        if self._verifying:
+            return
+
+        def unlocked(recovery) -> None:
+            if recovery:
+                self.run_worker(self._unlock(recovery), group="verify_flow")
+
+        self.app.push_screen(SecurityKeyScreen(), unlocked)
+
+    async def _unlock(self, recovery: str) -> None:
+        self._outcome = None
+        self._status = "unlocking cross-signing..."
+        self.render_flow()
+        try:
+            self._outcome = await self.app.session.unlock_cross_signing(recovery)
+        except Exception as exc:
+            self._outcome = (False, f"unlock failed: {type(exc).__name__}: {exc}")
+        self._status = ""
+        self.render_flow()
+        self.load()
+
+    async def _verify(self, initiate: str | None) -> None:
+        loop = asyncio.get_running_loop()
+
+        async def announce(msg: str) -> None:
+            self._status = msg
+            self.render_flow()
+
+        async def confirm(emoji) -> bool:
+            self._emoji = emoji
+            self._answer = loop.create_future()
+            self.render_flow()
+            try:
+                return await self._answer
+            finally:
+                self._answer = None
+                self._emoji = None
+
+        self._outcome = None
+        self._status = ""
+        self.render_flow()
+        try:
+            result, stop = await self.app.session.begin_verification(
+                confirm, announce, initiate=initiate
+            )
+        except Exception as exc:
+            self._verifying = False
+            self._target = ""
+            self._outcome = (False, f"could not start: {type(exc).__name__}: {exc}")
+            self.render_flow()
+            return
+        try:
+            # shield: Esc cancels this worker, and a plain await would take
+            # the result future down with it, before stop() could read it.
+            self._outcome = await asyncio.shield(result)
+        finally:
+            # Also on cancel (Esc): tells the other device, so it does not sit
+            # on its emoji screen waiting for us.
+            await stop()
+            self._verifying = False
+            self._target = ""
+        self.render_flow()
+        # The peer uploads its cross-signature over this device right after the
+        # handshake; give that a moment, then re-read so the list (and the
+        # verdict at the top) reflects it.
+        await asyncio.sleep(2)
+        self.load()
+
+    def action_answer(self, matches: bool) -> None:
+        if self._answer is not None and not self._answer.done():
+            self._answer.set_result(matches)
+
+    def action_reload(self) -> None:
+        if not self._verifying:
+            self.load()
+
+    def action_enter(self) -> None:
+        # A reflex Enter mid-handshake must neither confirm the emoji nor
+        # abandon the run; it closes only when nothing is pending.
+        if not self._verifying:
+            self.action_close()
+
+    def action_close(self) -> None:
+        self.workers.cancel_group(self, "verify_flow")
+        self.dismiss()
 
 
 class SyncAllScreen(ModalScreen):
@@ -3811,12 +4228,57 @@ class SettingsScreen(ModalScreen):
             self.dismiss(None)
 
 
+class HelpScreen(ModalScreen):
+    """":help" (or ":?"): the list of ":" commands. Any key closes it."""
+
+    BINDINGS = [
+        ("escape", "dismiss", "Close"),
+        ("enter", "dismiss", "Close"),
+        ("q", "dismiss", "Close"),
+        ("question_mark", "dismiss", "Close"),
+    ]
+
+    # (command, what it does). Kept next to the dispatch in
+    # action_command_line, which is the source of truth for what runs.
+    COMMANDS = [
+        (":help", "show this list (:? works too)"),
+        (":q", "close the current page (quit from the dashboard)"),
+        (":q!", "quit immediately, from anywhere"),
+        (":<number>", "in a room, jump to that message (:1 is the oldest)"),
+        (":settings", "account and app settings (:set works too)"),
+        (":verify", "verify sessions and manage cross-signing"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        table = Table(box=None, show_header=False, padding=(0, 2, 0, 0))
+        table.add_column(style="bold")
+        table.add_column()
+        for name, what in self.COMMANDS:
+            table.add_row(Text(name), Text(what))
+        tip = Text()
+        tip.append("Try vim shortcuts (", style="dim")
+        tip.append("hjkl", style="bold")
+        tip.append(", ", style="dim")
+        tip.append("g", style="bold")
+        tip.append("/", style="dim")
+        tip.append("G", style="bold")
+        tip.append(", ", style="dim")
+        tip.append("/", style="bold")
+        tip.append(" to search) to get around.", style="dim")
+        with Vertical(id="helpbox"):
+            yield Label("Commands", id="helptitle")
+            yield Static(table)
+            yield Static(tip, id="helptip")
+
+
 class CommandScreen(ModalScreen):
     """":" anywhere outside a text editor: a one-line vim-style command
     entry docked at the bottom, dismissing with the typed command on Enter
     (None on Escape). The app interprets the result: "q!" quits
-    unconditionally, "q" closes the page like the q key, and a bare number
-    jumps to that message in the open room (":1" = the oldest)."""
+    unconditionally, "q" closes the page like the q key, a bare number
+    jumps to that message in the open room (":1" = the oldest), "settings"
+    opens the settings screen, "verify" the sessions screen, and "help"
+    the list of commands."""
 
     BINDINGS = [("escape", "dismiss", "Cancel")]
 
@@ -4742,9 +5204,45 @@ class MatrixApp(App):
        line would spill one cell onto a blank row and stripe the picture. */
     #previewart { width: auto; height: auto; text-wrap: nowrap; }
     #reactionsbox #reactors { height: auto; max-height: 20; }
-    AboutScreen, ConfirmScreen, SettingsScreen, SetupScreen, SyncAllScreen {
+    AboutScreen, ConfirmScreen, SettingsScreen, SetupScreen, SyncAllScreen,
+    VerifyScreen, SecurityKeyScreen, HelpScreen {
         align: center middle;
     }
+    #helpbox {
+        width: 66;
+        max-width: 92%;
+        height: auto;
+        padding: 1 2;
+        border: round $accent;
+        background: $panel;
+    }
+    #helptitle { text-style: bold; padding: 0 0 1 0; }
+    #helptip { padding: 1 0 0 0; }
+    #seckeybox {
+        width: 70;
+        max-width: 90%;
+        height: auto;
+        padding: 1 2;
+        border: round $accent;
+        background: $panel;
+    }
+    #seckeytitle { text-style: bold; padding: 0 0 1 0; }
+    #seckeyhelp { padding: 0 0 1 0; }
+    #seckeyhint { padding: 1 0 0 0; }
+    #seckeybox Input { background: $boost; }
+    #verifybox {
+        width: 96%;
+        max-width: 120;
+        height: auto;
+        max-height: 90%;
+        padding: 1 2;
+        border: round $accent;
+        background: $panel;
+    }
+    #verifytitle { text-style: bold; padding: 0 0 1 0; }
+    #verifylist { padding: 1 0 0 0; }
+    #verifyflow { padding: 1 0 0 0; }
+    #verifyhint { padding: 1 0 0 0; }
     #syncbox {
         width: 60;
         max-width: 80%;
@@ -4883,9 +5381,24 @@ class MatrixApp(App):
                         "':<number>' jumps to a message inside a room",
                         severity="warning", timeout=4,
                     )
+            elif cmd in ("help", "?"):
+                if not isinstance(self.screen, HelpScreen):
+                    self.push_screen(HelpScreen())
             elif cmd in ("settings", "set"):
                 if not isinstance(self.screen, SettingsScreen):
                     self.push_screen(SettingsScreen())
+            elif cmd == "verify":
+                if self.session is None or isinstance(
+                    self.screen, (LoadingScreen, SetupScreen)
+                ):
+                    # The handshake rides the sync loop, which startup owns
+                    # until the home screen is up.
+                    self.notify(
+                        "':verify' needs the connection up first",
+                        severity="warning", timeout=4,
+                    )
+                elif not isinstance(self.screen, VerifyScreen):
+                    self.push_screen(VerifyScreen())
             else:
                 self.notify(
                     f"Not a command: {cmd}", severity="warning", timeout=4,
@@ -5387,7 +5900,8 @@ def main() -> None:
     parser.add_argument(
         "--verify",
         action="store_true",
-        help="Verify this session via emoji (SAS), started from another device.",
+        help="Verify this session via emoji (SAS), started from another device "
+        "(the same flow as ':verify' inside the app, without the TUI).",
     )
     parser.add_argument(
         "--import-keys",

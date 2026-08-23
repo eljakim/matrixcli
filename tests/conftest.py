@@ -29,6 +29,9 @@ def session(cfg, monkeypatch):
     monkeypatch.setattr(
         Config, "get_or_create_store_key", lambda self: "test-store-key"
     )
+    # Keep tests off the real keyring: no persisted cross-signing keys unless a
+    # test sets them up explicitly.
+    monkeypatch.setattr(Config, "load_cross_signing", lambda self: {})
     return MatrixSession(cfg)
 
 

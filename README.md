@@ -177,7 +177,8 @@ On the home screen:
   focused): `:q!` quits immediately from anywhere, `:q` closes the current
   page like the `q` key, a bare number inside a room jumps to that message
   (see the room keys below), `:settings` (or `:set`) opens the settings
-  screen, `Esc` cancels
+  screen, `:verify` the sessions screen (below), `:help` (or `:?`) lists
+  the commands, `Esc` cancels
 - `:settings`: account and app settings. Your display name (saved to the
   homeserver), the email addresses on the account (read-only; changing them
   needs a validation mail, so that stays in Element), whether the terminal
@@ -185,6 +186,15 @@ On the home screen:
   displayed timestamp (an IANA name like `Europe/Amsterdam`; empty uses the
   system zone). The last two persist in `state.json`; `Enter` or `Ctrl+S`
   saves, `Esc` cancels
+- `:verify`: every session on the account (name, id, last seen) and how far
+  each is trusted, this one on top, with three Element-free ways to verify.
+  `k` unlocks cross-signing with your Security Key or Security Phrase and
+  signs this session (no other device needed). `j`/`k` move the selection;
+  `v` on another session starts an emoji verification against it (matrixcli
+  drives it), and `v` on this session waits for one started elsewhere. During
+  a compare, `y` matches, `n` rejects, `Esc` cancels and tells the other
+  device. `r` re-reads the server. See Device verification below for what the
+  marks mean and how the very first session works
 
 Pending invitations appear in an `Invites` section (marked `✉`) above
 Favourites whenever there are any; `Enter` accepts.
@@ -324,17 +334,63 @@ In a room:
 In a thread (opened with `T`): the composer is ready immediately and sends
 into the thread; `r`, `j`/`k`, and `Esc` work as in a room.
 
-### Device verification and history decryption
+### Device verification
 
-To make other clients trust this session, verify it via emoji (SAS) with the
-CLI as the responder:
+Open `:verify` for the session list and the three ways to verify, none of
+which need Element running. (`bin/matrix --verify` still runs the plain-CLI
+responder for the emoji flow without the TUI.)
 
-```sh
-bin/matrix --verify
-```
+1. **Security Key / Security Phrase** (`k`): matrixcli reads the account's
+   cross-signing keys straight out of server-side secret storage, unlocked
+   with the `EsTx ...` Security Key or the Security Phrase Element created
+   with Secure Backup, and signs this session. No second device is involved;
+   this session goes verified on its own. On a host with a system keyring
+   (e.g. the macOS Keychain) the unlocked keys are stored there, so `k` is a
+   one-time step; on a keyringless host (a server) they stay in memory for the
+   session, since these keys can cross-sign any device and the file fallback is
+   plaintext. Because a session must be *holding* the keys to cross-sign or
+   vouch for others, verify other sessions from one that has them (your
+   keyring-backed desktop), not from a server session.
+2. **Verify another session by emoji** (select it, then `v`): matrixcli sends
+   the verification request and drives the SAS handshake as the initiator, so
+   one matrixcli can verify another with no Element in the loop. If this
+   session already holds the cross-signing keys (from step 1), a successful
+   compare does two more things: it cross-signs the other session (making it
+   verified for every client, not just locally trusted), and it hands the
+   other session the account's master key inside the handshake so that session
+   confirms the identity too. So verifying a fresh matrixcli from your unlocked
+   one leaves it fully green, with no need to type the Security Key on it.
+3. **Respond to a verification started elsewhere** (`v` on this session, or
+   `bin/matrix --verify`): the original responder flow, for when Element or
+   another matrixcli starts the compare.
 
-then start the verification from Element (Settings -> Sessions -> this device
--> Verify session -> Compare unique emoji).
+Why the keys matter: "verified" means what Element means by it. The account
+has a cross-signing identity (a master key, set up by the first Element login
+and backed by its Security Key), the identity's self-signing key has signed
+this session, and this client has confirmed the identity itself. Emoji alone
+only sets a local "verified here" flag; a session becomes *cross-signed*
+(the shield everyone sees) only when the self-signing key signs it, and only a
+client holding that key can do it. That is why the Security Key (step 1) is
+the bootstrap: it brings the cross-signing authority into matrixcli, after
+which matrixcli can sign itself and, over an emoji check, sign other sessions.
+matrixcli confirms the identity either by holding the master key (step 1) or
+by the peer vouching for it inside the handshake: a session that holds the
+keys puts the master key in its `m.key.verification.mac`, and the other side
+pins it. Once pinned, it lives in `state.json`; the `:verify`
+list checks every signature against the pinned identity, so a server that
+later publishes a different master key shows up as "identity changed" rather
+than silently verified. The marks: `✓` cross-signed by the confirmed
+identity, `~` cross-signed by an identity this client has not confirmed yet,
+`✗` not cross-signed; "verified here" is a device this client compared emoji
+with directly.
+
+The very first session on an account still needs Element once: cross-signing
+has to exist before anything can be verified against it, and matrix-nio cannot
+create it (no cross-signing, no Security Key, no server-side key backup). Sign
+in with Element once to set up cross-signing and a Security Key; from then on
+`:verify` handles everything here without it.
+
+### History decryption
 
 Encrypted history older than this device needs the room keys. Export them from
 a client that has them (Element: Settings -> Security & Privacy -> Export E2E
@@ -377,8 +433,8 @@ nowhere, and the file cannot be read without it.
   history, use `--import-keys` (matrix-nio has no server-side key backup
   support, so the keys must come from an export).
 - Outgoing messages are sent with `ignore_unverified_devices=True` so you are
-  not blocked by unverified sessions. Use `--verify` to make your other clients
-  trust this one.
+  not blocked by unverified sessions. Use `:verify` (or `--verify`) to make
+  your other clients trust this one.
 - Room-opening recency (used for sorting) is tracked locally; it starts empty
   until you open some rooms.
 - Only one instance runs at a time: a second launch exits immediately with a

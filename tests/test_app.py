@@ -3591,3 +3591,299 @@ class TestReLoginFlow:
         asyncio.run(run())
         # The second attempt reused the session built for that account.
         assert app.session.passwords == ["wrong", "hunter2"]
+
+
+class TestFmtAgo:
+    def test_buckets(self, monkeypatch):
+        from matrixcli.app import _fmt_ago
+
+        now = 1_800_000_000.0
+        monkeypatch.setattr("matrixcli.app.time.time", lambda: now)
+        ms = lambda secs: int((now - secs) * 1000)
+        assert _fmt_ago(0) == ""
+        assert _fmt_ago(ms(10)) == "just now"
+        assert _fmt_ago(ms(5 * 60)) == "5 min ago"
+        assert _fmt_ago(ms(3 * 3600)) == "3 h ago"
+        assert _fmt_ago(ms(4 * 86400)) == "4 d ago"
+        assert re.fullmatch(r"\d\d \w{3} \d{4}", _fmt_ago(ms(40 * 86400)))
+        assert _fmt_ago(ms(-3600)) == "just now"  # clock skew never goes negative
+
+
+class TestVerifyScreen:
+    """":verify" over a fake session: the list, the key that starts each
+    Element-free path (k = Security Key, v = verify the selected session or
+    wait), and that Enter never confirms the emoji."""
+
+    def report(self, kind):
+        from matrixcli.client import OwnDevice, SessionReport
+
+        now = int(time.time() * 1000)
+        cli = OwnDevice(
+            "CLIDEV", "matrixcli", now, "", "fp1",
+            cross_signed=kind == "verified", verified_here=False, is_this=True,
+        )
+        web = OwnDevice(
+            "WEBDEV", "Element Web", now - 7_200_000, "", "fp2",
+            cross_signed=True, verified_here=kind == "verified", is_this=False,
+        )
+        if kind == "verified":
+            return SessionReport([cli, web], "MK", "MK")
+        if kind == "alone":
+            return SessionReport([cli], None, None)
+        return SessionReport([cli, web], "MK", None)
+
+    def run(self, kind, steps, unlock=(True, "unlocked cross-signing")):
+        from matrixcli.app import VerifyScreen
+
+        calls = {"begun": 0, "initiate": "sentinel", "confirm": None,
+                 "announce": None, "stopped": 0, "unlocked": None}
+        rep = self.report(kind)
+
+        async def own_sessions():
+            return rep
+
+        async def begin_verification(confirm, announce, *, initiate=None):
+            calls["begun"] += 1
+            calls["initiate"] = initiate
+            calls["confirm"], calls["announce"] = confirm, announce
+            calls["result"] = asyncio.get_running_loop().create_future()
+
+            async def stop():
+                calls["stopped"] += 1
+                if not calls["result"].done():
+                    calls["result"].set_result((False, "cancelled"))
+
+            return calls["result"], stop
+
+        async def unlock_cross_signing(recovery):
+            calls["unlocked"] = recovery
+            return unlock
+
+        session = SimpleNamespace(
+            client=SimpleNamespace(device_id="CLIDEV"),
+            own_sessions=own_sessions,
+            begin_verification=begin_verification,
+            unlock_cross_signing=unlock_cross_signing,
+        )
+
+        class VApp(App):
+            CSS = MatrixApp.CSS
+
+            def on_mount(self):
+                self.session = session
+                return self.push_screen(VerifyScreen())
+
+        def screen_text(app):
+            return "\n".join(
+                "".join(seg.text for seg in strip).rstrip()
+                for strip in app.screen._compositor.render_strips()
+            )
+
+        async def go():
+            app = VApp()
+            async with app.run_test(size=(104, 30)) as pilot:
+                await pilot.pause()
+                await pilot.pause()
+                return await steps(pilot, app, calls, screen_text)
+
+        return asyncio.run(go())
+
+    def test_opens_on_the_list_without_starting_anything(self):
+        async def steps(pilot, app, calls, screen_text):
+            return calls["begun"], screen_text(app)
+
+        begun, text = self.run("unverified", steps)
+        assert begun == 0
+        assert "This session is not verified" in text
+        assert "matrixcli" in text and "WEBDEV" in text
+        assert "k Security Key" in text
+
+    def test_v_on_this_session_waits(self):
+        async def steps(pilot, app, calls, screen_text):
+            await pilot.press("v")
+            await pilot.pause()
+            return calls["begun"], calls["initiate"], screen_text(app)
+
+        begun, initiate, text = self.run("verified", steps)
+        assert begun == 1 and initiate is None
+        assert "Waiting for a verification request" in text
+        assert "(CLIDEV)" in text
+
+    def test_selecting_a_peer_then_v_initiates_against_it(self):
+        async def steps(pilot, app, calls, screen_text):
+            await pilot.press("j")  # move to WEBDEV
+            await pilot.pause()
+            hint = screen_text(app)
+            await pilot.press("v")
+            await pilot.pause()
+            return calls["initiate"], hint, screen_text(app)
+
+        initiate, hint, text = self.run("unverified", steps)
+        assert initiate == "WEBDEV"
+        assert "v verify WEBDEV" in hint
+        assert "Verifying session WEBDEV" in text
+
+    def test_emoji_takes_y_not_enter(self):
+        async def steps(pilot, app, calls, screen_text):
+            await pilot.press("v")
+            await pilot.pause()
+            task = asyncio.ensure_future(
+                calls["confirm"]([("🐶", "Dog"), ("🐱", "Cat")])
+            )
+            await pilot.pause()
+            emoji = screen_text(app)
+            await pilot.press("enter")
+            await pilot.pause()
+            enter_done = task.done()
+            await pilot.press("y")
+            await pilot.pause()
+            answer = task.result()
+            calls["result"].set_result((True, "verified the other device (WEBDEV)"))
+            await pilot.pause()
+            return emoji, enter_done, answer, screen_text(app)
+
+        emoji, enter_done, answer, done = self.run("verified", steps)
+        assert "🐶 Dog" in emoji and "Do they match?" in emoji
+        assert not enter_done and answer is True
+        assert "verified the other device (WEBDEV)" in done
+
+    def test_n_rejects(self):
+        async def steps(pilot, app, calls, screen_text):
+            await pilot.press("v")
+            await pilot.pause()
+            task = asyncio.ensure_future(calls["confirm"]([("🐶", "Dog")]))
+            await pilot.pause()
+            await pilot.press("n")
+            await pilot.pause()
+            return task.result()
+
+        assert self.run("verified", steps) is False
+
+    def test_escape_cancels_for_the_peer_and_closes(self):
+        from matrixcli.app import VerifyScreen
+
+        async def steps(pilot, app, calls, screen_text):
+            await pilot.press("v")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            await pilot.pause()
+            return calls["stopped"], isinstance(app.screen, VerifyScreen)
+
+        stopped, still_open = self.run("verified", steps)
+        assert stopped == 1 and not still_open
+
+    def test_q_closes_the_screen(self):
+        from matrixcli.app import VerifyScreen
+
+        async def steps(pilot, app, calls, screen_text):
+            await pilot.press("q")
+            await pilot.pause()
+            return isinstance(app.screen, VerifyScreen)
+
+        assert self.run("verified", steps) is False
+
+    def test_k_prompts_for_the_security_key_and_unlocks(self):
+        from matrixcli.app import SecurityKeyScreen
+
+        async def steps(pilot, app, calls, screen_text):
+            await pilot.press("k")
+            await pilot.pause()
+            assert isinstance(app.screen, SecurityKeyScreen)
+            app.screen.query_one("#seckey").value = "EsTx secret"
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+            return calls["unlocked"], calls["begun"], screen_text(app)
+
+        recovery, begun, text = self.run("unverified", steps)
+        assert recovery == "EsTx secret"
+        assert begun == 0  # unlock is not a SAS run
+        assert "unlocked cross-signing" in text
+
+    def test_k_cancelled_does_not_unlock(self):
+        async def steps(pilot, app, calls, screen_text):
+            await pilot.press("k")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            return calls["unlocked"]
+
+        assert self.run("unverified", steps) is None
+
+
+class TestHelpCommand:
+    """':help' opens the command list; any key closes it."""
+
+    def run(self, typed):
+        from matrixcli.app import HelpScreen
+        from textual.screen import Screen
+
+        class App2(App):
+            CSS = MatrixApp.CSS
+            BINDINGS = MatrixApp.BINDINGS
+            action_command_line = MatrixApp.action_command_line
+            action_go_home = MatrixApp.action_go_home
+            action_noop = MatrixApp.action_noop
+
+            def on_mount(self):
+                self.session = SimpleNamespace()
+                return self.push_screen(Screen())
+
+        async def go():
+            app = App2()
+            async with app.run_test(size=(84, 26)) as pilot:
+                await pilot.pause()
+                await pilot.press("colon")
+                await pilot.pause()
+                for ch in typed:
+                    await pilot.press(ch)
+                await pilot.press("enter")
+                await pilot.pause()
+                opened = isinstance(app.screen, HelpScreen)
+                text = "\n".join(
+                    "".join(s.text for s in strip).rstrip()
+                    for strip in app.screen._compositor.render_strips()
+                ) if opened else ""
+                if opened:
+                    await pilot.press("q")
+                    await pilot.pause()
+                    closed = not isinstance(app.screen, HelpScreen)
+                else:
+                    closed = None
+                return opened, text, closed
+
+        return asyncio.run(go())
+
+    def test_help_lists_the_commands_and_any_key_closes(self):
+        opened, text, closed = self.run("help")
+        assert opened and closed
+        for cmd in (":help", ":q", ":q!", ":settings", ":verify"):
+            assert cmd in text
+        assert "vim shortcuts" in text and "hjkl" in text
+
+    def test_question_mark_alias(self):
+        opened, _text, closed = self.run("?")
+        assert opened and closed
+
+
+class TestAboutScreen:
+    def test_points_at_help(self):
+        from matrixcli.app import AboutScreen, MatrixApp
+
+        async def go():
+            class A(App):
+                CSS = MatrixApp.CSS
+
+                def on_mount(self):
+                    return self.push_screen(AboutScreen())
+
+            app = A()
+            async with app.run_test(size=(60, 20)) as pilot:
+                await pilot.pause()
+                return "\n".join(
+                    "".join(s.text for s in strip).rstrip()
+                    for strip in app.screen._compositor.render_strips()
+                )
+
+        assert ":help for actual help" in asyncio.run(go())

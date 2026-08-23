@@ -92,6 +92,7 @@ class TestState:
             "space_children": {},
             "cache_spaces": {},
             "settings": {},
+            "master_keys": {},
         }
 
     def test_roundtrip(self, cfg):
@@ -103,7 +104,9 @@ class TestState:
             "selected_space": "!s:hs",
         }
         cfg.save_state(state)
-        assert cfg.load_state() == {**state, "cache_spaces": {}, "settings": {}}
+        assert cfg.load_state() == {
+            **state, "cache_spaces": {}, "settings": {}, "master_keys": {}
+        }
         assert not list(cfg.state_path.parent.glob("*.tmp"))
 
     def test_corrupt_file_falls_back_to_defaults(self, cfg):
@@ -115,6 +118,7 @@ class TestState:
             "space_children": {},
             "cache_spaces": {},
             "settings": {},
+            "master_keys": {},
         }
 
     def test_non_dict_json_falls_back_to_defaults(self, cfg):
@@ -126,6 +130,7 @@ class TestState:
             "space_children": {},
             "cache_spaces": {},
             "settings": {},
+            "master_keys": {},
         }
 
     def test_missing_keys_are_added(self, cfg):
@@ -619,3 +624,60 @@ class TestVersion:
         with pyproject.open("rb") as f:
             data = tomllib.load(f)
         assert matrixcli.__version__ == data["project"]["version"]
+
+
+class TestCrossSigningPersistence:
+    """The 'k' keys survive a restart via the keyring, and never via the
+    plaintext file fallback."""
+
+    def store(self, cfg, uses_keyring):
+        s = cfg.secrets
+        s._keyring_ok = uses_keyring
+        if uses_keyring:
+            # Route keyring calls through the in-memory dict so the real
+            # Keychain is never touched.
+            backing = {}
+            import matrixcli.config as C
+
+            class FakeKeyring:
+                @staticmethod
+                def get_password(service, key):
+                    return backing.get((service, key))
+
+                @staticmethod
+                def set_password(service, key, value):
+                    backing[(service, key)] = value
+
+                @staticmethod
+                def delete_password(service, key):
+                    backing.pop((service, key), None)
+
+            C.keyring = FakeKeyring
+        return s
+
+    def test_round_trips_through_the_keyring(self, cfg, monkeypatch):
+        self.store(cfg, uses_keyring=True)
+        seeds = {"m.cross_signing.master": bytes(range(32)),
+                 "m.cross_signing.self_signing": bytes(range(32, 64))}
+        assert cfg.save_cross_signing(seeds) is True
+        # A fresh Config sharing the same (fake) keyring loads them back.
+        fresh = Config(
+            homeserver=cfg.homeserver, user_id=cfg.user_id,
+            device_name=cfg.device_name, room="", keychain_service=cfg.keychain_service,
+            store_path=cfg.store_path, state_path=cfg.state_path, config_path=cfg.config_path,
+        )
+        fresh.secrets._keyring_ok = True
+        assert fresh.load_cross_signing() == seeds
+
+    def test_keyringless_host_does_not_persist(self, cfg):
+        s = self.store(cfg, uses_keyring=False)
+        seeds = {"m.cross_signing.master": bytes(32)}
+        assert cfg.save_cross_signing(seeds) is False
+        assert cfg.load_cross_signing() == {}
+        # And nothing landed in the plaintext file.
+        assert not (s.path.exists() and "xsign" in s.path.read_text())
+
+    def test_junk_stored_value_is_ignored(self, cfg):
+        s = self.store(cfg, uses_keyring=False)
+        s.set(cfg._xsign_service, cfg.user_id, "not json")
+        assert cfg.load_cross_signing() == {}

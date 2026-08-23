@@ -27,6 +27,7 @@ Three kinds of persistence live here:
 
 from __future__ import annotations
 
+import base64
 import configparser
 import fcntl
 import hashlib
@@ -464,6 +465,50 @@ class Config:
             self.secrets.set(service, self.user_id, key)
         return key
 
+    @property
+    def _xsign_service(self) -> str:
+        return f"{self.keychain_service}-xsign"
+
+    def load_cross_signing(self) -> dict[str, bytes]:
+        """The account's cross-signing private seeds, if a previous ``k`` unlock
+        stored them. Only ever persisted to a real keyring (they are the account
+        identity's signing keys, too sensitive for the plaintext file fallback),
+        so this returns empty on a keyringless host. Maps the secret name to the
+        raw 32-byte seed."""
+        raw = self.secrets.get(self._xsign_service, self.user_id)
+        if not raw:
+            return {}
+        try:
+            stored = json.loads(raw)
+        except (ValueError, TypeError):
+            return {}
+        out: dict[str, bytes] = {}
+        if isinstance(stored, dict):
+            for name, b64 in stored.items():
+                try:
+                    seed = base64.b64decode(b64 + "=" * (-len(b64) % 4))
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(name, str) and len(seed) == 32:
+                    out[name] = seed
+        return out
+
+    def save_cross_signing(self, seeds: dict[str, bytes]) -> bool:
+        """Persist the cross-signing seeds, but ONLY to a keyring: on a host
+        without one they stay in memory for the session (``k`` again next
+        launch), because the file fallback is plaintext and these keys can
+        cross-sign any device on the account. Returns whether it persisted."""
+        if not self.secrets.uses_keyring:
+            return False
+        payload = json.dumps(
+            {name: base64.b64encode(seed).decode() for name, seed in seeds.items()}
+        )
+        self.secrets.set(self._xsign_service, self.user_id, payload)
+        return True
+
+    def clear_cross_signing(self) -> None:
+        self.secrets.delete(self._xsign_service, self.user_id)
+
     def load_token(self) -> dict | None:
         raw = self.secrets.get(self._token_service, self.user_id)
         if not raw:
@@ -511,6 +556,7 @@ class Config:
             "space_children",
             "cache_spaces",
             "settings",
+            "master_keys",
         ):
             if not isinstance(state.get(key), dict):
                 state[key] = {}

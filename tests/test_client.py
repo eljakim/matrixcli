@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import hmac
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -3843,3 +3845,988 @@ class TestAccountSettings:
 
         monkeypatch.setattr("matrixcli.client.aiohttp.ClientSession", Boom)
         assert asyncio.run(session.fetch_email_addresses()) is None
+
+
+def _signed(obj, user, key_id, account):
+    """obj with a real ed25519 signature by `account` under ed25519:<key_id>,
+    the way /keys/query publishes device and cross-signing keys."""
+    import vodozemac
+    from nio.api import Api
+
+    body = {k: v for k, v in obj.items() if k not in ("signatures", "unsigned")}
+    sig = account.sign(Api.to_canonical_json(body).encode()).to_base64()
+    out = dict(obj)
+    out.setdefault("signatures", {}).setdefault(user, {})[f"ed25519:{key_id}"] = sig
+    return out
+
+
+def _cross_signing(user, devices, master=None, ssk=None, device_sig_on_master=None):
+    """A /keys/query body for `user` with a master -> self-signing -> device
+    chain built from real vodozemac keys. `devices` maps device id to its
+    Account; only the ids listed in `signed` get the self-signing signature.
+    Returns (body, master_key, ssk_key)."""
+    import vodozemac
+
+    master = master or vodozemac.Account()
+    ssk = ssk or vodozemac.Account()
+    mk, sk = master.ed25519_key.to_base64(), ssk.ed25519_key.to_base64()
+    master_obj = {"user_id": user, "usage": ["master"], "keys": {f"ed25519:{mk}": mk}}
+    if device_sig_on_master:
+        dev_id, dev = device_sig_on_master
+        master_obj = _signed(master_obj, user, dev_id, dev)
+    ssk_obj = _signed(
+        {"user_id": user, "usage": ["self_signing"], "keys": {f"ed25519:{sk}": sk}},
+        user, mk, master,
+    )
+    body = {
+        "master_keys": {user: master_obj},
+        "self_signing_keys": {user: ssk_obj},
+        "device_keys": {user: {}},
+    }
+    for dev_id, (acct, signed) in devices.items():
+        fp = acct.ed25519_key.to_base64()
+        dk = {
+            "user_id": user,
+            "device_id": dev_id,
+            "algorithms": ["m.olm.v1.curve25519-aes-sha2"],
+            "keys": {f"ed25519:{dev_id}": fp, f"curve25519:{dev_id}": acct.curve25519_key.to_base64()},
+        }
+        dk = _signed(dk, user, dev_id, acct)
+        if signed:
+            dk = _signed(dk, user, sk, ssk)
+        body["device_keys"][user][dev_id] = dk
+    return body, mk, sk
+
+
+class TestSignedBy:
+    def test_valid_signature_passes(self):
+        import vodozemac
+        from matrixcli.client import _signed_by
+
+        acct = vodozemac.Account()
+        key = acct.ed25519_key.to_base64()
+        obj = _signed({"keys": {f"ed25519:{key}": key}, "unsigned": {"x": 1}}, ME, key, acct)
+        assert _signed_by(obj, ME, key, key)
+
+    def test_tampered_body_fails(self):
+        import vodozemac
+        from matrixcli.client import _signed_by
+
+        acct = vodozemac.Account()
+        key = acct.ed25519_key.to_base64()
+        obj = _signed({"keys": {f"ed25519:{key}": key}}, ME, key, acct)
+        obj["keys"]["ed25519:evil"] = "x"
+        assert not _signed_by(obj, ME, key, key)
+
+    def test_wrong_key_missing_sig_and_junk_fail(self):
+        import vodozemac
+        from matrixcli.client import _signed_by
+
+        acct, other = vodozemac.Account(), vodozemac.Account()
+        key = acct.ed25519_key.to_base64()
+        obj = _signed({"keys": {f"ed25519:{key}": key}}, ME, key, acct)
+        assert not _signed_by(obj, ME, key, other.ed25519_key.to_base64())
+        assert not _signed_by(obj, ALICE, key, key)
+        assert not _signed_by({"signatures": {ME: {f"ed25519:{key}": "!!"}}}, ME, key, key)
+        assert not _signed_by({"signatures": {ME: {f"ed25519:{key}": "AAAA"}}}, ME, key, "not-a-key")
+        assert not _signed_by("junk", ME, key, key)
+
+
+class TestMasterKeyFromMac:
+    """The peer's mac carries its master key under ed25519:<key>; nio checks
+    the id list but skips that entry, so we re-check it ourselves."""
+
+    def _pair(self):
+        import vodozemac
+
+        ours, theirs = vodozemac.Sas(), vodozemac.Sas()
+        established = ours.diffie_hellman(theirs.public_key)
+        peer_side = theirs.diffie_hellman(ours.public_key)
+        sas = SimpleNamespace(
+            verified=True,
+            other_olm_device=SimpleNamespace(user_id=ME, id="ELEMENT"),
+            own_user=ME,
+            own_device="CLI",
+            transaction_id="txn1",
+            established_sas=established,
+        )
+        info = f"MATRIX_KEY_VERIFICATION_MAC{ME}ELEMENT{ME}CLItxn1"
+        return sas, peer_side, info
+
+    def test_returns_the_master_key_the_peer_vouched_for(self):
+        from matrixcli.client import _master_key_from_mac
+
+        sas, peer, info = self._pair()
+        master = "MASTERKEYbase64"
+        event = SimpleNamespace(mac={
+            "ed25519:ELEMENT": peer.calculate_mac("devicefp", info + "ed25519:ELEMENT"),
+            f"ed25519:{master}": peer.calculate_mac(master, info + f"ed25519:{master}"),
+        })
+        assert _master_key_from_mac(sas, event) == master
+
+    def test_bad_mac_unverified_or_missing_give_none(self):
+        from matrixcli.client import _master_key_from_mac
+
+        sas, peer, info = self._pair()
+        master = "MASTERKEYbase64"
+        forged = SimpleNamespace(mac={f"ed25519:{master}": "forged"})
+        assert _master_key_from_mac(sas, forged) is None
+        good = SimpleNamespace(mac={
+            f"ed25519:{master}": peer.calculate_mac(master, info + f"ed25519:{master}"),
+        })
+        assert _master_key_from_mac(replace_ns(sas, verified=False), good) is None
+        assert _master_key_from_mac(sas, None) is None
+        # Only the device key in the mac (an account without cross-signing).
+        only_device = SimpleNamespace(mac={
+            "ed25519:ELEMENT": peer.calculate_mac("fp", info + "ed25519:ELEMENT"),
+        })
+        assert _master_key_from_mac(sas, only_device) is None
+
+
+def replace_ns(ns, **kw):
+    return SimpleNamespace(**{**vars(ns), **kw})
+
+
+class TestOwnSessions:
+    """The :verify report, from crafted /keys/query and /devices bodies."""
+
+    def run(self, session, keys, devices, monkeypatch):
+        async def fake_get(method, path, body=None):
+            if path.endswith("/keys/query"):
+                assert method == "POST" and body == {"device_keys": {ME: []}}
+                return keys
+            assert path.endswith("/devices")
+            return devices
+
+        monkeypatch.setattr(session, "_get_json", fake_get)
+        session.client.device_id = "CLI"
+        return asyncio.run(session.own_sessions())
+
+    def test_cross_signed_chain_and_pinned_identity_verify_this_session(
+        self, session, monkeypatch
+    ):
+        import vodozemac
+
+        cli, web = vodozemac.Account(), vodozemac.Account()
+        keys, mk, _ = _cross_signing(ME, {"CLI": (cli, True), "WEB": (web, True)})
+        devices = {"devices": [
+            {"device_id": "WEB", "display_name": "Element Web", "last_seen_ts": 5, "last_seen_ip": "1.2.3.4"},
+            {"device_id": "CLI", "display_name": "matrixcli", "last_seen_ts": 9},
+        ]}
+        # Not pinned yet: cross-signed but not verified.
+        rep = self.run(session, keys, devices, monkeypatch)
+        assert rep.master_key == mk and rep.pinned_key is None
+        assert [d.device_id for d in rep.devices] == ["CLI", "WEB"]  # this one first
+        assert all(d.cross_signed for d in rep.devices)
+        assert not rep.identity_confirmed and not rep.this_verified
+        assert rep.devices[1].display_name == "Element Web"
+        assert rep.devices[1].last_seen_ts == 5
+        # Pinned (what a completed emoji verification records): verified.
+        session.state["master_keys"] = {ME: mk}
+        rep = self.run(session, keys, devices, monkeypatch)
+        assert rep.identity_confirmed and rep.this_verified
+        assert not rep.identity_changed
+
+    def test_unsigned_device_and_forged_chain_are_not_cross_signed(
+        self, session, monkeypatch
+    ):
+        import vodozemac
+
+        cli, web = vodozemac.Account(), vodozemac.Account()
+        keys, mk, sk = _cross_signing(ME, {"CLI": (cli, False), "WEB": (web, True)})
+        session.state["master_keys"] = {ME: mk}
+        rep = self.run(session, keys, {"devices": []}, monkeypatch)
+        by_id = {d.device_id: d for d in rep.devices}
+        assert not by_id["CLI"].cross_signed and by_id["WEB"].cross_signed
+        assert not rep.this_verified
+        # A self-signing key the master key did not sign vouches for nothing,
+        # however valid its own signatures over the devices are.
+        keys["self_signing_keys"][ME]["signatures"] = {}
+        rep = self.run(session, keys, {"devices": []}, monkeypatch)
+        assert not any(d.cross_signed for d in rep.devices)
+
+    def test_identity_changed_when_server_publishes_another_master_key(
+        self, session, monkeypatch
+    ):
+        import vodozemac
+
+        keys, mk, _ = _cross_signing(ME, {"CLI": (vodozemac.Account(), True)})
+        session.state["master_keys"] = {ME: "OLDKEY"}
+        rep = self.run(session, keys, {"devices": []}, monkeypatch)
+        assert rep.identity_changed and not rep.this_verified
+        assert rep.devices[0].cross_signed  # the chain itself is valid
+
+    def test_no_cross_signing_and_only_this_device(self, session, monkeypatch):
+        import vodozemac
+
+        cli = vodozemac.Account()
+        fp = cli.ed25519_key.to_base64()
+        dk = _signed({"user_id": ME, "device_id": "CLI", "keys": {"ed25519:CLI": fp}}, ME, "CLI", cli)
+        keys = {"device_keys": {ME: {"CLI": dk}}}
+        rep = self.run(session, keys, {"devices": [{"device_id": "CLI"}]}, monkeypatch)
+        assert rep.master_key is None and not rep.this_verified
+        assert [d.device_id for d in rep.devices] == ["CLI"]
+        assert rep.devices[0].is_this and not rep.devices[0].cross_signed
+        assert rep.devices[0].display_name == "" and rep.devices[0].last_seen_ts == 0
+
+    def test_pins_master_key_signed_by_a_device_verified_here(
+        self, session, monkeypatch
+    ):
+        """Verified with an older matrixcli: no pin, but the SAS-verified
+        device signed the master key, which vouches for it just as well."""
+        import vodozemac
+
+        cli, web = vodozemac.Account(), vodozemac.Account()
+        keys, mk, _ = _cross_signing(
+            ME, {"CLI": (cli, True), "WEB": (web, True)},
+            device_sig_on_master=("WEB", web),
+        )
+
+        class Store(dict):
+            pass
+
+        verified = SimpleNamespace(verified=True)
+        monkeypatch.setattr(
+            type(session.client), "device_store",
+            property(lambda self: {ME: {"WEB": verified}}),
+        )
+        rep = self.run(session, keys, {"devices": []}, monkeypatch)
+        assert rep.pinned_key == mk and rep.this_verified
+        assert session.cfg.load_state()["master_keys"] == {ME: mk}
+        by_id = {d.device_id: d for d in rep.devices}
+        assert by_id["WEB"].verified_here and not by_id["CLI"].verified_here
+
+    def test_offline_reports_an_error(self, session, monkeypatch):
+        async def nothing(method, path, body=None):
+            return None
+
+        monkeypatch.setattr(session, "_get_json", nothing)
+        rep = asyncio.run(session.own_sessions())
+        assert rep.error and rep.devices == [] and not rep.this_verified
+
+    def test_names_are_sanitized_and_junk_shapes_tolerated(self, session, monkeypatch):
+        keys = {"device_keys": {ME: {"CLI": "junk", "X": {"keys": "junk"}}},
+                "master_keys": {ME: {"keys": {"ed25519:a": "a", "ed25519:b": "b"}}}}
+        devices = {"devices": [
+            {"device_id": "CLI", "display_name": "bad\x1b[31m name", "last_seen_ts": True},
+            "junk", {"no": "id"},
+        ]}
+        rep = self.run(session, keys, devices, monkeypatch)
+        assert rep.master_key is None  # two keys in one object: not a master key
+        by_id = {d.device_id: d for d in rep.devices}
+        assert set(by_id) == {"CLI", "X"}
+        assert "\x1b" not in by_id["CLI"].display_name
+        assert by_id["CLI"].last_seen_ts == 0
+
+
+class TestBeginVerification:
+    """The SAS responder's plumbing over a fake nio client: which to-device
+    messages go out for which incoming ones, with the emoji answer taken
+    outside the sync, in either order relative to the peer's mac."""
+
+    def ev(self, t, content, sender=ME):
+        from nio.events.to_device import ToDeviceEvent
+
+        return ToDeviceEvent.parse_event(
+            {"type": t, "sender": sender, "content": content}
+        )
+
+    async def deliver(self, session, event):
+        """What nio's sync does with a to-device event: every matching
+        callback, in registration order."""
+        for cb in list(session.client.to_device_callbacks):
+            if isinstance(event, cb.filter):
+                await cb.func(event)
+
+    def wire(self, session, master="MASTERKEY"):
+        """A client whose verification API just records what it was asked
+        to send, around a fake Sas that 'verifies' once accepted and
+        mac'd, like nio's does."""
+        from nio import LocalProtocolError, ToDeviceMessage
+
+        sent: list[tuple[str, dict]] = []
+        client = session.client
+
+        class FakeSas(SimpleNamespace):
+            @property
+            def verified(self):
+                return self.sas_accepted and self.mac_received
+
+        sas = FakeSas(
+            pubkey="OURPUB",
+            commitment="deadbeef",
+            sas_accepted=False,
+            mac_received=False,
+            other_olm_device=SimpleNamespace(user_id=ME, id="WEB"),
+            own_user=ME,
+            own_device="CLI",
+            transaction_id="txn",
+            _extra_info="info",
+            established_sas=SimpleNamespace(
+                bytes=lambda info: SimpleNamespace(emoji_indices=[1, 2, 3, 4, 5, 6, 7]),
+                calculate_mac=lambda key, info: f"mac({key}|{info})",
+            ),
+            share_key=lambda: ToDeviceMessage(
+                "m.key.verification.key", ME, "WEB", {"key": "OURPUB"}
+            ),
+        )
+
+        async def to_device(msg, tx_id=None):
+            sent.append((msg.type, msg.content))
+            return SimpleNamespace()
+
+        async def accept(txn):
+            sent.append(("accept", {"commitment": sas.commitment}))
+            return SimpleNamespace()
+
+        async def confirm(txn):
+            sas.sas_accepted = True
+            sent.append(("mac", {}))
+            return SimpleNamespace()
+
+        async def cancel(txn, reject=False, tx_id=None):
+            sent.append(("cancel", {"reject": reject}))
+            return SimpleNamespace()
+
+        async def keys_query():
+            raise LocalProtocolError("No key query required.")
+
+        # key_verifications is a view onto olm's dict.
+        client.olm = SimpleNamespace(
+            add_changed_users=lambda users: None, key_verifications={}
+        )
+        client.to_device = to_device
+        client.accept_key_verification = accept
+        client.confirm_short_auth_string = confirm
+        client.cancel_key_verification = cancel
+        client.keys_query = keys_query
+        client.device_id = "CLI"
+        self.sas = sas
+        self.master = master
+        return sent
+
+    def start_event(self):
+        return self.ev("m.key.verification.start", {
+            "transaction_id": "txn", "from_device": "WEB", "method": "m.sas.v1",
+            "key_agreement_protocols": ["curve25519-hkdf-sha256"], "hashes": ["sha256"],
+            "message_authentication_codes": ["hkdf-hmac-sha256.v2"],
+            "short_authentication_string": ["emoji", "decimal"],
+        })
+
+    def mac_event(self):
+        info = f"MATRIX_KEY_VERIFICATION_MAC{ME}WEB{ME}CLItxn"
+        calc = self.sas.established_sas.calculate_mac
+        mid = f"ed25519:{self.master}"
+        return self.ev("m.key.verification.mac", {
+            "transaction_id": "txn", "keys": "k",
+            "mac": {"ed25519:WEB": calc("fp", info + "ed25519:WEB"), mid: calc(self.master, info + mid)},
+        })
+
+    def run_flow(self, session, mac_before_answer, answer=True):
+        sent = self.wire(session)
+        seen: list[str] = []
+        shown: list = []
+        answered = asyncio.Event()
+
+        async def confirm(emoji):
+            shown.append(emoji)
+            await answered.wait()
+            return answer
+
+        async def announce(msg):
+            seen.append(msg)
+
+        async def main():
+            result, stop = await session.begin_verification(confirm, announce)
+            await self.deliver(session, self.ev("m.key.verification.request", {
+                "transaction_id": "txn", "from_device": "WEB", "methods": ["m.sas.v1"], "timestamp": 1,
+            }))
+            # A stranger's request, and a second one of ours: both ignored.
+            await self.deliver(session, self.ev("m.key.verification.request", {
+                "transaction_id": "evil", "from_device": "X", "methods": ["m.sas.v1"], "timestamp": 1,
+            }, sender=ALICE))
+            await self.deliver(session, self.ev("m.key.verification.request", {
+                "transaction_id": "txn2", "from_device": "PHONE", "methods": ["m.sas.v1"], "timestamp": 1,
+            }))
+            session.client.key_verifications["txn"] = self.sas
+            await self.deliver(session, self.start_event())
+            await self.deliver(session, self.ev("m.key.verification.key", {"transaction_id": "txn", "key": "THEIRPUB"}))
+            await asyncio.sleep(0)  # lets the decide task reach confirm()
+            assert shown and not result.done()
+            mac = self.mac_event()
+            if mac_before_answer:
+                self.sas.mac_received = True
+                await self.deliver(session, mac)
+                assert not result.done()  # nothing to complete before the answer
+            answered.set()
+            await asyncio.sleep(0.01)
+            if not mac_before_answer and answer:
+                assert not result.done()  # our mac is out; theirs still to come
+                self.sas.mac_received = True
+                await self.deliver(session, mac)
+            outcome = await asyncio.wait_for(result, 1)
+            await stop()
+            return outcome
+
+        outcome = asyncio.run(main())
+        return outcome, sent, seen, shown
+
+    @pytest.mark.parametrize("mac_first", [False, True])
+    def test_full_handshake_in_either_mac_order(self, session, mac_first):
+        outcome, sent, seen, shown = self.run_flow(session, mac_before_answer=mac_first)
+        assert outcome == (True, "verified the other device (WEB)")
+        kinds = [k for k, _ in sent]
+        assert kinds == [
+            "m.key.verification.ready", "accept", "m.key.verification.key",
+            "mac", "m.key.verification.done",
+        ]
+        ready = sent[0][1]
+        assert ready["from_device"] == "CLI" and ready["transaction_id"] == "txn"
+        # Bug 2: the commitment went out as unpadded base64, not nio's hex.
+        assert "=" not in sent[1][1]["commitment"] and sent[1][1]["commitment"] != "deadbeef"
+        # Bug 3: emoji mapped straight from the indices.
+        from nio.crypto.sas import Sas
+        assert shown[0] == [Sas.emoji[i] for i in [1, 2, 3, 4, 5, 6, 7]]
+        assert any("PHONE" not in m and "second" in m for m in seen)
+        assert any("not your account" in m for m in seen)
+        # The identity the peer vouched for is pinned for :verify.
+        assert session.state["master_keys"] == {ME: "MASTERKEY"}
+        assert session.cfg.load_state()["master_keys"] == {ME: "MASTERKEY"}
+        # The handlers are gone after stop().
+        assert session.client.to_device_callbacks == []
+
+    def test_mismatch_cancels_with_reject(self, session):
+        outcome, sent, _, _ = self.run_flow(session, mac_before_answer=False, answer=False)
+        assert outcome == (False, "you reported the emoji did not match; cancelled")
+        assert sent[-1] == ("cancel", {"reject": True})
+        assert "master_keys" not in session.state or not session.state["master_keys"]
+
+    def test_stop_mid_flight_cancels_for_the_peer(self, session):
+        sent = self.wire(session)
+
+        async def main():
+            result, stop = await session.begin_verification(lambda e: None)
+            await self.deliver(session, self.ev("m.key.verification.request", {
+                "transaction_id": "txn", "from_device": "WEB", "methods": ["m.sas.v1"], "timestamp": 1,
+            }))
+            # Before any start: no Sas object, so a raw cancel goes out.
+            await stop()
+            assert result.result() == (False, "cancelled")
+            return sent[-1]
+
+        assert asyncio.run(main()) == (
+            "m.key.verification.cancel",
+            {"code": "m.user", "reason": "Verification cancelled", "transaction_id": "txn"},
+        )
+
+    def test_peer_cancel_and_no_emoji_support(self, session):
+        sent = self.wire(session)
+
+        async def main():
+            result, stop = await session.begin_verification(lambda e: None)
+            await self.deliver(session, self.ev("m.key.verification.request", {
+                "transaction_id": "txn", "from_device": "WEB", "methods": ["m.sas.v1"], "timestamp": 1,
+            }))
+            await self.deliver(session, self.ev("m.key.verification.cancel", {
+                "transaction_id": "txn", "code": "m.user", "reason": "User declined",
+            }))
+            out = result.result()
+            await stop()
+            return out
+
+        assert asyncio.run(main()) == (False, "the other device cancelled: User declined")
+        assert ("cancel", {"reject": True}) not in sent
+
+        sent = self.wire(session)
+
+        async def main2():
+            result, stop = await session.begin_verification(lambda e: None)
+            await self.deliver(session, self.ev("m.key.verification.request", {
+                "transaction_id": "txn", "from_device": "WEB", "methods": ["m.sas.v1"], "timestamp": 1,
+            }))
+            session.client.key_verifications["txn"] = self.sas
+            start = self.start_event()
+            start.short_authentication_string = ["decimal"]
+            await self.deliver(session, start)
+            out = result.result()
+            await stop()
+            return out
+
+        assert asyncio.run(main2()) == (False, "other device does not support emoji verification")
+        assert sent[-1] == ("cancel", {"reject": True})
+
+    def test_handler_exception_becomes_the_outcome(self, session):
+        self.wire(session)
+
+        async def main():
+            result, stop = await session.begin_verification(lambda e: None)
+            await self.deliver(session, self.ev("m.key.verification.request", {
+                "transaction_id": "txn", "from_device": "WEB", "methods": ["m.sas.v1"], "timestamp": 1,
+            }))
+            # No Sas registered for the start: on_start's commitment rewrite
+            # is skipped, but accept then blows up in this fake.
+            async def boom(txn):
+                raise RuntimeError("nope")
+
+            session.client.accept_key_verification = boom
+            await self.deliver(session, self.start_event())
+            out = result.result()
+            await stop()
+            return out
+
+        assert asyncio.run(main()) == (False, "verification failed: RuntimeError: nope")
+
+
+class TestSSSSHelpers:
+    def test_decode_security_key_round_trip(self):
+        import matrixcli.client as C
+
+        raw = hashlib.sha256(b"storage").digest() if False else bytes(range(32))
+        payload = b"\x8b\x01" + raw
+        parity = 0
+        for b in payload:
+            parity ^= b
+        payload += bytes([parity])
+        BASE58 = C._BASE58
+        n = int.from_bytes(payload, "big")
+        enc = ""
+        while n:
+            n, r = divmod(n, 58)
+            enc = BASE58[r] + enc
+        spaced = " ".join(enc[i:i + 4] for i in range(0, len(enc), 4))
+        assert C._decode_security_key(spaced) == raw
+        assert C._decode_security_key(enc) == raw
+        assert C._decode_security_key("not a key!") is None
+        assert C._decode_security_key(enc[:-1] + BASE58[(BASE58.index(enc[-1]) + 1) % 58]) is None
+
+    def test_ssss_encrypt_decrypt_and_key_check(self):
+        import matrixcli.client as C
+
+        key = bytes(range(32, 64))
+
+        def encrypt(name, plaintext):
+            ak, mk = C._ssss_keys(key, name)
+            iv = bytes(range(16))
+            ct = C._ssss_ctr(ak, iv).encrypt(plaintext)
+            return {"iv": C._b64(iv), "ciphertext": C._b64(ct),
+                    "mac": C._b64(hmac.new(mk, ct, hashlib.sha256).digest())}
+
+        blob = encrypt("m.cross_signing.master", b"secret-bytes")
+        assert C._ssss_decrypt(key, "m.cross_signing.master", blob) == b"secret-bytes"
+        assert C._ssss_decrypt(bytes(32), "m.cross_signing.master", blob) is None
+        assert C._ssss_decrypt(key, "wrong.name", blob) is None
+        assert C._ssss_decrypt(key, "m.cross_signing.master", {**blob, "mac": C._b64(bytes(32))}) is None
+        assert C._ssss_decrypt(key, "x", "not a dict") is None
+
+        check = encrypt("", bytes(32))
+        assert C._ssss_key_matches(key, check)
+        assert not C._ssss_key_matches(bytes(32), check)
+        assert C._ssss_key_matches(key, {})  # no check value: cannot disprove
+
+
+def _pub(seed):
+    import matrixcli.client as C
+
+    return C._ed25519_public(seed)
+
+
+class TestUnlockCrossSigning:
+    """unlock_cross_signing against a synthetic secret-storage account."""
+
+    def build(self, session, monkeypatch, *, master_seed=None, ssk_seed=None,
+              tamper_master=False, recovery=None):
+        import matrixcli.client as C
+
+        master_seed = master_seed or hashlib.sha256(b"master").digest()
+        ssk_seed = ssk_seed or hashlib.sha256(b"ssk").digest()
+        usk_seed = hashlib.sha256(b"usk").digest()
+        sample = "EsT6 Z45J sGoW 5rBW JSzw pNFt EzYW GTWZ Fgdn RNSQ ysT8 gSNF"
+        storage_key = C._decode_security_key(sample)
+
+        def enc(name, plaintext):
+            ak, mk = C._ssss_keys(storage_key, name)
+            iv = hashlib.sha256(name.encode() + b"iv").digest()[:16]
+            ct = C._ssss_ctr(ak, iv).encrypt(plaintext)
+            return {"iv": C._b64(iv), "ciphertext": C._b64(ct),
+                    "mac": C._b64(hmac.new(mk, ct, hashlib.sha256).digest())}
+
+        key_id = "KEYID"
+        check = enc("", bytes(32))
+        account_data = {
+            "m.secret_storage.default_key": {"key": key_id},
+            f"m.secret_storage.key.{key_id}": {
+                "algorithm": "m.secret_storage.v1.aes-hmac-sha2",
+                "iv": check["iv"], "mac": check["mac"],
+            },
+            "m.cross_signing.master": {"encrypted": {key_id: enc("m.cross_signing.master", C._b64(master_seed).encode())}},
+            "m.cross_signing.self_signing": {"encrypted": {key_id: enc("m.cross_signing.self_signing", C._b64(ssk_seed).encode())}},
+            "m.cross_signing.user_signing": {"encrypted": {key_id: enc("m.cross_signing.user_signing", C._b64(usk_seed).encode())}},
+        }
+        published_master = _pub(hashlib.sha256(b"someone else").digest()) if tamper_master else _pub(master_seed)
+        device_obj = {"user_id": ME, "device_id": "CLI",
+                      "keys": {"ed25519:CLI": "FP", "curve25519:CLI": "C"},
+                      "signatures": {ME: {"ed25519:CLI": "selfsig"}}}
+        keys_query = {
+            "master_keys": {ME: {"user_id": ME, "usage": ["master"], "keys": {f"ed25519:{published_master}": published_master}}},
+            "self_signing_keys": {ME: {"user_id": ME, "usage": ["self_signing"], "keys": {f"ed25519:{_pub(ssk_seed)}": _pub(ssk_seed)}}},
+            "device_keys": {ME: {"CLI": device_obj}},
+        }
+        uploaded = {}
+
+        async def fake_get_json(method, path, body=None):
+            if "/account_data/" in path:
+                from urllib.parse import unquote
+                name = unquote(path.split("/account_data/")[1])
+                return account_data.get(name)
+            if path.endswith("/keys/query"):
+                return keys_query
+            if path.endswith("/signatures/upload"):
+                uploaded["body"] = body
+                return {"failures": {}}
+            raise AssertionError(path)
+
+        monkeypatch.setattr(session, "_get_json", fake_get_json)
+        session.client = SimpleNamespace(device_id="CLI")
+        session.cfg.secrets._keyring_ok = False  # deterministic; no real keyring
+        return sample, master_seed, ssk_seed, device_obj, uploaded
+
+    def test_happy_path_signs_and_pins(self, session, monkeypatch):
+        import vodozemac
+        from nio.api import Api
+
+        sample, master_seed, ssk_seed, device_obj, uploaded = self.build(session, monkeypatch)
+        saved = {}
+        monkeypatch.setattr(session.cfg, "save_cross_signing",
+                            lambda seeds: saved.update(seeds) or True)
+        ok, msg = asyncio.run(session.unlock_cross_signing(sample))
+        assert ok, msg
+        assert saved  # persisted the seeds it just decrypted
+        ssk_pub = _pub(ssk_seed)
+        sig = uploaded["body"][ME]["CLI"]["signatures"][ME][f"ed25519:{ssk_pub}"]
+        body = {k: v for k, v in device_obj.items() if k not in ("signatures", "unsigned")}
+        vodozemac.Ed25519PublicKey.from_base64(ssk_pub).verify_signature(
+            Api.to_canonical_json(body).encode(),
+            vodozemac.Ed25519Signature.from_base64(sig),
+        )
+        assert uploaded["body"][ME]["CLI"]["signatures"][ME]["ed25519:CLI"] == "selfsig"
+        assert session.state["master_keys"][ME] == _pub(master_seed)
+        assert set(session._cross_signing) == {
+            "m.cross_signing.master", "m.cross_signing.self_signing",
+            "m.cross_signing.user_signing",
+        }
+
+    def test_wrong_key_rejected_before_any_upload(self, session, monkeypatch):
+        sample, *_rest, uploaded = self.build(session, monkeypatch)
+        ok, msg = asyncio.run(session.unlock_cross_signing(sample[:-1] + "Z"))
+        assert not ok and "Security Key" in msg
+        assert uploaded == {}
+
+    def test_master_mismatch_refuses(self, session, monkeypatch):
+        sample, *_rest, uploaded = self.build(session, monkeypatch, tamper_master=True)
+        ok, msg = asyncio.run(session.unlock_cross_signing(sample))
+        assert not ok and "master key" in msg
+        assert uploaded == {}
+
+    def test_blank_input(self, session, monkeypatch):
+        self.build(session, monkeypatch)
+        assert asyncio.run(session.unlock_cross_signing("   "))[0] is False
+
+    def test_no_secret_storage(self, session, monkeypatch):
+        async def fake(method, path, body=None):
+            return None
+
+        monkeypatch.setattr(session, "_get_json", fake)
+        session.client = SimpleNamespace(device_id="CLI")
+        ok, msg = asyncio.run(session.unlock_cross_signing("EsTx whatever"))
+        assert not ok and "secret" in msg.lower()
+
+    def test_security_phrase_via_pbkdf2(self, session, monkeypatch):
+        import matrixcli.client as C
+
+        phrase = "correct horse battery staple"
+        salt = "somesalt"
+        iterations = 1000
+        storage_key = hashlib.pbkdf2_hmac("sha512", phrase.encode(), salt.encode(), iterations, dklen=32)
+        master_seed = hashlib.sha256(b"m").digest()
+        ssk_seed = hashlib.sha256(b"s").digest()
+        usk_seed = hashlib.sha256(b"u").digest()
+
+        def enc(name, plaintext):
+            ak, mk = C._ssss_keys(storage_key, name)
+            iv = hashlib.sha256(name.encode()).digest()[:16]
+            ct = C._ssss_ctr(ak, iv).encrypt(plaintext)
+            return {"iv": C._b64(iv), "ciphertext": C._b64(ct),
+                    "mac": C._b64(hmac.new(mk, ct, hashlib.sha256).digest())}
+
+        key_id = "K"
+        check = enc("", bytes(32))
+        account_data = {
+            "m.secret_storage.default_key": {"key": key_id},
+            f"m.secret_storage.key.{key_id}": {
+                "algorithm": "m.secret_storage.v1.aes-hmac-sha2",
+                "iv": check["iv"], "mac": check["mac"],
+                "passphrase": {"algorithm": "m.pbkdf2", "salt": salt, "iterations": iterations},
+            },
+            "m.cross_signing.master": {"encrypted": {key_id: enc("m.cross_signing.master", C._b64(master_seed).encode())}},
+            "m.cross_signing.self_signing": {"encrypted": {key_id: enc("m.cross_signing.self_signing", C._b64(ssk_seed).encode())}},
+            "m.cross_signing.user_signing": {"encrypted": {key_id: enc("m.cross_signing.user_signing", C._b64(usk_seed).encode())}},
+        }
+        device_obj = {"user_id": ME, "device_id": "CLI", "keys": {"ed25519:CLI": "FP"}, "signatures": {}}
+        keys_query = {
+            "master_keys": {ME: {"keys": {f"ed25519:{_pub(master_seed)}": _pub(master_seed)}}},
+            "self_signing_keys": {ME: {"keys": {f"ed25519:{_pub(ssk_seed)}": _pub(ssk_seed)}}},
+            "device_keys": {ME: {"CLI": device_obj}},
+        }
+        uploaded = {}
+
+        async def fake(method, path, body=None):
+            if "/account_data/" in path:
+                from urllib.parse import unquote
+                return account_data.get(unquote(path.split("/account_data/")[1]))
+            if path.endswith("/keys/query"):
+                return keys_query
+            if path.endswith("/signatures/upload"):
+                uploaded["body"] = body
+                return {"failures": {}}
+
+        monkeypatch.setattr(session, "_get_json", fake)
+        session.client = SimpleNamespace(device_id="CLI")
+        ok, msg = asyncio.run(session.unlock_cross_signing(phrase))
+        assert ok, msg
+        assert uploaded["body"][ME]["CLI"]["signatures"][ME]
+
+
+class TestCrossSignPeer:
+    def wire(self, session, monkeypatch, published_fp="PEERFP"):
+        import matrixcli.client as C
+
+        ssk_seed = hashlib.sha256(b"ssk").digest()
+        session._cross_signing = {"m.cross_signing.self_signing": ssk_seed}
+        session.cfg = replace(session.cfg)  # keep, just ensure user id
+        peer_obj = {"user_id": ME, "device_id": "PEER",
+                    "keys": {"ed25519:PEER": published_fp, "curve25519:PEER": "c"},
+                    "signatures": {ME: {"ed25519:PEER": "peerself"}}}
+        captured = {}
+
+        async def fake(method, path, body=None):
+            if path.endswith("/keys/query"):
+                return {"device_keys": {ME: {"PEER": peer_obj}}}
+            if path.endswith("/signatures/upload"):
+                captured["body"] = body
+                return {"failures": {}}
+
+        monkeypatch.setattr(session, "_get_json", fake)
+        return ssk_seed, peer_obj, captured
+
+    def test_signs_when_fingerprint_matches(self, session, monkeypatch):
+        import vodozemac
+        from nio.api import Api
+
+        ssk_seed, peer_obj, captured = self.wire(session, monkeypatch)
+        olm = SimpleNamespace(id="PEER", ed25519="PEERFP")
+        assert asyncio.run(session._cross_sign_peer(olm)) is True
+        ssk_pub = _pub(ssk_seed)
+        sig = captured["body"][ME]["PEER"]["signatures"][ME][f"ed25519:{ssk_pub}"]
+        body = {k: v for k, v in peer_obj.items() if k not in ("signatures", "unsigned")}
+        vodozemac.Ed25519PublicKey.from_base64(ssk_pub).verify_signature(
+            Api.to_canonical_json(body).encode(),
+            vodozemac.Ed25519Signature.from_base64(sig),
+        )
+
+    def test_refuses_on_fingerprint_mismatch(self, session, monkeypatch):
+        _ssk, _peer, captured = self.wire(session, monkeypatch, published_fp="OTHER")
+        olm = SimpleNamespace(id="PEER", ed25519="PEERFP")
+        assert asyncio.run(session._cross_sign_peer(olm)) is False
+        assert captured == {}
+
+    def test_no_keys_no_sign(self, session, monkeypatch):
+        session._cross_signing = {}
+        olm = SimpleNamespace(id="PEER", ed25519="PEERFP")
+        assert asyncio.run(session._cross_sign_peer(olm)) is False
+
+
+class TestInitiatorSAS:
+    """The full initiator<->responder SAS between two real nio olm machines,
+    driven in-process with the to-device messages handed across by hand."""
+
+    def two_clients(self):
+        import tempfile
+        from nio import AsyncClient, AsyncClientConfig
+        from nio.crypto import OlmDevice
+        import matrixcli.client as C
+        from matrixcli.config import Config
+
+        def make(device_id):
+            d = tempfile.mkdtemp()
+            cfg = Config(homeserver="https://hs", user_id=ME, device_name="t", room="",
+                         keychain_service="s", store_path=Path(d),
+                         state_path=Path(d) / "state.json", config_path=Path(d) / "c.ini")
+            sess = C.MatrixSession.__new__(C.MatrixSession)
+            sess.cfg = cfg
+            sess.state = {}
+            sess._cross_signing = {}
+            client = AsyncClient(homeserver="https://hs", user=ME, device_id=device_id,
+                                 store_path=d, config=AsyncClientConfig(store_sync_tokens=False))
+            client.restore_login(ME, device_id, "tok" + device_id)
+            sess.client = client
+            return sess
+
+        A, B = make("AAAAA"), make("BBBBB")
+
+        def olm_device(client):
+            ik = client.olm.account.identity_keys
+            return OlmDevice(ME, client.device_id,
+                             {"ed25519": ik["ed25519"], "curve25519": ik["curve25519"]})
+
+        A.client.olm.device_store.add(olm_device(B.client))
+        B.client.olm.device_store.add(olm_device(A.client))
+
+        async def noquery():
+            return SimpleNamespace()
+
+        A.client.keys_query = noquery
+        B.client.keys_query = noquery
+        return A, B
+
+    def drive(self, A, B, answerA=True, answerB=True):
+        from nio.events.to_device import ToDeviceEvent
+
+        queues = {A.client: asyncio.Queue(), B.client: asyncio.Queue()}
+        other = {A.client: B.client, B.client: A.client}
+
+        def wrap(client):
+            async def to_device(msg, tx_id=None):
+                await queues[other[client]].put(msg)
+                return SimpleNamespace()
+            client.to_device = to_device
+
+        wrap(A.client)
+        wrap(B.client)
+        shown = {}
+
+        def confirmer(tag, ans):
+            async def confirm(emoji):
+                shown[tag] = [n for _, n in emoji]
+                return ans
+            return confirm
+
+        async def main():
+            resB, stopB = await B.begin_verification(confirmer("B", answerB), None)
+            resA, stopA = await A.begin_verification(confirmer("A", answerA), None, initiate="BBBBB")
+            for _ in range(400):
+                if resA.done() and resB.done():
+                    break
+                moved = False
+                for client in (A.client, B.client):
+                    while not queues[client].empty():
+                        msg = await queues[client].get()
+                        ev = ToDeviceEvent.parse_event(
+                            {"type": msg.type, "sender": ME, "content": msg.content}
+                        )
+                        ev = client._handle_decrypt_to_device(ev) or ev
+                        await client._on_to_device(ev)
+                        moved = True
+                await asyncio.sleep(0)
+                if not moved:
+                    await asyncio.sleep(0.005)
+            await stopA()
+            await stopB()
+            return resA.result(), resB.result(), shown
+
+        return asyncio.run(main())
+
+    def test_both_sides_verify_with_matching_emoji(self):
+        A, B = self.two_clients()
+        resA, resB, shown = self.drive(A, B)
+        assert resA[0] and resB[0]
+        assert shown["A"] == shown["B"] and len(shown["A"]) == 7
+        assert A.client.olm.device_store[ME]["BBBBB"].verified
+        assert B.client.olm.device_store[ME]["AAAAA"].verified
+
+    def test_mismatch_on_one_side_cancels_both(self):
+        A, B = self.two_clients()
+        resA, resB, shown = self.drive(A, B, answerB=False)
+        assert not resA[0] and not resB[0]
+        assert not A.client.olm.device_store[ME]["BBBBB"].verified
+
+    def test_no_keys_means_no_identity_pin(self):
+        A, B = self.two_clients()
+        resA, resB, shown = self.drive(A, B)
+        assert resA[0] and resB[0]
+        # Neither side holds the master key, so neither can vouch for the
+        # identity: the mac carries only device keys, nothing gets pinned.
+        assert not (A.state.get("master_keys") or {})
+        assert not (B.state.get("master_keys") or {})
+
+    def test_holder_of_the_master_key_confirms_identity_on_the_peer(self):
+        import matrixcli.client as C
+
+        A, B = self.two_clients()
+        master_seed = hashlib.sha256(b"the-master").digest()
+        A._cross_signing = {"m.cross_signing.master": master_seed}
+        resA, resB, shown = self.drive(A, B)
+        assert resA[0] and resB[0]
+        # A included the master key in its mac, so B pinned the identity from
+        # the emoji compare alone; A pinned nothing (B holds no keys).
+        assert B.state["master_keys"][ME] == C._ed25519_public(master_seed)
+        assert not (A.state.get("master_keys") or {})
+
+
+class TestMacWithMaster:
+    def test_adds_a_verifiable_master_entry_the_reader_recovers(self):
+        import vodozemac
+        import matrixcli.client as C
+        from nio import ToDeviceMessage
+
+        sender = vodozemac.Sas()
+        receiver = vodozemac.Sas()
+        est_send = sender.diffie_hellman(receiver.public_key)
+        est_recv = receiver.diffie_hellman(sender.public_key)
+        master_pub = C._ed25519_public(hashlib.sha256(b"m").digest())
+
+        send_sas = SimpleNamespace(
+            own_user=ME, own_device="A",
+            other_olm_device=SimpleNamespace(user_id=ME, id="B"),
+            transaction_id="txn", established_sas=est_send,
+        )
+        info = f"MATRIX_KEY_VERIFICATION_MAC{ME}A{ME}Btxn"
+
+        def original():
+            device_id = "ed25519:A"
+            return ToDeviceMessage("m.key.verification.mac", ME, "B", {
+                "mac": {device_id: est_send.calculate_mac("Afp", info + device_id)},
+                "keys": est_send.calculate_mac("ed25519:A", info + "KEY_IDS"),
+                "transaction_id": "txn",
+            })
+
+        send_sas.get_mac = original
+        msg = C._mac_with_master(send_sas, master_pub)()
+        mac = msg.content["mac"]
+        assert f"ed25519:{master_pub}" in mac and "ed25519:A" in mac
+        # `keys` now covers both ids, sorted.
+        assert msg.content["keys"] == est_send.calculate_mac(
+            ",".join(sorted(mac)), info + "KEY_IDS"
+        )
+        # The receiver (other perspective, same shared secret) recovers the
+        # master key from the mac.
+        recv_sas = SimpleNamespace(
+            verified=True,
+            other_olm_device=SimpleNamespace(user_id=ME, id="A"),
+            own_user=ME, own_device="B", transaction_id="txn",
+            established_sas=est_recv,
+        )
+        event = SimpleNamespace(mac=mac)
+        assert C._master_key_from_mac(recv_sas, event) == master_pub
+
+
+class TestSessionLoadsPersistedKeys:
+    def test_init_populates_cross_signing_from_config(self, cfg, monkeypatch):
+        from matrixcli.config import Config
+        from matrixcli.client import MatrixSession
+
+        seeds = {"m.cross_signing.self_signing": bytes(range(32))}
+        monkeypatch.setattr(Config, "load_token", lambda self: None)
+        monkeypatch.setattr(Config, "get_or_create_store_key", lambda self: "k")
+        monkeypatch.setattr(Config, "load_cross_signing", lambda self: seeds)
+        sess = MatrixSession(cfg)
+        assert sess._cross_signing == seeds
