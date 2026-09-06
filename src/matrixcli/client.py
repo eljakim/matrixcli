@@ -691,6 +691,59 @@ def fold_edits(messages: list[Message]) -> list[Message]:
     return out
 
 
+def unread_summary(state: dict) -> dict:
+    """What ``matrix --check`` reports, read from the dashboard snapshot in
+    state.json: one row per room with unread notifications, plus the pending
+    invites.
+
+    The snapshot is the only source that survives a restart. A resumed sync
+    returns just the rooms that changed since the token, so counting the live
+    rooms alone would miss every quiet room that was already unread (see
+    _all_entries, which refreshes the snapshot from the live rooms first).
+    Reading it also lets a check run while the TUI holds the instance lock:
+    the running app rewrites these same fields on every sync.
+    """
+    rooms = []
+    for room_id, snap in (state.get("room_meta") or {}).items():
+        if not isinstance(snap, dict) or snap.get("is_space"):
+            continue
+        unread = int(snap.get("unread") or 0)
+        if unread <= 0:
+            continue
+        rooms.append(
+            {
+                "room_id": room_id,
+                "title": snap.get("title") or room_id,
+                "unread": unread,
+                "highlights": int(snap.get("highlights") or 0),
+                "is_direct": bool(snap.get("person")),
+            }
+        )
+    # Loudest first, so a truncated read still shows what matters most.
+    rooms.sort(key=lambda r: (-r["unread"], r["title"].lower()))
+    invited = [
+        {
+            "room_id": room_id,
+            "title": (snap.get("title") if isinstance(snap, dict) else "") or room_id,
+            "inviter": (snap.get("inviter") if isinstance(snap, dict) else "") or "",
+        }
+        for room_id, snap in (state.get("invites") or {}).items()
+    ]
+    invited.sort(key=lambda r: r["title"].lower())
+    unread = sum(r["unread"] for r in rooms)
+    return {
+        "unread": unread,
+        "highlights": sum(r["highlights"] for r in rooms),
+        "invites": len(invited),
+        # An invite is one thing waiting for you, the same as one unread
+        # message: --format count prints this single number.
+        "total": unread + len(invited),
+        "new": bool(unread or invited),
+        "rooms": rooms,
+        "invited": invited,
+    }
+
+
 class MatrixSession:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -774,6 +827,12 @@ class MatrixSession:
         self._cache_dirty = False
         self._cache_saved_at = 0.0
         self._cache_saving = False  # a threaded write is in flight
+        # Set once _restore_timelines has read the file. A session that never
+        # restored (--verify, --check, --export-keys: they connect without a
+        # dashboard) holds empty timelines, so saving would rewrite the cache
+        # as empty and throw away every room's window, reactions and archive
+        # bookkeeping. Nothing is written until the file has been read.
+        self._cache_loaded = False
         # The sync token the file on disk was written at. nio persists its
         # own token on every sync response, ours only when a save runs, so
         # close() rewrites the payload when the two drifted apart (see
@@ -1228,6 +1287,10 @@ class MatrixSession:
         if not payload or payload.get("user_id") != self.cfg.user_id:
             payload = {}
         self._saved_next_batch = payload.get("next_batch") or ""
+        # From here the in-memory copy mirrors the file, so saving it back is
+        # safe (an unreadable or missing cache counts too: there is nothing
+        # left to lose).
+        self._cache_loaded = True
         for room_id, rows in (payload.get("timelines") or {}).items():
             if not self.cache_allowed(room_id):
                 continue  # written before a space was toggled off
@@ -1466,6 +1529,8 @@ class MatrixSession:
     def _save_timelines(self, force: bool = False) -> None:
         if not self.cfg.cache_messages:
             return  # global off: nothing is ever written
+        if not self._cache_loaded:
+            return  # never read the file; writing would empty it
         payload = self._timeline_payload()
         writes = self._pending_archive_writes(force)
         try:
@@ -1485,7 +1550,7 @@ class MatrixSession:
         Archive files can reach tens of MB, so under a running loop only the
         payload snapshot happens inline and the serialize/encrypt/write of
         the changed files goes to a thread."""
-        if not self.cfg.cache_messages:
+        if not self.cfg.cache_messages or not self._cache_loaded:
             return
         if not self._cache_dirty or self._cache_saving:
             return
@@ -1531,7 +1596,10 @@ class MatrixSession:
 
         self._cache_save_task = asyncio.create_task(write())
 
-    async def initial_sync(self, progress=None) -> None:
+    async def initial_sync(self, progress=None) -> bool:
+        """One launch sync. Returns whether it actually landed: False means
+        the dashboard is being served from cache alone (--check reports that
+        as a stale reading rather than "nothing new")."""
         def step(msg: str) -> None:
             if progress is not None:
                 progress(msg)
@@ -1617,7 +1685,8 @@ class MatrixSession:
                 break  # out of attempts; don't promise a retry or sleep first
             step(f"initial sync failed ({detail}); retrying")
             await asyncio.sleep(2 * (attempt + 1))
-        if resp is None or isinstance(resp, SyncError):
+        synced = not (resp is None or isinstance(resp, SyncError))
+        if not synced:
             step("initial sync failed; showing cached data, the background sync will keep retrying")
         try:
             await direct_fetch
@@ -1645,6 +1714,7 @@ class MatrixSession:
         step("organizing dashboard")
         self._record_room_timestamps(resp)
         self._persist_recency()
+        return synced
 
     async def _on_presence(self, event: PresenceEvent) -> None:
         self.presence[event.user_id] = event.presence
@@ -1669,6 +1739,9 @@ class MatrixSession:
             # snapshot the room right back into room_meta.
             self.client.rooms.pop(room_id, None)
             self.client.invited_rooms.pop(room_id, None)
+            # Rejecting an invite arrives as a leave; drop the snapshot with it.
+            if (self.state.get("invites") or {}).pop(room_id, None) is not None:
+                changed = True
             # Purge the cached history too. Without this the room's decrypted
             # messages stay in the main cache and in store/archive/<sha>.cache
             # forever: it has no Entry any more, so it is unreachable from the
@@ -1775,7 +1848,7 @@ class MatrixSession:
                 pass
         if self._cache_dirty or self._archive_dirty:
             self._save_timelines(force=True)
-        elif self.cfg.cache_messages:
+        elif self.cfg.cache_messages and self._cache_loaded:
             token = self.client.next_batch or self.client.loaded_sync_token or ""
             if token and token != self._saved_next_batch:
                 # Nothing changed since the last save, but the sync token
@@ -3118,22 +3191,7 @@ class MatrixSession:
         """
         entries = self._all_entries()
         by_id = {e.room_id: e for e in entries}
-
-        invites = []
-        for rid, room in (getattr(self.client, "invited_rooms", {}) or {}).items():
-            inviter = getattr(room, "inviter", None)
-            invites.append(
-                Entry(
-                    room_id=rid,
-                    title=_clean(getattr(room, "display_name", "")) or rid,
-                    unread=0,
-                    is_direct=False,
-                    person=inviter,
-                    last_ts=0,
-                    is_invite=True,
-                )
-            )
-        invites.sort(key=lambda e: e.title.lower())
+        invites = self.invites()
 
         opened = self.state["last_opened_ts"]
 
@@ -3248,6 +3306,55 @@ class MatrixSession:
             "all": list(by_id.values()),
         }
 
+    def invites(self) -> list[Entry]:
+        """Pending invitations, live ones from the sync merged with the
+        persisted snapshot.
+
+        The snapshot is what makes an invite survive a restart: the server
+        sends an invite in the sync that carries its membership event and
+        never again, so a resumed launch (the only affordable one, see
+        initial_sync) would show an untouched invite for exactly one run and
+        then quietly lose it. Answering the invite anywhere clears it: joining
+        puts the room in room_meta, and rejecting it sends a leave that
+        _record_room_timestamps drops."""
+        stored = self.state.setdefault("invites", {})
+        if not isinstance(stored, dict):
+            stored = self.state["invites"] = {}
+        live = getattr(self.client, "invited_rooms", {}) or {}
+        changed = False
+        for rid, room in live.items():
+            snap = {
+                "title": _clean(getattr(room, "display_name", "")) or rid,
+                "inviter": getattr(room, "inviter", None) or "",
+            }
+            if stored.get(rid) != snap:
+                stored[rid] = snap
+                changed = True
+        joined = self.state.get("room_meta") or {}
+        for rid in [
+            r
+            for r in stored
+            if r not in live and (r in joined or r in self.client.rooms)
+        ]:
+            del stored[rid]
+            changed = True
+        if changed:
+            self._persist_recency()
+        invites = [
+            Entry(
+                room_id=rid,
+                title=(snap.get("title") if isinstance(snap, dict) else "") or rid,
+                unread=0,
+                is_direct=False,
+                person=(snap.get("inviter") if isinstance(snap, dict) else "") or None,
+                last_ts=0,
+                is_invite=True,
+            )
+            for rid, snap in stored.items()
+        ]
+        invites.sort(key=lambda e: e.title.lower())
+        return invites
+
     async def accept_invite(self, room_id: str) -> tuple[bool, str]:
         """Join a room we were invited to. The room moves from invited_rooms
         to rooms through the next sync; the invite entry is dropped locally
@@ -3259,6 +3366,10 @@ class MatrixSession:
         if isinstance(resp, JoinError):
             return False, f"could not join: {resp.message}"
         self.client.invited_rooms.pop(room_id, None)
+        # The snapshot outlives the sync's copy, so it has to be cleared too
+        # or the accepted invite would come back on the next launch.
+        if (self.state.get("invites") or {}).pop(room_id, None) is not None:
+            self._persist_recency()
         return True, "invitation accepted"
 
     async def set_favourite(self, room_id: str, favourite: bool) -> bool:
@@ -4607,6 +4718,13 @@ class MatrixSession:
             room.unread_notifications or 0
             for room in self.client.rooms.values()
         )
+
+    def check_summary(self) -> dict:
+        """The --check report for this session: rebuild the dashboard
+        snapshot from the rooms this sync delivered, then summarise it."""
+        self._all_entries()
+        self.invites()
+        return unread_summary(self.state)
 
     def get_setting(self, key: str, default=None):
         """One in-app setting (the settings screen's fields), from the

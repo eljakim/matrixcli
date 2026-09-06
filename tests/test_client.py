@@ -9,7 +9,13 @@ import aiohttp
 import pytest
 from nio.events.room_events import Event, RoomMessageText, RoomSpaceChildEvent
 
-from matrixcli.client import MatrixSession, Message, NeedsPassword, fold_edits
+from matrixcli.client import (
+    MatrixSession,
+    Message,
+    NeedsPassword,
+    fold_edits,
+    unread_summary,
+)
 
 ME = "@me:example.org"
 ALICE = "@alice:example.org"
@@ -2020,6 +2026,104 @@ class TestInvites:
         assert "!inv:hs" in session.client.invited_rooms
 
 
+class TestInvitesPersist:
+    """An invite has to outlive the sync that delivered it: the server sends
+    it once, and every launch after the first resumes from a token."""
+
+    def test_a_live_invite_is_written_to_the_snapshot(self, session):
+        session.client.invited_rooms["!inv:hs"] = SimpleNamespace(
+            display_name="Secret Club", inviter=ALICE
+        )
+        session.dashboard()
+        assert session.state["invites"] == {
+            "!inv:hs": {"title": "Secret Club", "inviter": ALICE}
+        }
+
+    def test_the_snapshot_carries_the_invite_when_the_sync_does_not(self, session):
+        # What a resumed launch sees: nothing in invited_rooms, everything in
+        # state.json.
+        session.state["invites"] = {"!inv:hs": {"title": "Secret Club", "inviter": ALICE}}
+        invites = session.dashboard()["invites"]
+        assert [(e.room_id, e.title, e.person) for e in invites] == [
+            ("!inv:hs", "Secret Club", ALICE)
+        ]
+        assert invites[0].is_invite
+
+    def test_a_joined_room_drops_its_stored_invite(self, session):
+        session.state["invites"] = {"!inv:hs": {"title": "x", "inviter": ALICE}}
+        session.state["room_meta"]["!inv:hs"] = {"title": "x"}
+        assert session.dashboard()["invites"] == []
+        assert session.state["invites"] == {}
+
+    def test_accepting_clears_the_stored_invite(self, session):
+        session.client.invited_rooms["!inv:hs"] = SimpleNamespace(
+            display_name="x", inviter=ALICE
+        )
+        session.state["invites"] = {"!inv:hs": {"title": "x", "inviter": ALICE}}
+
+        async def fake_join(room_id):
+            return SimpleNamespace(room_id=room_id)
+
+        session.client.join = fake_join
+        assert asyncio.run(session.accept_invite("!inv:hs"))[0]
+        assert session.state["invites"] == {}
+
+    def test_rejecting_elsewhere_arrives_as_a_leave_and_clears_it(self, session):
+        session.state["invites"] = {"!inv:hs": {"title": "x", "inviter": ALICE}}
+        response = SimpleNamespace(
+            rooms=SimpleNamespace(join={}, leave={"!inv:hs": SimpleNamespace()})
+        )
+        session._record_room_timestamps(response)
+        assert session.state["invites"] == {}
+
+
+class TestUnreadSummary:
+    """The reading behind 'matrix --check', taken from the state snapshot."""
+
+    def state(self):
+        return {
+            "room_meta": {
+                "!a:hs": {"title": "Committee", "unread": 3, "highlights": 1},
+                "!b:hs": {"title": "Alice", "unread": 1, "person": ALICE},
+                "!quiet:hs": {"title": "Quiet", "unread": 0},
+                "!s:hs": {"title": "Space", "unread": 9, "is_space": True},
+            },
+            "invites": {"!i:hs": {"title": "General", "inviter": BOB}},
+        }
+
+    def test_counts_rooms_and_invites(self):
+        summary = unread_summary(self.state())
+        assert summary["unread"] == 4  # the space's 9 are not messages
+        assert summary["highlights"] == 1
+        assert summary["invites"] == 1
+        assert summary["total"] == 5  # one invite counts as one thing waiting
+        assert summary["new"] is True
+        assert [r["title"] for r in summary["rooms"]] == ["Committee", "Alice"]
+        assert summary["rooms"][1]["is_direct"] is True
+        assert summary["invited"] == [
+            {"room_id": "!i:hs", "title": "General", "inviter": BOB}
+        ]
+
+    def test_an_empty_state_is_nothing_new(self):
+        summary = unread_summary({})
+        assert summary["new"] is False
+        assert (summary["total"], summary["rooms"], summary["invited"]) == (0, [], [])
+
+    def test_an_invite_alone_is_something_new(self):
+        summary = unread_summary({"invites": {"!i:hs": {"title": "General"}}})
+        assert summary["new"] is True and summary["total"] == 1
+
+    def test_a_session_summary_refreshes_the_snapshot_first(self, session, fake_room):
+        session.client.rooms["!a:hs"] = fake_room("!a:hs", display_name="Live", unread=2)
+        session.client.invited_rooms["!inv:hs"] = SimpleNamespace(
+            display_name="Invited", inviter=ALICE
+        )
+        summary = session.check_summary()
+        assert summary["unread"] == 2
+        assert [r["title"] for r in summary["rooms"]] == ["Live"]
+        assert [i["title"] for i in summary["invited"]] == ["Invited"]
+
+
 class TestLoadOlder:
     def test_paginates_and_stops_at_the_beginning(self, session):
         calls = []
@@ -3092,6 +3196,27 @@ class TestTimelineCachePersistence:
         session._save_timelines()
         fresh = self.restored(cfg, resume=False)
         assert fresh.gap_gen == {"!a:hs": 1}
+
+    def test_a_session_that_never_restored_writes_nothing(self, cfg, session, monkeypatch):
+        # --check, --verify and --export-keys connect without a dashboard, so
+        # their timelines are empty by definition. Saving that would rewrite
+        # the file as empty and lose every room's window, reactions and
+        # archive bookkeeping.
+        self.seed(session)
+        session._save_timelines()
+        before = cfg.load_timeline_cache()
+
+        headless = MatrixSession(cfg)
+        headless._cache_loaded = False
+        headless.client.next_batch = "much-newer-tok"
+        headless._cache_dirty = True
+
+        async def fake_close():
+            return None
+
+        monkeypatch.setattr(headless.client, "close", fake_close)
+        asyncio.run(headless.close())
+        assert cfg.load_timeline_cache() == before
 
     def test_cache_of_another_account_is_ignored(self, cfg, session):
         cfg.save_timeline_cache(

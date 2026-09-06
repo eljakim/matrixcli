@@ -1,5 +1,6 @@
 import asyncio
 import html
+import json
 import re
 import time
 from dataclasses import replace
@@ -1745,9 +1746,8 @@ class TestHomeKeys:
             "dms": rooms(dms, is_direct=True),
         }
 
-    def walk(self, keys, **kw):
-        """Press keys on a freshly mounted HomeScreen; return the (list id,
-        highlighted index) the cursor sits on after each one."""
+    def home_app(self, **kw):
+        """An app showing one HomeScreen over a canned dashboard."""
         data = self.dashboard(**kw)
         session = SimpleNamespace(
             cfg=SimpleNamespace(
@@ -1766,6 +1766,32 @@ class TestHomeKeys:
                 self.session = session
                 return self.push_screen(HomeScreen())
 
+        return HomeApp
+
+    def focused(self, screen):
+        """The id of the list holding keyboard focus."""
+        for cid in [c for col in screen.COLUMNS for c in col]:
+            if screen.query_one(f"#{cid}", ListView).has_focus:
+                return cid
+        return None
+
+    def start_on(self, **kw):
+        """Where the cursor sits the moment the dashboard appears."""
+        HomeApp = self.home_app(**kw)
+
+        async def run():
+            app = HomeApp()
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                return self.focused(app.screen)
+
+        return asyncio.run(run())
+
+    def walk(self, keys, **kw):
+        """Press keys on a freshly mounted HomeScreen; return the (list id,
+        highlighted index) the cursor sits on after each one."""
+        HomeApp = self.home_app(**kw)
+
         async def run():
             positions = []
             app = HomeApp()
@@ -1774,14 +1800,21 @@ class TestHomeKeys:
                 for key in keys:
                     await pilot.press(key)
                     await pilot.pause()
-                    for cid in [c for col in screen.COLUMNS for c in col]:
+                    cid = self.focused(screen)
+                    if cid is not None:
                         lv = screen.query_one(f"#{cid}", ListView)
-                        if lv.has_focus:
-                            positions.append((cid, lv.index))
-                            break
+                        positions.append((cid, lv.index))
             return positions
 
         return asyncio.run(run())
+
+    def test_an_invite_takes_the_focus_on_arrival(self):
+        # An invite is the one row on this screen waiting for an answer, and
+        # Enter accepts the highlighted one, so the cursor starts there.
+        assert self.start_on(invites=["Inv1"]) == "invites"
+
+    def test_without_invites_the_cursor_starts_on_recent(self):
+        assert self.start_on() == "recent"
 
     def test_j_and_k_walk_a_column_as_one_list(self):
         # Focus starts on Recent; j runs off its end into Favourites below it,
@@ -3887,3 +3920,131 @@ class TestAboutScreen:
                 )
 
         assert ":help for actual help" in asyncio.run(go())
+
+
+class TestCheckCommand:
+    """'matrix --check': the exit code says whether anything is waiting, the
+    format says what lands on stdout."""
+
+    def state(self):
+        return {
+            "room_meta": {
+                "!a:hs": {"title": "Committee", "unread": 3, "highlights": 1},
+                "!b:hs": {"title": "Alice", "unread": 1, "person": "@alice:hs"},
+            },
+            "invites": {"!i:hs": {"title": "General", "inviter": "@bob:hs"}},
+        }
+
+    def test_plain_lines_list_every_room_and_invite(self):
+        from matrixcli.app import _check_lines
+        from matrixcli.client import unread_summary
+
+        assert _check_lines(unread_summary(self.state())).splitlines() == [
+            "4 unread messages in 2 rooms, 1 mention, 1 invite",
+            "     3! Committee",
+            "     1  Alice",
+            "     ✉ General (from @bob:hs)",
+        ]
+
+    def test_plain_says_so_when_there_is_nothing(self):
+        from matrixcli.app import _check_lines
+        from matrixcli.client import unread_summary
+
+        assert _check_lines(unread_summary({})) == "nothing new"
+
+    def locked(self, cfg, fmt, state):
+        """Run --check with the instance lock already held, which is what a
+        running app looks like: the reading comes off disk."""
+        from matrixcli.app import _check
+
+        cfg.save_state(state)
+        cfg.acquire_instance_lock()
+        try:
+            return _check(cfg, fmt)
+        finally:
+            import os
+
+            os.close(cfg._instance_lock_fd)
+
+    def test_a_running_app_is_read_from_its_snapshot(self, cfg, capsys):
+        code = self.locked(cfg, "json", self.state())
+        report = json.loads(capsys.readouterr().out)
+        assert code == 0  # something is waiting
+        assert report["source"] == "cache"
+        assert (report["total"], report["unread"], report["invites"]) == (5, 4, 1)
+
+    def test_nothing_waiting_exits_one(self, cfg, capsys):
+        code = self.locked(cfg, "count", {"room_meta": {"!a:hs": {"title": "x"}}})
+        assert (code, capsys.readouterr().out) == (1, "0\n")
+
+    def test_quiet_prints_nothing_at_all(self, cfg, capsys):
+        code = self.locked(cfg, "quiet", self.state())
+        assert (code, capsys.readouterr().out) == (0, "")
+
+    def test_without_a_first_run_there_is_nothing_to_report(self, cfg, capsys):
+        from matrixcli.app import _check
+
+        assert _check(cfg, "plain") == 2
+        out = capsys.readouterr()
+        assert out.out == "" and "run 'matrix' once first" in out.err
+
+    def fake_session(self, monkeypatch, *, ok=True, synced=True, message="ok"):
+        """Stand in for MatrixSession so --check's own flow can be driven
+        without a homeserver."""
+        import matrixcli.app as app_module
+
+        closed = []
+
+        class FakeSession:
+            def __init__(self, cfg):
+                pass
+
+            async def connect(self):
+                return ok, message
+
+            async def initial_sync(self):
+                return synced
+
+            def check_summary(self):
+                return {"unread": 2, "total": 2, "new": True}
+
+            async def close(self):
+                closed.append(True)
+
+        monkeypatch.setattr(app_module, "MatrixSession", FakeSession)
+        return closed
+
+    def test_a_landed_sync_reports_and_closes(self, cfg, capsys, monkeypatch):
+        from matrixcli.app import _check
+
+        closed = self.fake_session(monkeypatch)
+        cfg.save_state({"room_meta": {"!a:hs": {"title": "x"}}})
+        assert _check(cfg, "json") == 0
+        report = json.loads(capsys.readouterr().out)
+        assert report["source"] == "sync" and report["unread"] == 2
+        assert closed == [True]
+
+    def test_a_sync_that_never_landed_is_an_error_not_an_answer(
+        self, cfg, capsys, monkeypatch
+    ):
+        from matrixcli.app import _check
+
+        self.fake_session(monkeypatch, synced=False)
+        cfg.save_state({"room_meta": {"!a:hs": {"title": "x"}}})
+        # The counts are still printed, but exit 2 keeps a monitor from
+        # reading a stale "nothing new" as good news.
+        assert _check(cfg, "json") == 2
+        out = capsys.readouterr()
+        assert json.loads(out.out)["source"] == "stale"
+        assert "could not reach the homeserver" in out.err
+
+    def test_a_failed_connect_is_reported_as_the_error(
+        self, cfg, capsys, monkeypatch
+    ):
+        from matrixcli.app import _check
+
+        self.fake_session(monkeypatch, ok=False, message="token rejected")
+        cfg.save_state({"room_meta": {"!a:hs": {"title": "x"}}})
+        assert _check(cfg, "plain") == 2
+        out = capsys.readouterr()
+        assert out.out == "" and out.err.strip() == "token rejected"

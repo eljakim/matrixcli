@@ -32,7 +32,12 @@ def session(cfg, monkeypatch):
     # Keep tests off the real keyring: no persisted cross-signing keys unless a
     # test sets them up explicitly.
     monkeypatch.setattr(Config, "load_cross_signing", lambda self: {})
-    return MatrixSession(cfg)
+    session = MatrixSession(cfg)
+    # Stand in for the launch restore: a session only writes the timeline
+    # cache once it has read it (see _cache_loaded), and the cache tests
+    # below all act as a session that is past that point.
+    session._cache_loaded = True
+    return session
 
 
 class FakeRoom:

@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import json
 import logging
 import os
 import re
@@ -71,6 +72,7 @@ from .client import (
     discover_homeserver,
     fold_edits,
     fold_text,
+    unread_summary,
 )
 from .config import Config
 
@@ -4674,12 +4676,14 @@ class HomeScreen(VimCount, Screen):
         self.title = "matrixcli"
         self.sub_title = self.app.session.cfg.user_id
         await self.refresh_data()
-        # Start on the most recently opened room, else the first list that
-        # actually has rows. Landing on an empty list (both Recent and
-        # Favourites are empty on a fresh state file) leaves j/k dead, since
-        # _step cannot spill out of a list with nothing in it.
-        for list_id in ("recent", "favourites", "dms", "spaces",
-                        "space_rooms", "other_rooms", "invites"):
+        # Invites first when there are any: they are the one thing on this
+        # screen that is waiting on an answer, and Enter accepts the
+        # highlighted one. Otherwise the most recently opened room, else the
+        # first list that actually has rows. Landing on an empty list (both
+        # Recent and Favourites are empty on a fresh state file) leaves j/k
+        # dead, since _step cannot spill out of a list with nothing in it.
+        for list_id in ("invites", "recent", "favourites", "dms", "spaces",
+                        "space_rooms", "other_rooms"):
             lv = self.query_one(f"#{list_id}", ListView)
             if any(isinstance(c, EntryItem) for c in lv.children):
                 lv.focus()
@@ -5890,12 +5894,148 @@ async def _run_import_keys(cfg: Config, infile: str) -> None:
     )
 
 
+CHECK_FORMATS = ("plain", "count", "json", "quiet")
+
+# --check exit codes, so a script can branch on them without parsing output.
+CHECK_NEW = 0
+CHECK_NONE = 1
+CHECK_ERROR = 2
+
+
+def _plural(count: int, word: str) -> str:
+    return f"{count} {word}" + ("" if count == 1 else "s")
+
+
+async def _run_check(cfg: Config) -> tuple[dict, str]:
+    """Sync once and report what is waiting. No TUI, no keys touched: this is
+    a plain instance that connects, takes one sync, and closes, so the
+    counters are the server's own and the dashboard snapshot it leaves behind
+    is the one the next launch reads."""
+    session = MatrixSession(cfg)
+    try:
+        ok, message = await session.connect()
+        if not ok:
+            return {}, message
+        synced = await session.initial_sync()
+        # "stale" when the sync never landed (offline, or the server refused
+        # every retry): the counts below are then only as fresh as the last
+        # successful run.
+        return session.check_summary(), "sync" if synced else "stale"
+    finally:
+        await session.close()
+
+
+def _check_lines(summary: dict) -> str:
+    """The --format plain report: a headline, then a line per room and per
+    invite. One screen at a glance, and greppable."""
+    if not summary["new"]:
+        return "nothing new"
+    head = []
+    if summary["unread"]:
+        head.append(
+            f"{_plural(summary['unread'], 'unread message')} in "
+            f"{_plural(len(summary['rooms']), 'room')}"
+        )
+    if summary["highlights"]:
+        head.append(_plural(summary["highlights"], "mention"))
+    if summary["invites"]:
+        head.append(_plural(summary["invites"], "invite"))
+    lines = [", ".join(head)]
+    for room in summary["rooms"]:
+        # "!" marks a room where one of those unread messages names you.
+        lines.append(
+            f"  {room['unread']:>4}{'!' if room['highlights'] else ' '} {room['title']}"
+        )
+    for invite in summary["invited"]:
+        sender = f" (from {invite['inviter']})" if invite["inviter"] else ""
+        lines.append(f"     ✉ {invite['title']}{sender}")
+    return "\n".join(lines)
+
+
+def _check(cfg: Config, fmt: str) -> int:
+    """``matrix --check``: what is waiting, as an exit code plus whatever
+    --format asks for on stdout. Notes and errors go to stderr, so stdout
+    carries nothing but the reading."""
+    def report(summary: dict, source: str, error: str = "") -> int:
+        summary = dict(unread_summary({}), **summary)
+        summary["source"] = source
+        summary["ok"] = not error
+        if error:
+            summary["error"] = error
+        if fmt == "json":
+            print(json.dumps(summary))
+        elif error:
+            pass  # nothing trustworthy to print; the message goes to stderr
+        elif fmt == "count":
+            print(summary["total"])
+        elif fmt == "plain":
+            print(_check_lines(summary))
+        if error:
+            print(error, file=sys.stderr)
+            return CHECK_ERROR
+        if source == "stale":
+            print(
+                "could not reach the homeserver; these are the last known "
+                "counts",
+                file=sys.stderr,
+            )
+            return CHECK_ERROR
+        return CHECK_NEW if summary["new"] else CHECK_NONE
+
+    if cfg.needs_setup:
+        return report(
+            {}, "error", f"no Matrix account is set up yet ({cfg.config_path})"
+        )
+    if not cfg.load_state().get("room_meta"):
+        # A first sync has to fetch every room's state, which takes minutes on
+        # a busy homeserver. That is not something to hand a cron job by
+        # surprise; the app itself does it once, behind its progress screen.
+        return report(
+            {},
+            "error",
+            "run 'matrix' once first: --check reports on what that leaves behind",
+        )
+    try:
+        cfg.acquire_instance_lock()
+    except SystemExit:
+        # The app is running. It refreshes exactly these fields on every sync
+        # tick, so read them off disk instead of opening a second connection
+        # to a store that is already in use.
+        return report(unread_summary(cfg.load_state()), "cache")
+    try:
+        summary, source = asyncio.run(_run_check(cfg))
+    except NeedsPassword as exc:
+        return report({}, "error", str(exc))
+    except Exception as exc:
+        return report({}, "error", f"could not check: {type(exc).__name__}: {exc}")
+    if not summary:
+        # connect() failed and put its reason where the source would be.
+        return report({}, "error", source)
+    return report(summary, source)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Terminal Matrix client.")
     parser.add_argument(
         "-c", "--config",
         help="Path to config.ini (default: $MATRIXCLI_CONFIG, else "
              "~/.config/matrixcli/config.ini)",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Report what is waiting instead of starting the app: exit 0 when "
+        "something is new (unread messages or invites), 1 when nothing is, "
+        "2 when the check could not be made. Prints the reading too, see "
+        "--format.",
+    )
+    parser.add_argument(
+        "--format",
+        choices=CHECK_FORMATS,
+        default="plain",
+        help="What --check prints on stdout: 'plain' a headline plus a line "
+        "per room, 'count' the single number of things waiting, 'json' the "
+        "whole reading as one object, 'quiet' nothing at all (default: plain).",
     )
     parser.add_argument(
         "--verify",
@@ -5916,6 +6056,8 @@ def main() -> None:
         "generated passphrase that is printed once when it finishes.",
     )
     args = parser.parse_args()
+    if args.format != "plain" and not args.check:
+        parser.error("--format only applies to --check")
 
     try:
         cfg = Config.load(Path(args.config).expanduser() if args.config else None)
@@ -5923,6 +6065,12 @@ def main() -> None:
         # OSError also covers an unwritable or blocked [storage] path; same
         # clean message, not a traceback.
         raise SystemExit(str(exc))
+
+    # --check takes the instance lock itself (it falls back to the snapshot on
+    # disk when the app already holds it), so it comes before the acquire
+    # below.
+    if args.check:
+        raise SystemExit(_check(cfg, args.format))
 
     # These three run without the TUI, so they cannot ask for anything; the
     # app itself does the setup.

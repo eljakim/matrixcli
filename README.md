@@ -131,6 +131,44 @@ only has to be present for installs; after a `git pull` that changes
 `poetry.lock` it reinstalls the dependencies before starting. `poetry run
 matrix` from the project directory does the same thing.
 
+### Checking without opening the app
+
+`--check` reports what is waiting and exits, so a prompt, a status bar, or a
+cron job can ask without a TUI:
+
+| Exit code | Meaning |
+|-----------|---------|
+| 0 | something is waiting (unread messages, or an invitation) |
+| 1 | nothing new |
+| 2 | the check could not be made (not set up yet, login refused, homeserver unreachable) |
+
+`--format` picks what lands on stdout; notes and errors always go to stderr,
+so stdout carries nothing but the reading.
+
+```sh
+bin/matrix --check                  # a headline, then a line per room and invite
+bin/matrix --check --format count   # one number: unread messages plus invitations
+bin/matrix --check --format json    # the whole reading as one object
+bin/matrix --check --format quiet   # print nothing; the exit code is the answer
+
+bin/matrix --check --format quiet && notify-send "Matrix: something new"
+```
+
+The JSON object carries `unread`, `highlights` (unread messages that name
+you), `invites`, their sum as `total`, the boolean `new`, a `rooms` array
+(room id, title, unread, highlights, whether it is a DM) and an `invited`
+array, plus `source`: `sync` when the numbers come from a fresh sync,
+`cache` when the app is running and holding the instance lock (its own
+snapshot is then read off disk, which is what it keeps current anyway), and
+`stale` when the homeserver could not be reached and the last known numbers
+are being served. `ok` is false on an error, which then also appears as
+`error`.
+
+A check takes one incremental sync (about a second), so it is cheap enough to
+poll. It needs one normal run first: the counts come from the dashboard
+snapshot in `state.json`, and building that from scratch is the slow
+first-run sync the app does behind its progress screen.
+
 ### Keys
 
 On the home screen:
@@ -197,7 +235,11 @@ On the home screen:
   marks mean and how the very first session works
 
 Pending invitations appear in an `Invites` section (marked `✉`) above
-Favourites whenever there are any; `Enter` accepts.
+Favourites whenever there are any; `Enter` accepts. When the dashboard opens
+with an invitation pending, the cursor starts there, so `Enter` accepts it
+without a keystroke in between. Invitations survive a restart: the server
+sends each one in a single sync and never again, so they are kept in
+`state.json` until they are answered.
 
 In a room:
 
@@ -441,7 +483,8 @@ nowhere, and the file cannot be read without it.
   message naming the first one's pid, because two instances would corrupt
   the shared encryption store and caches. The lock is released by the OS
   when the process ends, however it ends, so a crashed or killed instance
-  never blocks the next launch.
+  never blocks the next launch. `--check` is the exception: rather than
+  refuse, it reads the running app's own snapshot off disk.
 
 ## Development
 

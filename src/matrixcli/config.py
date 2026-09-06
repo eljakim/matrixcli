@@ -553,6 +553,7 @@ class Config:
             "last_event_ts",
             "last_opened_ts",
             "room_meta",
+            "invites",
             "space_children",
             "cache_spaces",
             "settings",
