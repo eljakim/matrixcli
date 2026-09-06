@@ -1,78 +1,486 @@
 # matrixcli
 
-A terminal [Matrix](https://matrix.org) client with a **three-column home
-dashboard**, end-to-end encryption, and credentials kept in the system
-keyring (**macOS Keychain**, Secret Service or KWallet on Linux, a 0600 file
-where there is none). Built on
-[matrix-nio](https://github.com/matrix-nio/matrix-nio) and
-[Textual](https://textual.textualize.io/); works on Python 3.10 through 3.14.
+A Matrix client that runs in your terminal.
 
-The home screen shows three columns:
+matrixcli is a full-screen terminal client built with Textual and matrix-nio. The home screen gives you Spaces, recent and favourite rooms, invites and DMs in one place, with unread counts and mentions visible without opening each room.
 
-- **Spaces**: your spaces; selecting one lists its rooms below, sorted
-  unread-first.
-- **Recent + Favourites**: the rooms you last opened, then rooms and DMs
-  tagged as favourite (toggle with `f`). Each section shows five rows by
-  default and can be resized with `+` / `-` (see below). Pending invites
-  appear above these when there are any.
-- **DMs**: one entry per person, most recently active first, with unread
-  counts and online indicators.
+It supports encrypted rooms, threads, reactions, edits, message history, files, local search and image previews. Navigation is deliberately Vim-ish: `hjkl`, counts such as `10j`, `g`/`G`, a command line, a jumplist and a few other familiar motions are used throughout.
 
-Unread counts show in yellow; rooms where you were mentioned add a red `(N!)`
-badge. Columns taller than the terminal scroll.
+Python 3.10–3.14 is supported.
 
-Plus a search overlay (`/`) over all people and rooms, and a per-room view to
-read history and send messages, which updates live as messages arrive. The
-terminal window's own titlebar follows along, naming the room (or thread)
-being read and prefixing the total unread count as `(N)` (switchable in
-`:settings`).
+## Installation
 
-## Install
-
-End-to-end encryption comes from matrix-nio's vodozemac backend (prebuilt
-Rust wheels), so there is nothing to build and no system crypto libraries to
-install. Dependencies are managed with Poetry, and the launcher installs them
-itself the first time you run it:
+Clone the repository and run the launcher:
 
 ```sh
-cd matrix
+cd matrixcli
 bin/matrix
 ```
 
-That needs Poetry (and a Python between 3.10 and 3.14) on the machine; if
-either is missing the launcher says so and prints the command to fix it:
+The launcher creates the Poetry environment and installs the project on the first run. After that it starts matrixcli directly from the virtualenv. If `poetry.lock` changes after a pull, it runs the install again before starting.
+
+You need:
+
+- Python 3.10, 3.11, 3.12, 3.13 or 3.14
+- Poetry
+
+If several Python versions are installed and Poetry picks the wrong one:
 
 ```sh
-sudo apt install -y pipx && pipx install poetry && pipx ensurepath   # Debian/Ubuntu
-sudo port install poetry                                             # macOS/MacPorts
-curl -sSL https://install.python-poetry.org | python3 -              # anywhere
+poetry env use python3.12
+poetry install
 ```
 
-pipx and the installer script put `poetry` in `~/.local/bin`, so open a new
-shell afterwards. To install by hand instead, `poetry install` in the project
-directory does the same thing (`poetry env use python3.12` pins an
-interpreter).
-
-Verify the crypto stack:
+You can also skip the launcher and use Poetry directly:
 
 ```sh
-poetry run python -c "import vodozemac; print(vodozemac.Account().ed25519_key and 'e2e ok')"
+poetry install
+poetry run matrix
 ```
 
-## Configure
+Or install into a normal virtualenv without Poetry:
 
-Nothing to edit by hand: the first launch asks. It shows a sign-in box for
-your **user id**, **password**, and **homeserver**, writes
-`~/.config/matrixcli/config.ini` from what you type, and connects.
+```sh
+python3 -m venv .venv
+.venv/bin/pip install -e .
+.venv/bin/matrix
+```
 
-Leave the homeserver empty and it is looked up from your user id's domain
-(`.well-known/matrix/client`), which is what accounts like
-`@you:example.org` living on `matrix.example.org` need. The same box comes
-back, with the reason on it, whenever a saved session has expired or a
-password is rejected.
+The last method installs from `pyproject.toml` rather than using the exact versions in `poetry.lock`.
 
-The written config.ini is documented in its own comments and can be edited
-afterwards:
+The launcher follows symlinks, so it can also be put somewhere on your `PATH`:
+
+```sh
+ln -s /path/to/matrixcli/bin/matrix ~/.local/bin/matrix
+```
+
+After that, just run:
+
+```sh
+matrix
+```
+
+## First run
+
+There is no config file to prepare beforehand.
+
+On the first launch matrixcli asks for:
+
+- your Matrix user ID, for example `@you:example.org`
+- your password
+- your homeserver
+
+The homeserver may be left empty. matrixcli will then try Matrix `.well-known` discovery using the domain from your user ID.
+
+Once login succeeds it writes:
+
+```text
+~/.config/matrixcli/config.ini
+```
+
+and keeps the access token and local encryption-store secret for future launches.
+
+On systems with a working keyring, secrets are stored in the macOS Keychain or the Linux Secret Service/KWallet backend.
+
+On machines without a usable keyring — common over SSH, in containers and on servers — the session information falls back to:
+
+```text
+~/.local/share/matrixcli/secrets.json
+```
+
+That file is created with mode `0600`. The Matrix password itself is not written to that fallback file; without a keyring it is only kept for the login that needs it.
+
+## Using matrixcli
+
+Start it with:
+
+```sh
+bin/matrix
+```
+
+The home screen is split into three columns.
+
+The left side contains Spaces and their rooms. Rooms which are not part of a space are shown separately.
+
+The middle contains pending invites, recently opened rooms and favourites.
+
+The right side contains DMs, ordered by recent activity.
+
+Unread rooms are marked directly in the lists, and mentions get their own highlight. The dashboard stays live while matrixcli is connected.
+
+### Home screen
+
+The keys used most often are:
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | Move down / up |
+| `h` / `l` | Previous / next column |
+| `Tab` / `Shift+Tab` | Previous / next column |
+| `Enter` | Open the selected room, DM or invite |
+| `/` | Search |
+| `f` | Favourite / unfavourite a room |
+| `c` | Enable or disable disk caching for the selected space |
+| `S` | Download full history for all rooms |
+| `+` / `-` | Resize Recent or Favourites |
+| `q` | Quit |
+
+Arrow keys work as well, but the navigation model is built around `hjkl`.
+
+`j` and `k` treat everything in a column as one continuous list. For example, moving down from the bottom of Spaces continues into the room list underneath it.
+
+Counts work in the usual Vim style:
+
+```text
+5j
+12k
+```
+
+### Search
+
+Press `/` from the dashboard to search people, rooms and locally downloaded messages.
+
+Search is accent-insensitive, so a plain spelling can still find names containing accents.
+
+When the cursor is inside Recent or Favourites, `/` searches that section rather than the entire account. This is also useful for getting at rooms which do not currently fit in the visible section.
+
+Message search is local. A message can only appear once matrixcli has downloaded it.
+
+If you want complete local search across your account, press `S` on the home screen once and let the history sync finish.
+
+### Inside a room
+
+Basic movement:
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | Next / previous message |
+| `g` | Oldest message |
+| `G` | Newest message |
+| `u` | First unread message |
+| `Ctrl+D` / `Ctrl+U` | Half-page down / up |
+| `Ctrl+F` / `Ctrl+B` | Page down / up |
+| `{` / `}` | Previous / next block of messages by sender |
+| `/` | Search this room |
+| `q` | Return to the dashboard |
+| `Esc` | Go back one screen |
+
+`g` can take you all the way into downloaded history. `G` returns to the live end of the room.
+
+Counts also work here:
+
+```text
+10j
+25k
+100G
+```
+
+`100G` jumps to message 100, counted from the start of the room.
+
+The command line can do the same thing:
+
+```text
+:1
+:100
+:10000
+```
+
+A number beyond the end simply lands on the newest message.
+
+Long jumps are recorded in a jumplist. Use `Ctrl+O` to go back and `Ctrl+I` or `Tab` to go forward again.
+
+### Writing messages
+
+Press:
+
+```text
+n
+```
+
+to write a new message, or:
+
+```text
+r
+```
+
+to reply to the selected message.
+
+The editor opens underneath the timeline.
+
+`Enter` sends. `Shift+Enter` inserts a newline. `Alt+Enter` is available for terminals which cannot distinguish Shift+Enter from Enter.
+
+`Esc` closes the editor but keeps the draft for the rest of the session.
+
+For your own messages:
+
+```text
+e    edit
+d    delete
+```
+
+Deletion asks for confirmation.
+
+### Reactions
+
+Press `a` on a message.
+
+Numbers `1` through `9` select from the quick reaction row. `/` opens emoji search, using Unicode names.
+
+Selecting a reaction you already sent removes it.
+
+### Threads
+
+Threads can either stay collapsed in the normal room timeline or be shown inline.
+
+```text
+l    enter/unfold a thread
+h    leave/fold a thread
+t    toggle threaded view
+T    open the selected thread full-screen
+```
+
+When a thread is opened full-screen the composer is ready immediately and sends into that thread.
+
+### Files, links and images
+
+`Enter` acts on the selected message when it contains something actionable.
+
+For a file, it opens a download destination picker. Encrypted Matrix attachments are decrypted during download.
+
+For a web link, it opens the link using the system browser.
+
+When there is more than one possible action, matrixcli shows an action menu instead.
+
+Press `Space` on an image to preview it directly in the terminal.
+
+The default preview uses coloured half-block characters. Press `~` while the preview is open to switch between that and ASCII rendering. The choice is remembered.
+
+On 256-colour terminals the block preview is dithered. On basic 16-colour terminals matrixcli uses the ASCII renderer.
+
+`j` and `k` inside the preview move through other images in the room.
+
+### Edits and deleted messages
+
+Edited messages are displayed once using the current text rather than appearing as a stream of corrections.
+
+When a message has older versions available, press:
+
+```text
+Shift+Enter
+```
+
+to inspect them. `Alt+Enter` does the same thing on terminals where Shift+Enter cannot be detected separately.
+
+A deleted message is shown as deleted rather than silently disappearing. If the running session saw the original before its deletion, matrixcli can show that copy while the process is still running. Once it is gone from the server and the session is restarted, only the deletion remains.
+
+## A few useful tricks
+
+### Jump straight to unread
+
+Inside a room:
+
+```text
+u
+```
+
+goes to the first unread message. New messages are separated from older history by a `new` divider.
+
+### Get complete offline search
+
+Message search only knows about history matrixcli has downloaded.
+
+From the dashboard, press:
+
+```text
+S
+```
+
+to work through every room and populate the local archives.
+
+This happens one room at a time rather than hammering the homeserver with every history request at once.
+
+### Disable message caching for a space
+
+Select a space and press:
+
+```text
+c
+```
+
+This toggles persistent message caching for the rooms in that space.
+
+It is useful for spaces where you do not want decrypted message history kept locally.
+
+To disable the persistent message cache globally, set:
+
+```ini
+[cache]
+messages = false
+```
+
+matrixcli will then keep message history in memory only.
+
+### Change names to Matrix IDs
+
+Inside a room:
+
+```text
+~
+```
+
+toggles the sender column between display names and raw Matrix IDs.
+
+### Compact busy rooms
+
+Press:
+
+```text
+c
+```
+
+inside a room to toggle compact mode. This removes the extra spacing between speaker blocks.
+
+### Commands
+
+Press `:` when an editor is not focused.
+
+Useful commands include:
+
+```text
+:q
+:q!
+:settings
+:set
+:verify
+:help
+:?
+```
+
+`:q` closes the current page. `:q!` exits immediately from anywhere.
+
+`:settings` lets you change account/display settings including your display name, terminal-title unread count and timestamp timezone.
+
+The timezone accepts an IANA name such as:
+
+```text
+Europe/Amsterdam
+```
+
+Leave it empty to use the operating system's timezone.
+
+## Using matrixcli from scripts
+
+The TUI is not required just to find out whether something is waiting.
+
+Run:
+
+```sh
+bin/matrix --check
+```
+
+This performs an incremental sync, prints the unread state and exits.
+
+A normal interactive run must have completed at least once before using `--check`, because the initial account state is built by the application during that first run.
+
+### Output formats
+
+Plain output is the default:
+
+```sh
+bin/matrix --check
+```
+
+Just print the total count:
+
+```sh
+bin/matrix --check --format count
+```
+
+JSON:
+
+```sh
+bin/matrix --check --format json
+```
+
+Or use the exit status only:
+
+```sh
+bin/matrix --check --format quiet
+```
+
+`stdout` is reserved for the requested result. Warnings and errors go to `stderr`, which makes the command safe to use in scripts.
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | There are unread messages or invites |
+| `1` | Nothing new |
+| `2` | The check could not be completed reliably |
+
+For example:
+
+```sh
+if bin/matrix --check --format quiet; then
+    notify-send "Matrix has new messages"
+fi
+```
+
+A connection failure can still have last-known counts available. In that case matrixcli reports them as stale but exits with code `2`, so a script does not mistake cached information for a successful live check.
+
+### JSON output
+
+The JSON form contains the aggregate unread state as well as room-level information.
+
+The main fields are:
+
+```text
+unread
+highlights
+invites
+total
+new
+rooms
+invited
+source
+ok
+```
+
+`rooms` contains the room ID, title, unread count, highlight count and whether the room is a DM.
+
+`source` tells you where the reading came from:
+
+```text
+sync     fresh sync with the homeserver
+cache    the running matrixcli instance's saved snapshot
+stale    last known state because a fresh sync failed
+```
+
+When matrixcli itself is already open, `--check` does not try to open its encryption store a second time. It reads the live application's saved unread snapshot instead.
+
+## Custom config files
+
+The default configuration is:
+
+```text
+~/.config/matrixcli/config.ini
+```
+
+Use another one with:
+
+```sh
+bin/matrix --config /path/to/config.ini
+```
+
+or:
+
+```sh
+bin/matrix -c /path/to/config.ini
+```
+
+The `MATRIXCLI_CONFIG` environment variable is also supported.
+
+A normal generated configuration looks roughly like this:
 
 ```ini
 [matrix]
@@ -87,409 +495,140 @@ service = matrix-cli
 [storage]
 store_path =
 state_path =
+
+[cache]
+messages = true
 ```
 
-`room` is optional: set it to a room id or canonical alias to open that room
-automatically on launch.
+`room` is optional. Set it to a room ID or canonical alias to open that room instead of the dashboard at startup.
 
-### Where credentials are kept
+`store_path` and `state_path` default to matrixcli's directory under `~/.local/share/`.
 
-After the first login the app caches an **access token + device id** and the
-key that encrypts its local caches, so later launches never need your
-password again.
+When using separate configs for different accounts, give them separate storage paths as well. Matrix encryption stores are device/account state and should not be shared between accounts.
 
-- **With a system keyring** (macOS Keychain, or Secret Service/KWallet on
-  Linux) they go there, under the service names `matrix-cli`,
-  `matrix-cli-token` and `matrix-cli-store`. Your password is stored too, so
-  the app can log in again unattended if the token is ever revoked. To force
-  a fresh login, delete the `matrix-cli-token` entry. Preloading the password
-  yourself still works:
+### Sending to unverified devices
 
-  ```sh
-  security add-generic-password -s "matrix-cli" -a "@you:matrix.org" -w   # macOS
-  keyring set matrix-cli @you:matrix.org                                  # Linux
-  ```
+matrixcli normally sends encrypted messages even when one of the recipient devices has not been verified. This avoids a new or rotated device blocking a send.
 
-- **Without one** (a server, a container, an ssh session with no unlocked
-  keyring) they go to `~/.local/share/matrixcli/secrets.json`, mode 0600.
-  The password is deliberately *not* written there: it is used for that one
-  login and forgotten, and if the cached token ever dies the app asks for it
-  again. Anything that can read your home directory can still use that
-  cached session, so on a shared machine install and unlock a keyring
-  (gnome-keyring, KWallet) and matrixcli will use it instead.
+For stricter behaviour:
 
-## Run
+```ini
+[matrix]
+allow_unverified = false
+```
+
+## Device verification
+
+Open:
+
+```text
+:verify
+```
+
+to see the Matrix sessions on your account and their verification state.
+
+There are two useful flows.
+
+Press `k` to unlock your account's cross-signing keys using the Matrix Security Key or Security Phrase and sign this matrixcli session.
+
+Select another session and press `v` to start an emoji/SAS verification with it.
+
+Select the current session and press `v` to wait for a verification request started by another Matrix client.
+
+During the emoji comparison:
+
+```text
+y    emojis match
+n    reject
+Esc  cancel
+```
+
+There is also a non-TUI responder:
 
 ```sh
-bin/matrix
+bin/matrix --verify
 ```
 
-The launcher works from any directory (symlink it into `/opt/local/bin` if you
-like) and forwards arguments, resolving file paths against your current
-directory. It runs the app straight out of the project's virtualenv, so Poetry
-only has to be present for installs; after a `git pull` that changes
-`poetry.lock` it reinstalls the dependencies before starting. `poetry run
-matrix` from the project directory does the same thing.
+This is useful on a server or over SSH when another Matrix client is starting the verification.
 
-### Checking without opening the app
+Cross-signing must already exist on the account. For a completely new Matrix account, use Element once to initialise cross-signing and create a Security Key. After that matrixcli can use the existing identity.
 
-`--check` reports what is waiting and exits, so a prompt, a status bar, or a
-cron job can ask without a TUI:
+## Encrypted history
 
-| Exit code | Meaning |
-|-----------|---------|
-| 0 | something is waiting (unread messages, or an invitation) |
-| 1 | nothing new |
-| 2 | the check could not be made (not set up yet, login refused, homeserver unreachable) |
+matrixcli uses matrix-nio's end-to-end encryption support.
 
-`--format` picks what lands on stdout; notes and errors always go to stderr,
-so stdout carries nothing but the reading.
+A newly created Matrix session does not automatically possess every Megolm key for messages sent before that device had access to the room. If old encrypted messages cannot be decrypted, import the room keys from another client which has them.
 
-```sh
-bin/matrix --check                  # a headline, then a line per room and invite
-bin/matrix --check --format count   # one number: unread messages plus invitations
-bin/matrix --check --format json    # the whole reading as one object
-bin/matrix --check --format quiet   # print nothing; the exit code is the answer
-
-bin/matrix --check --format quiet && notify-send "Matrix: something new"
-```
-
-The JSON object carries `unread`, `highlights` (unread messages that name
-you), `invites`, their sum as `total`, the boolean `new`, a `rooms` array
-(room id, title, unread, highlights, whether it is a DM) and an `invited`
-array, plus `source`: `sync` when the numbers come from a fresh sync,
-`cache` when the app is running and holding the instance lock (its own
-snapshot is then read off disk, which is what it keeps current anyway), and
-`stale` when the homeserver could not be reached and the last known numbers
-are being served. `ok` is false on an error, which then also appears as
-`error`.
-
-A check takes one incremental sync (about a second), so it is cheap enough to
-poll. It needs one normal run first: the counts come from the dashboard
-snapshot in `state.json`, and building that from scratch is the slow
-first-run sync the app does behind its progress screen.
-
-### Keys
-
-On the home screen:
-
-- `/`: search people, rooms, and every locally held message in every room
-  (accent-insensitive: `agnes` finds `Ágnes`); `↓`/`↑` move through the
-  results while you keep typing, `Enter` opens the highlighted hit. Message
-  hits are listed after the room and people hits, newest first, each naming
-  its room; opening one opens that room and jumps straight to the message.
-  With the cursor in Recent or Favourites, the search is instead scoped to
-  that whole section: it opens already listing all of the section's rooms
-  (beyond the rows the dashboard has room for), and message hits are
-  limited to messages in those rooms. The popup's border always names the
-  active scope (as does the in-room message search, with the room's name)
-- `j` / `k` or `↓` / `↑`: move the selection down / up; `j` and `k` treat a
-  column as one continuous list, so they roll on from Spaces into its Rooms,
-  and from Invites through Recent into Favourites. A typed count repeats
-  the motion (`5j`), as in a room
-- `l` / `h` (or `tab` / `shift+tab`): move to the next / previous column,
-  landing back on the list you last used there
-- `Enter`: open the selected room or DM (on a space: list its rooms; on an
-  invite: accept it)
-- `f`: toggle favourite on the selected room or DM (the label reads
-  `Favourite` or `Unfavourite` to match the selected row, and disappears on
-  rows that cannot be tagged)
-- `+` / `-`: grow / shrink the section the cursor is in, for Recent and
-  Favourites (vim's `Ctrl-W +`/`-` window resize boiled down to one key;
-  `=` works as an unshifted `+`). Neither section goes below five rows, and
-  growth stops where it would squeeze the other section or run off the
-  screen; shrinking the terminal takes rows back automatically, and the
-  sizes are remembered across sessions
-- `S`: sync everything: start the full-history download for every room at
-  once, so the local caches (and with them the global message search and
-  offline reading) end up covering all rooms without opening each one by
-  hand. It is the same background walk opening a room starts, run for all
-  rooms, one room at a time so the homeserver is not hammered; a
-  notification says how many rooms still needed downloading. Hidden when
-  `[cache] messages` is off, since nothing would be kept
-- `?`: about box
-- `q`: quit, from the home screen only; on any other page `q` returns
-  straight to the home screen instead (`Ctrl+Q` and the `Ctrl+P` command
-  palette are disabled)
-- `:`: vim-style command line (works on any page when no editor is
-  focused): `:q!` quits immediately from anywhere, `:q` closes the current
-  page like the `q` key, a bare number inside a room jumps to that message
-  (see the room keys below), `:settings` (or `:set`) opens the settings
-  screen, `:verify` the sessions screen (below), `:help` (or `:?`) lists
-  the commands, `Esc` cancels
-- `:settings`: account and app settings. Your display name (saved to the
-  homeserver), the email addresses on the account (read-only; changing them
-  needs a validation mail, so that stays in Element), whether the terminal
-  titlebar shows the total unread count, and a timezone override for every
-  displayed timestamp (an IANA name like `Europe/Amsterdam`; empty uses the
-  system zone). The last two persist in `state.json`; `Enter` or `Ctrl+S`
-  saves, `Esc` cancels
-- `:verify`: every session on the account (name, id, last seen) and how far
-  each is trusted, this one on top, with three Element-free ways to verify.
-  `k` unlocks cross-signing with your Security Key or Security Phrase and
-  signs this session (no other device needed). `j`/`k` move the selection;
-  `v` on another session starts an emoji verification against it (matrixcli
-  drives it), and `v` on this session waits for one started elsewhere. During
-  a compare, `y` matches, `n` rejects, `Esc` cancels and tells the other
-  device. `r` re-reads the server. See Device verification below for what the
-  marks mean and how the very first session works
-
-Pending invitations appear in an `Invites` section (marked `✉`) above
-Favourites whenever there are any; `Enter` accepts. When the dashboard opens
-with an invitation pending, the cursor starts there, so `Enter` accepts it
-without a keystroke in between. Invitations survive a restart: the server
-sends each one in a single sync and never again, so they are kept in
-`state.json` until they are answered.
-
-In a room:
-
-- `j` / `k` or `↓` / `↑`: move the selection down / up (the selected message
-  is marked with an accent bar in the left margin); moving up past the top
-  fetches older history, all the way back to the room's first message. A dim
-  `── Tue 12 Aug 2026 ──` divider marks every change of day, and reactions
-  show as a dim `👍 3` line under the message they apply to. Messages that
-  mention you get a red timestamp and a red `@` marker. A typed count
-  repeats the motion, as in vim: `10j` moves ten messages down (the pending
-  digits show in the footer's right corner, and any other key cancels them)
-- `g` / `G`: the room's first / newest message. `g` detaches from the live
-  tail and browses the downloaded archive from the very beginning (loaded a
-  chunk at a time as you move); `G` jumps to the newest message and
-  reattaches to the live tail. With a count both become vim's goto-line:
-  `10G` (or `10g`) goes to message 10, counted from the room's first
-- `:` + a number: the same jump from the command line: `:1` is the oldest
-  message, `:10000` the ten-thousandth, and a number past the end lands on
-  the newest, like `G`
-- `Ctrl+D` / `Ctrl+U`: half a window down / up; `Ctrl+F` / `Ctrl+B` a whole
-  window. Measured against what is actually on screen, so tall messages
-  count for their height
-- `{` / `}`: previous / next sender block, vim's paragraph motion for chat:
-  `{` jumps to the first message of the current speaker's run, then run by
-  run upward; `}` to the first message of the next speaker's run
-- `Ctrl+O` / `Ctrl+I` (or `Tab`): walk back / forward through the jumplist,
-  as in vim. Every long jump (`g`, `G`, `:N`, `u`, a search hit) records
-  where you were; `Ctrl+O` returns there, however deep in the archive that
-  was, and `Ctrl+I` re-runs the jump
-- `u`: jump to the first unread message; messages that arrived after you last
-  opened the room sit below a red `── new ──` divider
-- `Enter`: act on what the selected message says. The bottom bar names what it
-  will do, and says nothing when there is nothing to do:
-  - It is an uploaded file, shown as `📎 name (size)` (`Download`): a popup
-    picks the destination: last-used folder, `~/Desktop`, `~/Downloads`, or
-    the current directory. Encrypted attachments are decrypted on download.
-  - It holds a link, underlined and, in terminals that support it,
-    mouse-clickable (`Open link`): open it with the system's default browser.
-    Only `http(s)` links are picked up.
-
-  A message with several of those (more than one link, a file with a link in
-  its caption, or reactions on top of either) shows a popup to pick which
-  (`Message actions`), with `Who reacted` among the choices where it applies.
-  Every popup
-  takes `j`/`k` or `↓`/`↑` to choose, `Enter` to confirm, and `Esc` to cancel.
-- `Space`: peek at the selected message; a second `Space` closes what the
-  first one opened. On a message wearing a reaction badge it shows **who
-  reacted**: a line per emoji naming everyone who sent it, in the same
-  colors the timeline gives those people. On an image upload it previews
-  the image right in the terminal instead, scaled to the window and
-  rescaled live when the window resizes (a gimmick, but a useful one); a
-  reacted image keeps `Space` for the preview, with its reactions in
-  `Enter`'s actions menu. Two styles, flipped with `~` inside the preview and remembered
-  across sessions: truecolor half-blocks (the default), and classic ASCII art
-  built from a configurable character ramp (`[preview] ascii_ramp` in
-  `config.ini`; the default is
-  [Paul Bourke's 70-level ramp](https://paulbourke.net/dataformats/asciiart/),
-  mapped brightest-pixel-to-densest-glyph for dark terminals, so reverse the
-  string on a light one). `j`/`k` walk straight to the room's next/previous
-  image without leaving the preview, and closing lands the timeline selection
-  on the image last shown. Unencrypted images fetch a server-side thumbnail;
-  encrypted ones download and decrypt the full file. Fetched previews are
-  cached (AES-encrypted at rest, capped at 64 MB, oldest pruned first) so
-  reopening one is instant and works offline; the cache follows the same
-  `[cache] messages` switch and per-space opt-outs as message history. The
-  bottom bar shows the current style (`Style: ascii` / `Style: blocks`);
-  `Esc` closes. The preview degrades with the terminal: 24-bit color gets
-  exact blocks, 256-color terminals get Floyd-Steinberg-dithered blocks
-  (the title says so), and 16-color terminals get the ASCII ramp only,
-  with the style toggle hidden.
-- `Shift+Enter`: look behind the selected message, when it carries a trailing
-  `*` saying the line on screen is not the whole story (`Show history`). This
-  is a separate key from `Enter` so neither has to guess which you meant on,
-  say, an edited message that also holds a link. `Alt+Enter` does the same,
-  for terminals where Shift+Enter is indistinguishable from Enter.
-  - **Edited**: shown once, with its newest text, rather than as two
-    near-identical messages. The popup lists every version oldest first with
-    the time it was sent, fetched from the server, so versions older than the
-    loaded history are included too.
-  - **Deleted**: shown as `this message has been deleted`. If the message
-    arrived before it was deleted, the popup shows the text as we received it,
-    marked with the deletion time. The server no longer holds that text, so it
-    is only available in the session that saw it: after a restart the
-    tombstone is all that is left, and there is nothing to open.
-- `r` / `n`: reply to the selected message / compose a new one. Both open a
-  five-line editor docked below the timeline (the history moves up to make
-  room); its header line names what you are replying to. A draft longer than
-  five lines scrolls inside the panel, and a message arriving mid-typing
-  redraws the history without touching what you have written. Escape stashes
-  the draft rather than destroying it: `r`/`n` in the same room (or thread)
-  hands it back, for as long as the app runs.
-- `e`: edit the selected message, when it is your own (the composer opens
-  with its current text and sends the correction as a Matrix edit)
-- `d`: delete the selected message, when it is your own; a confirmation
-  popup gates it (Enter confirms, Esc backs out)
-- `a`: react to the selected message: digits `1`-`9` send from a quick row
-  instantly, `/` searches every emoji by Unicode name (`giraff` finds 🦒).
-  Picking one you already sent takes it back; the quick row ticks those
-- `/`: search everything this client holds for the room (accent-insensitive,
-  newest hit first): the full downloaded history, not just what is on
-  screen, thread replies included. The query matches the message text, the
-  sender's display name, or their matrix id, so `agnes` finds what Ágnes
-  said as well as messages that mention her. `Enter` jumps the selection to
-  the picked message, unfolding its thread or detaching into deep history
-  (as `g` does; `G` returns to the live tail) when the hit is not in view.
-  The search is local: while a room's background download is still running,
-  the count line under the input says so, and older not-yet-fetched
-  messages cannot match yet.
-- `l` / `h`: unfold / fold the selected message's thread in place. `l` on a
-  message with a `⤷ N replies` badge opens its replies inline (indented,
-  fetched in full from the server); `l` again steps into the first reply.
-  `h` on a reply jumps back to the root; `h` on the root folds the thread.
-  Both appear in the bottom bar only when the selected message has a thread
-  to act on.
-- `t`: toggle between normal view (threads collapsed behind a dim
-  `⤷ N replies` badge, except those unfolded with `l`) and threaded view
-  (every reply indented as a whole under its root, with a vertical bar down
-  the replies' left edge marking the thread); the bottom bar shows which
-  view you are in (`View: normal` / `View: threaded`). In threaded view,
-  `h`/`l` jump out of / into a thread.
-- `T`: open the selected message's thread full-screen (or start a new one)
-- `Enter` (in the composer): send its contents (`Shift+Enter` inserts a newline;
-  `Alt+Enter` does too, for terminals where Shift+Enter is indistinguishable
-  from Enter)
-- `c`: toggle compact mode (no blank line between speakers); the label reads
-  `Compact: off` / `Compact: on`
-- `~`: toggle the sender column between display names and raw
-  `@user:server` ids (vim's toggle key); the label reads
-  `Show: names` / `Show: ids`
-- `Esc`: cancel the editor, or go back one page
-- `q`: straight back to the home screen, however deep you are (also from a
-  thread); quitting is `q` on the home screen or `:q!` anywhere
-
-In a thread (opened with `T`): the composer is ready immediately and sends
-into the thread; `r`, `j`/`k`, and `Esc` work as in a room.
-
-### Device verification
-
-Open `:verify` for the session list and the three ways to verify, none of
-which need Element running. (`bin/matrix --verify` still runs the plain-CLI
-responder for the emoji flow without the TUI.)
-
-1. **Security Key / Security Phrase** (`k`): matrixcli reads the account's
-   cross-signing keys straight out of server-side secret storage, unlocked
-   with the `EsTx ...` Security Key or the Security Phrase Element created
-   with Secure Backup, and signs this session. No second device is involved;
-   this session goes verified on its own. On a host with a system keyring
-   (e.g. the macOS Keychain) the unlocked keys are stored there, so `k` is a
-   one-time step; on a keyringless host (a server) they stay in memory for the
-   session, since these keys can cross-sign any device and the file fallback is
-   plaintext. Because a session must be *holding* the keys to cross-sign or
-   vouch for others, verify other sessions from one that has them (your
-   keyring-backed desktop), not from a server session.
-2. **Verify another session by emoji** (select it, then `v`): matrixcli sends
-   the verification request and drives the SAS handshake as the initiator, so
-   one matrixcli can verify another with no Element in the loop. If this
-   session already holds the cross-signing keys (from step 1), a successful
-   compare does two more things: it cross-signs the other session (making it
-   verified for every client, not just locally trusted), and it hands the
-   other session the account's master key inside the handshake so that session
-   confirms the identity too. So verifying a fresh matrixcli from your unlocked
-   one leaves it fully green, with no need to type the Security Key on it.
-3. **Respond to a verification started elsewhere** (`v` on this session, or
-   `bin/matrix --verify`): the original responder flow, for when Element or
-   another matrixcli starts the compare.
-
-Why the keys matter: "verified" means what Element means by it. The account
-has a cross-signing identity (a master key, set up by the first Element login
-and backed by its Security Key), the identity's self-signing key has signed
-this session, and this client has confirmed the identity itself. Emoji alone
-only sets a local "verified here" flag; a session becomes *cross-signed*
-(the shield everyone sees) only when the self-signing key signs it, and only a
-client holding that key can do it. That is why the Security Key (step 1) is
-the bootstrap: it brings the cross-signing authority into matrixcli, after
-which matrixcli can sign itself and, over an emoji check, sign other sessions.
-matrixcli confirms the identity either by holding the master key (step 1) or
-by the peer vouching for it inside the handshake: a session that holds the
-keys puts the master key in its `m.key.verification.mac`, and the other side
-pins it. Once pinned, it lives in `state.json`; the `:verify`
-list checks every signature against the pinned identity, so a server that
-later publishes a different master key shows up as "identity changed" rather
-than silently verified. The marks: `✓` cross-signed by the confirmed
-identity, `~` cross-signed by an identity this client has not confirmed yet,
-`✗` not cross-signed; "verified here" is a device this client compared emoji
-with directly.
-
-The very first session on an account still needs Element once: cross-signing
-has to exist before anything can be verified against it, and matrix-nio cannot
-create it (no cross-signing, no Security Key, no server-side key backup). Sign
-in with Element once to set up cross-signing and a Security Key; from then on
-`:verify` handles everything here without it.
-
-### History decryption
-
-Encrypted history older than this device needs the room keys. Export them from
-a client that has them (Element: Settings -> Security & Privacy -> Export E2E
-room keys) and import the file:
+Export the E2EE room keys from Element and run:
 
 ```sh
 bin/matrix --import-keys element-keys.txt
 ```
 
-Delete the export file afterwards; it contains the keys to your message
-history.
+You will be asked for the export passphrase.
 
-It works the other way too: `--export-keys` writes this device's room keys to
-an encrypted file in the same format, so Element (or another matrixcli install)
-can read them back. There is no server-side key backup, so this file is the
-only copy that survives a lost store. The passphrase is generated rather than
-asked for, and printed once when the export finishes:
+The other direction works too:
 
 ```sh
 bin/matrix --export-keys ~/matrixcli-keys.txt
 ```
 
-Write the passphrase down before the terminal scrolls away; it is stored
-nowhere, and the file cannot be read without it.
+matrixcli generates an encryption passphrase for the export and prints it once. Save it somewhere separate from the file; matrixcli does not store it.
 
-## Where things live
+The exported file contains keys capable of decrypting your Matrix history. Treat it accordingly.
 
-| What | Where |
-|------|-------|
-| Settings | `~/.config/matrixcli/config.ini` |
-| Password | system keyring, service `matrix-cli` (not stored without one) |
-| Cached token | system keyring, service `matrix-cli-token`, or `~/.local/share/matrixcli/secrets.json` (0600) |
-| Encryption store (Olm keys) | `~/.local/share/matrixcli/store/` |
-| Recency state (UI ranking) | `~/.local/share/matrixcli/state.json` |
+matrix-nio does not provide matrixcli with server-side key-backup support, so importing/exporting room keys is currently the way to move older history between installations.
 
-## Notes & limitations
+## Where files are stored
 
-- Encrypted rooms only decrypt on devices that have the keys. A brand-new
-  device (first login) can read messages sent *after* it joined; for older
-  history, use `--import-keys` (matrix-nio has no server-side key backup
-  support, so the keys must come from an export).
-- Outgoing messages are sent with `ignore_unverified_devices=True` so you are
-  not blocked by unverified sessions. Use `:verify` (or `--verify`) to make
-  your other clients trust this one.
-- Room-opening recency (used for sorting) is tracked locally; it starts empty
-  until you open some rooms.
-- Only one instance runs at a time: a second launch exits immediately with a
-  message naming the first one's pid, because two instances would corrupt
-  the shared encryption store and caches. The lock is released by the OS
-  when the process ends, however it ends, so a crashed or killed instance
-  never blocks the next launch. `--check` is the exception: rather than
-  refuse, it reads the running app's own snapshot off disk.
+| Data | Default location |
+| --- | --- |
+| Configuration | `~/.config/matrixcli/config.ini` |
+| Encryption store | `~/.local/share/matrixcli/store/` |
+| UI/account state | `~/.local/share/matrixcli/state.json` |
+| Secret fallback without a keyring | `~/.local/share/matrixcli/secrets.json` |
+| Message/archive/media cache | below the encryption store |
+
+Persistent message and media caches contain decrypted application data and are encrypted at rest.
+
+Set:
+
+```ini
+[cache]
+messages = false
+```
+
+if you do not want matrixcli to retain message history between runs.
+
+## One instance at a time
+
+Only one interactive matrixcli process may use a store at once.
+
+The encryption database, local archives and account state are shared files, so starting two writers against them would risk corrupting or reverting state. A second normal launch therefore exits rather than opening the same store.
+
+There is no stale-lock-file cleanup to worry about: the operating system releases the lock when the process exits.
+
+`--check` is the exception. If matrixcli is running, it reads the application's saved unread snapshot instead of opening another live instance.
 
 ## Development
 
-Source lives in `src/matrixcli/`. Run the tests with:
+Source code lives in:
+
+```text
+src/matrixcli/
+```
+
+Install the development dependencies with Poetry and run the tests with:
 
 ```sh
+poetry install
 poetry run pytest
 ```
+
+The executable entry point is:
+
+```text
+matrixcli.app:main
+```
+
+The `bin/matrix` script is a launcher around that entry point; it handles the local environment and keeps it in sync with `poetry.lock`.
